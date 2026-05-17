@@ -325,6 +325,7 @@ def sidebar_accounts():
                 "annual_contribution": 0.0,
                 "contribution_growth_rate": 0.0,
                 "return_rate": 0.07,
+                "use_global_return_rate": True,
                 "employer_match_percent": 0.0,
                 "employer_match_limit": 0.0,
                 "qualified_dividend_yield": 0.015,
@@ -416,10 +417,37 @@ def sidebar_scenarios():
                     idx = st.session_state["rc_dst"]
                     if 0 <= idx < len(_roth):
                         rc["destination_account_id"] = _roth[idx]["id"]
+                # Sync all account widget values explicitly — widgets inside
+                # collapsed expanders may not have run, so the dict could be stale.
                 for a in st.session_state.accounts:
-                    key = f"a_global_ret_{a['id']}"
-                    if key in st.session_state:
-                        a["use_global_return_rate"] = bool(st.session_state[key])
+                    aid = a["id"]
+                    s = st.session_state
+                    if f"a_name_{aid}" in s:
+                        a["name"] = s[f"a_name_{aid}"]
+                    if f"a_type_{aid}" in s:
+                        a["type"] = ACCOUNT_TYPES.get(s[f"a_type_{aid}"], a["type"])
+                    if f"a_bal_{aid}" in s:
+                        a["balance"] = float(s[f"a_bal_{aid}"])
+                    if f"a_ret_{aid}" in s:
+                        a["return_rate"] = _dec(s[f"a_ret_{aid}"])
+                    if f"a_global_ret_{aid}" in s:
+                        a["use_global_return_rate"] = bool(s[f"a_global_ret_{aid}"])
+                    if f"a_contrib_{aid}" in s:
+                        a["annual_contribution"] = float(s[f"a_contrib_{aid}"])
+                    if f"a_cgr_{aid}" in s:
+                        a["contribution_growth_rate"] = _dec(s[f"a_cgr_{aid}"])
+                    if f"a_emp_{aid}" in s:
+                        a["employer_match_percent"] = _dec(s[f"a_emp_{aid}"])
+                    if f"a_empl_{aid}" in s:
+                        a["employer_match_limit"] = float(s[f"a_empl_{aid}"])
+                    if f"a_basis_{aid}" in s:
+                        a["basis"] = float(s[f"a_basis_{aid}"])
+                    if f"a_qdy_{aid}" in s:
+                        a["qualified_dividend_yield"] = _dec(s[f"a_qdy_{aid}"])
+                    if f"a_oiy_{aid}" in s:
+                        a["ordinary_income_yield"] = _dec(s[f"a_oiy_{aid}"])
+                    if f"a_rent_{aid}" in s:
+                        a["net_annual_rental_income"] = float(s[f"a_rent_{aid}"])
                 save_scenario(
                     name,
                     st.session_state.profile,
