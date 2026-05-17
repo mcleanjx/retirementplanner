@@ -120,6 +120,13 @@ def _init_state():
         st.session_state.roth_conversion = DEFAULT_ROTH_CONVERSION.copy()
     if "spending_overrides" not in st.session_state:
         st.session_state.spending_overrides = {}
+    # Set chk_global_* keys from account dicts so the checkbox renders correctly.
+    # Uses chk_global_ prefix (not a_*) so these keys are never deleted by
+    # _apply_pending_load's deletion loop, avoiding the delete-then-set problem.
+    for _a in st.session_state.accounts:
+        key = f"chk_global_{_a['id']}"
+        if key not in st.session_state:
+            st.session_state[key] = bool(_a.get("use_global_return_rate", True))
 
 
 def _apply_pending_load():
@@ -138,6 +145,8 @@ def _apply_pending_load():
     st.session_state.profile = data["profile"]
     st.session_state.assumptions = data["assumptions"]
     st.session_state.accounts = data["accounts"]
+    for _a in st.session_state.accounts:
+        st.session_state[f"chk_global_{_a['id']}"] = bool(_a.get("use_global_return_rate", True))
     rc = data.get("roth_conversion", DEFAULT_ROTH_CONVERSION.copy())
     # Migrate old single-source format → list format
     if "source_account_id" in rc and "source_account_ids" not in rc:
@@ -285,6 +294,7 @@ def sidebar_accounts():
                     use_global = st.checkbox(
                         "Use global retirement return rate",
                         value=a.get("use_global_return_rate", True),
+                        key=f"chk_global_{a['id']}",
                     )
                     a["use_global_return_rate"] = use_global
                     global_ret = st.session_state.assumptions.get("retirement_return_rate", 0.05)
@@ -429,6 +439,8 @@ def sidebar_scenarios():
                         a["balance"] = float(s[f"a_bal_{aid}"])
                     if f"a_ret_{aid}" in s:
                         a["return_rate"] = _dec(s[f"a_ret_{aid}"])
+                    if f"chk_global_{aid}" in s:
+                        a["use_global_return_rate"] = bool(s[f"chk_global_{aid}"])
                     if f"a_contrib_{aid}" in s:
                         a["annual_contribution"] = float(s[f"a_contrib_{aid}"])
                     if f"a_cgr_{aid}" in s:
