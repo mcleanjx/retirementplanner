@@ -416,6 +416,10 @@ def sidebar_scenarios():
                     idx = st.session_state["rc_dst"]
                     if 0 <= idx < len(_roth):
                         rc["destination_account_id"] = _roth[idx]["id"]
+                for a in st.session_state.accounts:
+                    key = f"a_global_ret_{a['id']}"
+                    if key in st.session_state:
+                        a["use_global_return_rate"] = bool(st.session_state[key])
                 save_scenario(
                     name,
                     st.session_state.profile,
