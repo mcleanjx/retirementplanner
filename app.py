@@ -88,7 +88,7 @@ DEFAULT_ROTH_CONVERSION = {
     "fixed_amount": 10000.0,
     "start_age": 65,
     "end_age": 72,
-    "source_account_id": "acc1",
+    "source_account_ids": [],   # list of traditional account IDs to convert from
     "destination_account_id": "acc2",
     "allow_during_accumulation": False,
 }
@@ -138,7 +138,12 @@ def _apply_pending_load():
     st.session_state.profile = data["profile"]
     st.session_state.assumptions = data["assumptions"]
     st.session_state.accounts = data["accounts"]
-    st.session_state.roth_conversion = data.get("roth_conversion", DEFAULT_ROTH_CONVERSION.copy())
+    rc = data.get("roth_conversion", DEFAULT_ROTH_CONVERSION.copy())
+    # Migrate old single-source format → list format
+    if "source_account_id" in rc and "source_account_ids" not in rc:
+        old_id = rc.pop("source_account_id", None)
+        rc["source_account_ids"] = [old_id] if old_id else []
+    st.session_state.roth_conversion = rc
     st.session_state.spending_overrides = {}
 
 
@@ -364,10 +369,15 @@ def sidebar_roth_conversion():
             roth_accts = [a for a in accts if a["type"] in {"roth_401k", "roth_ira"}]
 
             if trad_accts:
-                src_names = [a["name"] for a in trad_accts]
-                src_ids = [a["id"] for a in trad_accts]
-                cur_src = src_ids.index(rc.get("source_account_id", src_ids[0])) if rc.get("source_account_id") in src_ids else 0
-                rc["source_account_id"] = src_ids[st.selectbox("Convert From", range(len(src_names)), format_func=lambda i: src_names[i], index=cur_src, key="rc_src")]
+                st.markdown("**Convert From** (select one or more)")
+                # Default: all traditional accounts selected if list is empty
+                saved_ids = set(rc.get("source_account_ids") or [a["id"] for a in trad_accts])
+                new_src_ids = []
+                for ta in trad_accts:
+                    if st.checkbox(ta["name"], value=ta["id"] in saved_ids, key=f"rc_src_{ta['id']}"):
+                        new_src_ids.append(ta["id"])
+                rc["source_account_ids"] = new_src_ids
+
             if roth_accts:
                 dst_names = [a["name"] for a in roth_accts]
                 dst_ids = [a["id"] for a in roth_accts]
@@ -384,6 +394,34 @@ def sidebar_scenarios():
         name = st.text_input("Scenario Name", "My Scenario", key="sc_name")
         if st.button("Save", key="sc_save"):
             try:
+                # Read every RC widget key directly from session_state — this is the
+                # authoritative value and bypasses any dict-mutation timing issues.
+                rc = st.session_state.roth_conversion
+                if "rc_en" in st.session_state:
+                    rc["enabled"] = st.session_state["rc_en"]
+                if "rc_strat" in st.session_state:
+                    rc["strategy"] = st.session_state["rc_strat"]
+                if "rc_start" in st.session_state:
+                    rc["start_age"] = int(st.session_state["rc_start"])
+                if "rc_end" in st.session_state:
+                    rc["end_age"] = int(st.session_state["rc_end"])
+                if "rc_bracket" in st.session_state:
+                    rc["target_bracket"] = st.session_state["rc_bracket"]
+                if "rc_fixed" in st.session_state:
+                    rc["fixed_amount"] = float(st.session_state["rc_fixed"])
+                _trad = [a for a in st.session_state.accounts
+                         if a["type"] in {"traditional_401k", "traditional_ira"}]
+                if any(f"rc_src_{a['id']}" in st.session_state for a in _trad):
+                    rc["source_account_ids"] = [
+                        a["id"] for a in _trad
+                        if st.session_state.get(f"rc_src_{a['id']}", False)
+                    ]
+                _roth = [a for a in st.session_state.accounts
+                         if a["type"] in {"roth_401k", "roth_ira"}]
+                if "rc_dst" in st.session_state and _roth:
+                    idx = st.session_state["rc_dst"]
+                    if 0 <= idx < len(_roth):
+                        rc["destination_account_id"] = _roth[idx]["id"]
                 save_scenario(
                     name,
                     st.session_state.profile,

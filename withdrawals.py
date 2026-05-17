@@ -232,13 +232,27 @@ def simulate_retirement(
                     headroom = 0.0
 
                 if headroom > 0:
-                    src_id = roth_conversion.get("source_account_id")
+                    # Support both new multi-source format and old single-source format
+                    src_ids = set(roth_conversion.get("source_account_ids") or [])
+                    if not src_ids and "source_account_id" in roth_conversion:
+                        old = roth_conversion["source_account_id"]
+                        if old:
+                            src_ids = {old}
                     dst_id = roth_conversion.get("destination_account_id")
-                    src = next((a for a in accts if a["id"] == src_id), None)
                     dst = next((a for a in accts if a["id"] == dst_id), None)
-                    if src and dst and src["balance"] > 0:
-                        convert = min(headroom, src["balance"])
-                        src["balance"] -= convert
+                    src_accts = [
+                        a for a in accts
+                        if a["id"] in src_ids
+                        and a["type"] in TRADITIONAL_TYPES
+                        and a["balance"] > 0
+                    ]
+                    if src_accts and dst:
+                        total_src = sum(a["balance"] for a in src_accts)
+                        convert = min(headroom, total_src)
+                        # Draw proportionally from each source account
+                        for a in src_accts:
+                            portion = (a["balance"] / total_src) * convert
+                            a["balance"] -= portion
                         dst["balance"] += convert
                         ordinary_income += convert
                         roth_conversion_amount = convert
