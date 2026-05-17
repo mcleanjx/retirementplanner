@@ -12,7 +12,7 @@ from charts import (
     chart_spending_coverage,
     chart_tax_burden,
 )
-from scenarios import list_scenarios, save_scenario, load_scenario, delete_scenario
+from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario
 from constants import RMD_START_AGE
 
 st.set_page_config(page_title="Retirement Planner", layout="wide")
@@ -96,11 +96,11 @@ DEFAULT_ROTH_CONVERSION = {
 
 def _init_state():
     if "profile" not in st.session_state:
-        # Auto-load the most recently saved scenario on first run
-        saved = list_scenarios()
-        if saved:
+        # Auto-load the most recently modified scenario on first run
+        recent = latest_scenario()
+        if recent:
             try:
-                data = load_scenario(saved[-1])
+                data = load_scenario(recent)
                 st.session_state.profile = data["profile"]
                 st.session_state.assumptions = data["assumptions"]
                 import copy

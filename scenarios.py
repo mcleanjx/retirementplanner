@@ -14,6 +14,15 @@ def list_scenarios() -> list[str]:
     return sorted(p.stem for p in SCENARIOS_DIR.glob("*.json"))
 
 
+def latest_scenario() -> str | None:
+    """Return the stem of the most recently modified scenario file, or None."""
+    _ensure_dir()
+    files = list(SCENARIOS_DIR.glob("*.json"))
+    if not files:
+        return None
+    return max(files, key=lambda p: p.stat().st_mtime).stem
+
+
 def save_scenario(name: str, profile: dict, assumptions: dict, accounts: list[dict], roth_conversion: dict | None = None) -> None:
     _ensure_dir()
     safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip()
