@@ -94,19 +94,6 @@ DEFAULT_ROTH_CONVERSION = {
 }
 
 
-def _stamp_account_widget_keys(accounts: list) -> None:
-    """
-    Explicitly write account field values into session_state widget keys before
-    any widgets render. This prevents Streamlit from using a stale or default
-    value when a collapsed inner expander re-initializes a widget whose key
-    was just deleted.
-    """
-    for a in accounts:
-        aid = a["id"]
-        if "use_global_return_rate" in a:
-            st.session_state[f"a_global_ret_{aid}"] = bool(a["use_global_return_rate"])
-
-
 def _init_state():
     if "profile" not in st.session_state:
         # Auto-load the most recently saved scenario on first run
@@ -118,7 +105,6 @@ def _init_state():
                 st.session_state.assumptions = data["assumptions"]
                 import copy
                 st.session_state.accounts = copy.deepcopy(data["accounts"])
-                _stamp_account_widget_keys(st.session_state.accounts)
                 st.session_state.roth_conversion = data.get("roth_conversion", DEFAULT_ROTH_CONVERSION.copy())
                 st.session_state.spending_overrides = {}
                 return
@@ -152,7 +138,6 @@ def _apply_pending_load():
     st.session_state.profile = data["profile"]
     st.session_state.assumptions = data["assumptions"]
     st.session_state.accounts = data["accounts"]
-    _stamp_account_widget_keys(st.session_state.accounts)
     rc = data.get("roth_conversion", DEFAULT_ROTH_CONVERSION.copy())
     # Migrate old single-source format → list format
     if "source_account_id" in rc and "source_account_ids" not in rc:
@@ -300,7 +285,6 @@ def sidebar_accounts():
                     use_global = st.checkbox(
                         "Use global retirement return rate",
                         value=a.get("use_global_return_rate", True),
-                        key=f"a_global_ret_{a['id']}",
                     )
                     a["use_global_return_rate"] = use_global
                     global_ret = st.session_state.assumptions.get("retirement_return_rate", 0.05)
@@ -445,8 +429,6 @@ def sidebar_scenarios():
                         a["balance"] = float(s[f"a_bal_{aid}"])
                     if f"a_ret_{aid}" in s:
                         a["return_rate"] = _dec(s[f"a_ret_{aid}"])
-                    if f"a_global_ret_{aid}" in s:
-                        a["use_global_return_rate"] = bool(s[f"a_global_ret_{aid}"])
                     if f"a_contrib_{aid}" in s:
                         a["annual_contribution"] = float(s[f"a_contrib_{aid}"])
                     if f"a_cgr_{aid}" in s:
