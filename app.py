@@ -145,6 +145,8 @@ def _apply_pending_load():
         rc["source_account_ids"] = [old_id] if old_id else []
     st.session_state.roth_conversion = rc
     st.session_state.spending_overrides = {}
+    # Update the scenario name text input to match the loaded scenario
+    st.session_state["sc_name"] = data.get("scenario_name", "My Scenario")
 
 
 _init_state()
@@ -394,21 +396,13 @@ def sidebar_scenarios():
         name = st.text_input("Scenario Name", "My Scenario", key="sc_name")
         if st.button("Save", key="sc_save"):
             try:
-                # Read every RC widget key directly from session_state — this is the
-                # authoritative value and bypasses any dict-mutation timing issues.
+                # sidebar_roth_conversion() always runs before this handler and
+                # writes widget return values directly into st.session_state.roth_conversion
+                # via "rc[field] = widget()" assignments — that dict is authoritative.
+                # We only need to fix up the two fields that require index→ID translation
+                # (rc_dst stores a list index, not an account ID) and the checkbox-derived
+                # source list (those keys are individually keyed per account).
                 rc = st.session_state.roth_conversion
-                if "rc_en" in st.session_state:
-                    rc["enabled"] = st.session_state["rc_en"]
-                if "rc_strat" in st.session_state:
-                    rc["strategy"] = st.session_state["rc_strat"]
-                if "rc_start" in st.session_state:
-                    rc["start_age"] = int(st.session_state["rc_start"])
-                if "rc_end" in st.session_state:
-                    rc["end_age"] = int(st.session_state["rc_end"])
-                if "rc_bracket" in st.session_state:
-                    rc["target_bracket"] = st.session_state["rc_bracket"]
-                if "rc_fixed" in st.session_state:
-                    rc["fixed_amount"] = float(st.session_state["rc_fixed"])
                 _trad = [a for a in st.session_state.accounts
                          if a["type"] in {"traditional_401k", "traditional_ira"}]
                 if any(f"rc_src_{a['id']}" in st.session_state for a in _trad):
