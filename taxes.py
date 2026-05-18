@@ -6,15 +6,16 @@ from constants import (
 )
 
 
-def calculate_ordinary_tax(taxable_income: float, filing_status: str) -> float:
+def calculate_ordinary_tax(taxable_income: float, filing_status: str, brackets: list | None = None) -> float:
     """Federal ordinary income tax on taxable income (after standard deduction)."""
-    return _apply_brackets(taxable_income, ORDINARY_BRACKETS[filing_status])
+    return _apply_brackets(taxable_income, brackets or ORDINARY_BRACKETS[filing_status])
 
 
 def calculate_ltcg_tax(
     ltcg_income: float,
     ordinary_taxable_income: float,
     filing_status: str,
+    brackets: list | None = None,
 ) -> float:
     """
     Federal LTCG tax. LTCG brackets stack on top of ordinary income —
@@ -22,7 +23,7 @@ def calculate_ltcg_tax(
     """
     if ltcg_income <= 0:
         return 0.0
-    brackets = LTCG_BRACKETS[filing_status]
+    brackets = brackets or LTCG_BRACKETS[filing_status]
     tax = 0.0
     # LTCG income sits on top of ordinary income in the bracket stack
     ltcg_start = ordinary_taxable_income
@@ -40,16 +41,16 @@ def calculate_ltcg_tax(
     return tax
 
 
-def calculate_niit(magi: float, net_investment_income: float, filing_status: str) -> float:
+def calculate_niit(magi: float, net_investment_income: float, filing_status: str, threshold: float | None = None) -> float:
     """3.8% Net Investment Income Tax on lesser of NII or excess MAGI over threshold."""
-    threshold = NIIT_THRESHOLD[filing_status]
+    threshold = threshold if threshold is not None else NIIT_THRESHOLD[filing_status]
     if magi <= threshold:
         return 0.0
     excess = magi - threshold
     return min(net_investment_income, excess) * NIIT_RATE
 
 
-def calculate_irmaa(magi: float, filing_status: str, num_medicare_eligible: int) -> float:
+def calculate_irmaa(magi: float, filing_status: str, num_medicare_eligible: int, tiers: list | None = None) -> float:
     """
     Annual IRMAA surcharge. Returns total annual amount for all Medicare-eligible people.
     num_medicare_eligible: 1 or 2 (both spouses on Medicare).
@@ -58,7 +59,7 @@ def calculate_irmaa(magi: float, filing_status: str, num_medicare_eligible: int)
         return 0.0
     monthly_b = 0.0
     monthly_d = 0.0
-    for mfj_upper, single_upper, part_b, part_d in IRMAA_TIERS:
+    for mfj_upper, single_upper, part_b, part_d in (tiers or IRMAA_TIERS):
         upper = mfj_upper if filing_status == "married_filing_jointly" else single_upper
         if upper is None or magi <= upper:
             monthly_b = part_b
@@ -91,9 +92,9 @@ def calculate_ss_taxable_amount(
         return min(base + extra, 0.85 * ss_benefit)
 
 
-def bracket_ceiling_for_rate(rate: float, filing_status: str) -> float:
+def bracket_ceiling_for_rate(rate: float, filing_status: str, bracket_factor: float = 1.0) -> float:
     """Returns the taxable income ceiling for a given marginal rate bracket."""
-    return BRACKET_CEILINGS[filing_status].get(rate, 0.0)
+    return BRACKET_CEILINGS[filing_status].get(rate, 0.0) * bracket_factor
 
 
 def marginal_rate(taxable_income: float, filing_status: str) -> float:
@@ -125,6 +126,8 @@ def calculate_ca_state_tax(
     ltcg_income: float,
     ss_income: float,
     filing_status: str,
+    ca_std: float | None = None,
+    brackets: list | None = None,
 ) -> float:
     """
     California state income tax.
@@ -132,12 +135,11 @@ def calculate_ca_state_tax(
     - Social Security (ss_income) is excluded — CA does not tax SS
     - Uses CA standard deduction and CA progressive brackets
     """
-    ca_std = CA_STANDARD_DEDUCTION[filing_status]
-    # CA taxable income = ordinary + LTCG (no preferential rate) - CA std deduction
-    # SS is excluded entirely
+    ca_std = ca_std if ca_std is not None else CA_STANDARD_DEDUCTION[filing_status]
+    brackets = brackets or CA_ORDINARY_BRACKETS[filing_status]
     ca_gross = ordinary_income + ltcg_income
     ca_taxable = max(0.0, ca_gross - ca_std)
-    return _apply_brackets(ca_taxable, CA_ORDINARY_BRACKETS[filing_status])
+    return _apply_brackets(ca_taxable, brackets)
 
 
 def effective_tax_rate(total_tax: float, gross_income: float) -> float:
@@ -158,6 +160,7 @@ def calculate_year_taxes(
     state_tax_rate: float = 0.0,
     net_investment_income: float | None = None,
     ss_taxable_amount: float | None = None,
+    bracket_factor: float = 1.0,
 ) -> dict:
     """
     Full annual tax calculation. Returns a dict with each component and total.
@@ -167,29 +170,52 @@ def calculate_year_taxes(
     state: 'california' uses CA progressive brackets (no SS tax, LTCG as ordinary).
            Any other value falls back to flat state_tax_rate.
     ss_income: gross SS collected this year (used only by CA to exclude from state tax).
+    bracket_factor: cumulative inflation multiplier applied to all bracket thresholds and
+                    standard deduction. SS taxability thresholds are intentionally not scaled
+                    (they are not CPI-indexed under current law).
     """
-    std_ded = STANDARD_DEDUCTION[filing_status]
+    std_ded = STANDARD_DEDUCTION[filing_status] * bracket_factor
     ordinary_taxable = max(0.0, ordinary_income - std_ded)
 
-    federal_ordinary = calculate_ordinary_tax(ordinary_taxable, filing_status)
-    federal_ltcg = calculate_ltcg_tax(ltcg_income, ordinary_taxable, filing_status)
+    scaled_ord = [(u * bracket_factor if u is not None else None, r) for u, r in ORDINARY_BRACKETS[filing_status]]
+    federal_ordinary = calculate_ordinary_tax(ordinary_taxable, filing_status, scaled_ord)
+
+    # LTCG taxable income: standard deduction applies to combined income; when ordinary
+    # income is below the deduction, the residual deduction shelters some LTCG.
+    # IRS worksheet: taxable_ltcg = total_taxable - ordinary_taxable
+    total_taxable = max(0.0, ordinary_income + ltcg_income - std_ded)
+    ltcg_taxable = max(0.0, total_taxable - ordinary_taxable)
+    scaled_ltcg = [(u * bracket_factor if u is not None else None, r) for u, r in LTCG_BRACKETS[filing_status]]
+    federal_ltcg = calculate_ltcg_tax(ltcg_taxable, ordinary_taxable, filing_status, scaled_ltcg)
 
     magi = ordinary_income + ltcg_income
     # NII for NIIT: qualified dividends, capital gains, ordinary dividends, passive rental.
     # Caller should pass net_investment_income explicitly; fall back to ltcg_income only if omitted.
     nii = net_investment_income if net_investment_income is not None else ltcg_income
-    federal_niit = calculate_niit(magi, nii, filing_status)
-    federal_irmaa = calculate_irmaa(magi, filing_status, num_medicare_eligible)
+    niit_threshold = NIIT_THRESHOLD[filing_status] * bracket_factor
+    federal_niit = calculate_niit(magi, nii, filing_status, niit_threshold)
+
+    scaled_irmaa_tiers = [
+        (mfj * bracket_factor if mfj is not None else None,
+         sing * bracket_factor if sing is not None else None,
+         pb, pd)
+        for mfj, sing, pb, pd in IRMAA_TIERS
+    ]
+    federal_irmaa = calculate_irmaa(magi, filing_status, num_medicare_eligible, scaled_irmaa_tiers)
 
     if state == "california":
         # ordinary_income includes only the taxable portion of SS (ss_taxable_amount).
         # Subtract exactly that amount so CA sees non-SS ordinary income — CA excludes SS entirely.
         ss_excl = ss_taxable_amount if ss_taxable_amount is not None else ss_income
+        scaled_ca_std = CA_STANDARD_DEDUCTION[filing_status] * bracket_factor
+        scaled_ca_brackets = [(u * bracket_factor if u is not None else None, r) for u, r in CA_ORDINARY_BRACKETS[filing_status]]
         state_tax = calculate_ca_state_tax(
             ordinary_income=ordinary_income - ss_excl,
             ltcg_income=ltcg_income,
             ss_income=ss_income,
             filing_status=filing_status,
+            ca_std=scaled_ca_std,
+            brackets=scaled_ca_brackets,
         )
     else:
         state_tax = (ordinary_income + ltcg_income) * state_tax_rate

@@ -1,18 +1,13 @@
 import uuid
+from datetime import date
 import streamlit as st
 import pandas as pd
 
 from projections import project_accumulation
 from withdrawals import simulate_retirement
-from charts import (
-    chart_accumulation,
-    chart_composition_at_retirement,
-    chart_drawdown,
-    chart_annual_income,
-    chart_spending_coverage,
-    chart_tax_burden,
-)
-from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario
+import charts as _charts
+import montecarlo as _mc
+from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking
 from constants import RMD_START_AGE
 
 st.set_page_config(page_title="Retirement Planner", layout="wide")
@@ -37,15 +32,17 @@ DEFAULT_PROFILE = {
     "spouse_ss_start_age": 67,
     "survivor_spending_reduction": 0.25,
     "pre_medicare_healthcare": 15000.0,
-    "post_medicare_healthcare": 5000.0,
+    "post_medicare_healthcare": 12000.0,
 }
 
 DEFAULT_ASSUMPTIONS = {
     "inflation_rate": 0.03,
+    "bracket_inflation_rate": 0.025,
     "safe_withdrawal_rate": 0.04,
     "retirement_return_rate": 0.05,
     "spending_mode": "swr",
     "annual_spending_target": 80000.0,
+    "withdrawal_strategy": "tax_efficient",
 }
 
 DEFAULT_ACCOUNTS = [
@@ -225,6 +222,7 @@ def sidebar_profile():
         st.markdown("**Social Security**")
         p["social_security_benefit"] = st.number_input("Your SS Benefit ($/yr today's $)", 0, 60000, int(p.get("social_security_benefit", 0)), 500, key="p_ss")
         p["social_security_start_age"] = st.number_input("Your SS Start Age", 62, 70, p.get("social_security_start_age", 67), key="p_ss_age")
+        st.caption("Enter your estimated benefit in **today's dollars** (from SSA.gov 'my Social Security'). The simulation inflates to retirement-year nominal dollars and applies annual COLA.")
 
         if p["filing_status"] == "married_filing_jointly":
             st.markdown("**Spouse**")
@@ -236,7 +234,12 @@ def sidebar_profile():
 
         st.markdown("**Healthcare**")
         p["pre_medicare_healthcare"] = st.number_input("Pre-Medicare Annual Cost ($)", 0, 50000, int(p.get("pre_medicare_healthcare", 15000)), 500, key="p_hc_pre")
-        p["post_medicare_healthcare"] = st.number_input("Post-Medicare Annual Cost ($)", 0, 30000, int(p.get("post_medicare_healthcare", 5000)), 500, key="p_hc_post")
+        p["post_medicare_healthcare"] = st.number_input("Post-Medicare Annual Cost ($)", 0, 50000, int(p.get("post_medicare_healthcare", 12000)), 500, key="p_hc_post")
+        st.caption(
+            "Post-Medicare: include **Part B** (~$2,435/yr/person), Part D, supplemental (Medigap), dental/vision, and out-of-pocket. "
+            "IRMAA surcharges are computed separately from income and added on top. "
+            "A healthy couple with Medigap: ~$15,000–$20,000/yr."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +250,12 @@ def sidebar_assumptions():
     a = st.session_state.assumptions
     with st.sidebar.expander("📊 Assumptions", expanded=False):
         a["inflation_rate"] = _dec(st.number_input("Inflation Rate (%)", 0.0, 15.0, _pct(a["inflation_rate"]), 0.1, key="a_inf"))
+        a["bracket_inflation_rate"] = _dec(st.number_input(
+            "Tax Bracket Inflation Rate (%)", 0.0, 10.0,
+            float(round(_pct(a.get("bracket_inflation_rate", 0.025)), 1)),
+            0.1, key="a_bracket_inf",
+        ))
+        st.caption("Annual rate at which bracket thresholds, standard deduction, NIIT/IRMAA limits, and state brackets grow. SS taxability thresholds are not indexed — bracket creep on SS is intentional.")
         a["retirement_return_rate"] = _dec(st.number_input("Retirement Return Rate — capital appreciation (%)", 0.0, 15.0, _pct(a["retirement_return_rate"]), 0.1, key="a_ret"))
         st.caption("Applied to accounts set to 'use global rate'. Set this to total return minus dividend yield (e.g. 5% if portfolio returns 6.5% total and pays 1.5% dividends).")
 
@@ -267,6 +276,19 @@ def sidebar_assumptions():
                 int(a.get("annual_spending_target", 80000)), 1000, key="a_spend_target",
             ))
             st.caption("Desired after-tax spending in today's dollars, excluding healthcare. Inflated to retirement date then annually. The simulation grosses up withdrawals to cover taxes.")
+
+        st.markdown("**Withdrawal Strategy**")
+        a["withdrawal_strategy"] = st.radio(
+            "Account withdrawal order",
+            ["tax_efficient", "roth_preservation"],
+            format_func=lambda x: "Tax-Efficient (default)" if x == "tax_efficient" else "Roth Preservation",
+            index=0 if a.get("withdrawal_strategy", "tax_efficient") == "tax_efficient" else 1,
+            key="a_withdraw_strat",
+        )
+        st.caption(
+            "**Tax-Efficient**: fills traditional brackets to 22% before drawing Roth — minimizes current-year taxes. "
+            "**Roth Preservation**: drains traditional accounts first, letting Roth grow tax-free longer — higher taxes now, lower RMDs later."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +551,28 @@ def main():
         st.error(f"Calculation error: {e}")
         raise
 
+    # Build projected portfolio by age (accumulation per-account + retirement totals)
+    projected_by_age: dict[str, dict] = {}
+    if not acc_df.empty:
+        for age_val, grp in acc_df.groupby("age"):
+            projected_by_age[str(int(age_val))] = {
+                "total": float(grp["balance"].sum()),
+                "by_account": {
+                    row["account_id"]: {
+                        "name": row["account_name"],
+                        "type": row["account_type"],
+                        "balance": float(row["balance"]),
+                    }
+                    for _, row in grp.iterrows()
+                },
+            }
+    if not ret_df.empty:
+        for _, row in ret_df.iterrows():
+            age_str = str(int(row["age"]))
+            entry = projected_by_age.get(age_str, {})
+            entry["total"] = float(row["total_portfolio"])
+            projected_by_age[age_str] = entry
+
     # ---------------------------------------------------------------------------
     # Summary cards
     # ---------------------------------------------------------------------------
@@ -565,23 +609,23 @@ def main():
     # ---------------------------------------------------------------------------
     # Tabs
     # ---------------------------------------------------------------------------
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📈 Accumulation", "💰 Retirement", "✏️ Custom Spending", "📋 Data Tables", "⚠️ Warnings"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "📈 Accumulation", "💰 Retirement", "✏️ Custom Spending", "📋 Data Tables", "📊 Progress", "⚠️ Warnings", "🎲 Monte Carlo"
     ])
 
     with tab1:
-        st.plotly_chart(chart_accumulation(acc_df), use_container_width=True)
-        st.plotly_chart(chart_composition_at_retirement(accounts_at_retirement), use_container_width=True)
+        st.plotly_chart(_charts.chart_accumulation(acc_df), use_container_width=True)
+        st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), use_container_width=True)
 
         if acc_df["tax_drag"].sum() > 0:
             total_drag = acc_df.groupby("age")["tax_drag"].sum().sum()
             st.info(f"📊 Estimated tax drag on taxable accounts during accumulation: ${total_drag:,.0f} total.")
 
     with tab2:
-        st.plotly_chart(chart_drawdown(ret_df, accounts_at_retirement), use_container_width=True)
-        st.plotly_chart(chart_spending_coverage(ret_df), use_container_width=True)
-        st.plotly_chart(chart_annual_income(ret_df), use_container_width=True)
-        st.plotly_chart(chart_tax_burden(ret_df), use_container_width=True)
+        st.plotly_chart(_charts.chart_drawdown(ret_df, accounts_at_retirement, assumptions.get("inflation_rate", 0.03), profile["current_age"]), use_container_width=True)
+        st.plotly_chart(_charts.chart_spending_coverage(ret_df), use_container_width=True)
+        st.plotly_chart(_charts.chart_annual_income(ret_df, assumptions.get("inflation_rate", 0.03), profile["retirement_age"]), use_container_width=True)
+        st.plotly_chart(_charts.chart_tax_burden(ret_df), use_container_width=True)
 
     with tab3:
         fixed_net_mode = assumptions.get("spending_mode") == "fixed"
@@ -666,13 +710,27 @@ def main():
         ).reset_index()
         st.dataframe(acc_pivot.style.format("${:,.0f}", subset=acc_pivot.columns[1:]), use_container_width=True)
 
+        st.subheader("Retirement Account Balances")
+        bal_cols = ["age"] + [c for c in ret_df.columns if c.startswith("bal_")] + ["total_portfolio"]
+        bal_cols = [c for c in bal_cols if c in ret_df.columns]
+        bal_df = ret_df[bal_cols].copy()
+        col_rename = {"age": "Age", "total_portfolio": "Total Portfolio"}
+        for a in accounts_at_retirement:
+            col_key = f"bal_{a['name'].replace(' ', '_')}"
+            if col_key in bal_df.columns:
+                col_rename[col_key] = a["name"]
+        bal_df = bal_df.rename(columns=col_rename)
+        bal_df["Age"] = bal_df["Age"].astype(int)
+        dollar_cols = [c for c in bal_df.columns if c != "Age"]
+        st.dataframe(bal_df.style.format("${:,.0f}", subset=dollar_cols), use_container_width=True)
+
         st.subheader("Retirement Year-by-Year")
         display_cols = [
             "age", "spending_target", "net_spending_target", "actual_after_tax_net",
             "spending_override_active",
             "ss_income", "rental_income", "investment_income",
             "rmd_amount", "taxable_withdrawal", "traditional_withdrawal", "roth_withdrawal", "bank_withdrawal",
-            "roth_conversion", "ordinary_income", "ltcg_income",
+            "roth_conversion", "harvest_ltcg", "ordinary_income", "ltcg_income",
             "total_tax", "effective_tax_rate", "federal_irmaa", "healthcare_cost",
             "after_tax_spending", "total_portfolio",
         ]
@@ -686,24 +744,364 @@ def main():
         st.dataframe(ret_df[display_cols].style.format(fmt, na_rep="-"), use_container_width=True)
 
     with tab5:
+        scenario_name = st.session_state.get("sc_name", "My Scenario")
+        tracking = load_tracking(scenario_name)
+        baseline = tracking.get("baseline")
+        checkins = tracking.get("checkins", [])
+
+        # ── Baseline ──────────────────────────────────────────────────────────
+        st.subheader("Baseline Plan")
+        if baseline:
+            captured = baseline.get("captured_date", "unknown date")
+            proj_at_ret = baseline.get("projections_by_age", {}).get(
+                str(profile["retirement_age"]), {}
+            ).get("total")
+            col_bl1, col_bl2, col_bl3 = st.columns([3, 2, 2])
+            col_bl1.success(f"Baseline captured on **{captured}**")
+            if proj_at_ret:
+                col_bl2.metric("Projected at Retirement", f"${proj_at_ret:,.0f}")
+            if col_bl3.button("Update Baseline"):
+                tracking["baseline"] = {
+                    "captured_date": date.today().isoformat(),
+                    "projections_by_age": projected_by_age,
+                }
+                save_tracking(scenario_name, tracking)
+                st.success("Baseline updated.")
+                st.rerun()
+        else:
+            col_bl1, col_bl2 = st.columns([4, 2])
+            col_bl1.info("No baseline saved yet. Capture the current projection to start tracking progress.")
+            if col_bl2.button("Capture Baseline"):
+                tracking["baseline"] = {
+                    "captured_date": date.today().isoformat(),
+                    "projections_by_age": projected_by_age,
+                }
+                save_tracking(scenario_name, tracking)
+                st.success("Baseline captured.")
+                st.rerun()
+
+        st.divider()
+
+        # ── Add a check-in ────────────────────────────────────────────────────
+        st.subheader("Record Actual Balances")
+        col_age, col_note = st.columns([1, 2])
+        with col_age:
+            ci_age = st.number_input(
+                "Your Age at Check-in",
+                min_value=profile["current_age"],
+                max_value=profile["life_expectancy"],
+                value=profile["current_age"],
+                key="ci_age",
+            )
+        with col_note:
+            ci_note = st.text_input("Note (optional)", key="ci_note")
+
+        proj_at_ci_age = (baseline or {}).get("projections_by_age", {}).get(str(ci_age), {})
+        proj_by_account = proj_at_ci_age.get("by_account", {})
+
+        h1, h2, h3 = st.columns([3, 2, 2])
+        h1.markdown("**Account**")
+        h2.markdown("**Projected**")
+        h3.markdown("**Actual Balance**")
+
+        ci_balances: dict[str, float] = {}
+        for a in accounts:
+            c1, c2, c3 = st.columns([3, 2, 2])
+            c1.write(f"{a['name']}  \n*{ACCOUNT_TYPE_LABELS.get(a['type'], a['type'])}*")
+            proj_bal = proj_by_account.get(a["id"], {}).get("balance")
+            c2.write(f"${proj_bal:,.0f}" if proj_bal is not None else "—")
+            ci_balances[a["id"]] = float(c3.number_input(
+                a["name"],
+                min_value=0,
+                max_value=100_000_000,
+                value=0,
+                step=1000,
+                key=f"ci_bal_{a['id']}",
+                label_visibility="collapsed",
+            ))
+
+        ci_total = sum(ci_balances.values())
+        st.metric("Total Portfolio Entered", f"${ci_total:,.0f}")
+
+        save_disabled = ci_total <= 0
+        if st.button("Save Check-in", disabled=save_disabled):
+            checkins.append({
+                "id": str(uuid.uuid4())[:8],
+                "date": date.today().isoformat(),
+                "age": int(ci_age),
+                "note": ci_note,
+                "by_account": ci_balances,
+                "total": ci_total,
+            })
+            tracking["checkins"] = checkins
+            save_tracking(scenario_name, tracking)
+            st.success(f"Check-in saved — age {ci_age}: ${ci_total:,.0f}")
+            st.rerun()
+
+        st.divider()
+
+        # ── Comparison chart & history ─────────────────────────────────────────
+        if baseline:
+            if checkins:
+                st.plotly_chart(
+                    _charts.chart_progress_tracking(baseline["projections_by_age"], checkins),
+                    use_container_width=True,
+                )
+
+                st.subheader("Check-in History")
+                for c in sorted(checkins, key=lambda x: x["age"], reverse=True):
+                    proj_entry = baseline["projections_by_age"].get(str(c["age"]), {})
+                    proj_total = proj_entry.get("total")
+                    delta = (c["total"] - proj_total) if proj_total is not None else None
+                    pct = (delta / proj_total * 100) if (proj_total and delta is not None) else None
+
+                    status = ""
+                    if delta is not None:
+                        status = "✅ Ahead" if delta >= 0 else "❌ Behind"
+
+                    with st.expander(
+                        f"Age {c['age']} — {c.get('date', '?')}  |  "
+                        f"Actual: ${c['total']:,.0f}  |  "
+                        f"Projected: ${proj_total:,.0f}  |  "
+                        f"{'${:+,.0f} ({:+.1f}%)'.format(delta, pct) if delta is not None else '—'}  "
+                        f"{status}"
+                    ):
+                        # Per-account breakdown (accumulation years only)
+                        proj_by_acc = proj_entry.get("by_account", {})
+                        if proj_by_acc:
+                            rows_acc = []
+                            for a in accounts:
+                                actual_bal = c["by_account"].get(a["id"], 0.0)
+                                proj_bal = proj_by_acc.get(a["id"], {}).get("balance")
+                                acc_delta = (actual_bal - proj_bal) if proj_bal is not None else None
+                                rows_acc.append({
+                                    "Account": a["name"],
+                                    "Type": ACCOUNT_TYPE_LABELS.get(a["type"], a["type"]),
+                                    "Projected": proj_bal if proj_bal is not None else float("nan"),
+                                    "Actual": actual_bal,
+                                    "Delta ($)": acc_delta if acc_delta is not None else float("nan"),
+                                })
+                            df_acc = pd.DataFrame(rows_acc)
+                            fmt_acc = {
+                                "Projected": "${:,.0f}",
+                                "Actual": "${:,.0f}",
+                                "Delta ($)": "${:+,.0f}",
+                            }
+                            st.dataframe(
+                                df_acc.style.format(fmt_acc, na_rep="—"),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        elif c["by_account"]:
+                            # Retirement age check-in — show totals only (no per-account baseline)
+                            rows_ret = [
+                                {"Account": a["name"], "Actual": c["by_account"].get(a["id"], 0.0)}
+                                for a in accounts
+                                if c["by_account"].get(a["id"], 0.0) > 0
+                            ]
+                            st.dataframe(
+                                pd.DataFrame(rows_ret).style.format({"Actual": "${:,.0f}"}),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                        if c.get("note"):
+                            st.caption(f"Note: {c['note']}")
+
+                        if st.button("Delete this check-in", key=f"del_ci_{c['id']}"):
+                            tracking["checkins"] = [x for x in checkins if x["id"] != c["id"]]
+                            save_tracking(scenario_name, tracking)
+                            st.rerun()
+            else:
+                st.plotly_chart(
+                    _charts.chart_progress_tracking(baseline["projections_by_age"], []),
+                    use_container_width=True,
+                )
+                st.info("No check-ins recorded yet. Enter actual balances above to compare against the plan.")
+        else:
+            st.info("Capture a baseline first to see the comparison chart.")
+
+    with tab6:
         st.subheader("Warnings & Notes")
         warnings = summary.get("warnings", [])
         any_rental = any(a["type"] == "rental_property" for a in accounts)
 
-        if not warnings and not any_rental:
+        # Contribution limit checks (2026 IRS limits)
+        contrib_warnings = []
+        _cur_age = profile["current_age"]
+        for _acct in accounts:
+            _contrib = _acct.get("annual_contribution", 0)
+            if _contrib <= 0:
+                continue
+            _atype = _acct["type"]
+            if _atype in {"traditional_401k", "roth_401k"}:
+                _limit = 23500
+                if 50 <= _cur_age <= 59 or _cur_age >= 64:
+                    _limit += 7500
+                elif 60 <= _cur_age <= 63:
+                    _limit += 11250
+                if _contrib > _limit:
+                    contrib_warnings.append(
+                        f"**{_acct['name']}**: contribution ${_contrib:,.0f}/yr exceeds the 2026 401(k) limit of ${_limit:,.0f} for age {_cur_age}."
+                    )
+            elif _atype in {"traditional_ira", "roth_ira"}:
+                _limit = 7000 + (1000 if _cur_age >= 50 else 0)
+                if _contrib > _limit:
+                    contrib_warnings.append(
+                        f"**{_acct['name']}**: contribution ${_contrib:,.0f}/yr exceeds the 2026 IRA limit of ${_limit:,.0f} for age {_cur_age}."
+                    )
+            elif _atype == "hsa":
+                _limit = 8550 if profile.get("filing_status") == "married_filing_jointly" else 4300
+                if _contrib > _limit:
+                    contrib_warnings.append(
+                        f"**{_acct['name']}**: contribution ${_contrib:,.0f}/yr exceeds the 2026 HSA limit of ${_limit:,.0f}."
+                    )
+
+        has_contrib_warnings = bool(contrib_warnings)
+        has_sim_warnings = bool(warnings)
+
+        if not has_contrib_warnings and not has_sim_warnings and not any_rental:
             st.success("No warnings — your plan looks solid.")
         else:
+            for cw in contrib_warnings:
+                st.warning(f"📋 {cw}")
             for w in warnings:
                 if w["type"] == "depletion":
                     st.error(f"⚠️ {w['message']}")
                 elif w["type"] == "irmaa":
                     st.warning(f"📋 {w['message']}")
+                elif w["type"] == "irmaa_approaching":
+                    st.info(f"💡 {w['message']}")
                 elif w["type"] == "survivor_transition":
                     st.info(f"👥 {w['message']}")
                 elif w["type"] == "rmd_excess":
                     st.warning(f"🏦 {w['message']}")
             if any_rental:
                 st.info("ℹ️ Rental property: depreciation recapture (25%) is not modeled on sale. Consult a tax advisor.")
+
+
+    with tab7:
+        st.subheader("Monte Carlo Simulation")
+        st.caption(
+            "Runs thousands of trials with randomized annual returns (drawn from a normal distribution, "
+            "independently per account per year) to show the range of possible outcomes. "
+            "**Success** = portfolio never hits $0 before your life expectancy. "
+            "Spending, Social Security, and healthcare follow the same assumptions as the main simulation."
+        )
+
+        mc_col1, mc_col2 = st.columns([3, 1])
+        with mc_col1:
+            mc_vol = st.slider(
+                "Equity Volatility (std dev %)",
+                min_value=1, max_value=30, value=12, step=1,
+                help=(
+                    "Standard deviation of annual equity returns. "
+                    "US equities: ~15–17%. Balanced 60/40 portfolio: ~10–12%. Conservative: ~6–8%. "
+                    "Bond volatility is set to 30% of this value. "
+                    "Bank and rental accounts use their own lower volatility."
+                ),
+                key="mc_vol",
+            ) / 100.0
+        with mc_col2:
+            mc_n = int(st.number_input(
+                "Trials", min_value=100, max_value=5000, value=1000, step=100, key="mc_n"
+            ))
+
+        alloc_col1, alloc_col2 = st.columns(2)
+        with alloc_col1:
+            mc_stock_pct = st.slider(
+                "Stock Allocation (%)",
+                min_value=0, max_value=100, value=60, step=5,
+                help=(
+                    "Portion of each investment account (401k, IRA, Roth, taxable) modeled as equities. "
+                    "The remainder is modeled as bonds. Bank accounts and rental property are unaffected."
+                ),
+                key="mc_stock_pct",
+            ) / 100.0
+        with alloc_col2:
+            mc_bond_return = st.number_input(
+                "Bond Annual Return (%)",
+                min_value=0.0, max_value=10.0, value=3.5, step=0.1,
+                key="mc_bond_return",
+                help="Expected annual return on the bond portion. Bonds have lower volatility and do not crash.",
+            ) / 100.0
+
+        _stock_ret = assumptions.get("retirement_return_rate", 0.05)
+        _blended = mc_stock_pct * _stock_ret + (1 - mc_stock_pct) * mc_bond_return
+        st.caption(
+            f"Expected blended portfolio return: **{_blended:.1%}** "
+            f"({mc_stock_pct:.0%} stocks × {_stock_ret:.1%} + "
+            f"{1 - mc_stock_pct:.0%} bonds × {mc_bond_return:.1%}). "
+            f"Stock return uses the Retirement Return Rate from Assumptions."
+        )
+
+        mc_crashes = st.checkbox(
+            "Include market crash events (−20% equity shock every 10–20 years)",
+            value=False,
+            help=(
+                "Each trial independently schedules one or more crashes during retirement, "
+                "spaced 10–20 years apart. In a crash year, all equity accounts (401k, IRA, Roth, taxable) "
+                "take an additional −20% drop on top of that year's normal random return. "
+                "Bank accounts and rental property are not affected."
+            ),
+            key="mc_crashes",
+        )
+
+        if st.button("▶ Run Monte Carlo", type="primary", key="mc_run"):
+            with st.spinner(f"Running {mc_n:,} simulations…"):
+                mc_result = _mc.run_monte_carlo(
+                    accounts_at_retirement=accounts_at_retirement,
+                    profile=profile,
+                    assumptions=assumptions,
+                    n_runs=mc_n,
+                    volatility=mc_vol,
+                    enable_crashes=mc_crashes,
+                    stock_pct=mc_stock_pct,
+                    bond_return_rate=mc_bond_return,
+                )
+            st.session_state["mc_result"] = mc_result
+
+        mc_result = st.session_state.get("mc_result")
+        if mc_result:
+            # Invalidate cached result if settings changed since last run
+            stale = (
+                mc_result.get("volatility") != mc_vol
+                or mc_result.get("n_runs") != mc_n
+                or mc_result.get("enable_crashes") != mc_crashes
+                or mc_result.get("stock_pct") != mc_stock_pct
+                or mc_result.get("bond_return_rate") != mc_bond_return
+            )
+            if stale:
+                st.info("Settings changed — click **▶ Run Monte Carlo** to refresh results.")
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Success Rate", f"{mc_result['success_rate']:.1%}")
+            m2.metric(
+                "Median at Life Expectancy",
+                f"${mc_result['percentiles'][50][-1]:,.0f}",
+            )
+            m3.metric(
+                "10th Percentile at Life Expectancy",
+                f"${mc_result['percentiles'][10][-1]:,.0f}",
+            )
+            m4.metric(
+                "Trials Depleted",
+                f"{mc_result['n_depleted']:,} / {mc_result['n_runs']:,}",
+            )
+
+            det_portfolio = ret_df["total_portfolio"].tolist() if not ret_df.empty else []
+            st.plotly_chart(
+                _charts.chart_monte_carlo(mc_result, det_portfolio),
+                use_container_width=True,
+            )
+
+            if mc_result["n_depleted"] > 0:
+                st.plotly_chart(
+                    _charts.chart_mc_depletion(mc_result),
+                    use_container_width=True,
+                )
+        else:
+            st.info("Configure your plan in the sidebar, then click **▶ Run Monte Carlo** to see results.")
 
 
 if __name__ == "__main__":

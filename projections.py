@@ -1,6 +1,15 @@
 import pandas as pd
 from taxes import marginal_rate, calculate_ltcg_tax, LTCG_BRACKETS
-from constants import RMD_START_AGE
+from constants import RMD_START_AGE, STANDARD_DEDUCTION, CA_ORDINARY_BRACKETS, CA_STANDARD_DEDUCTION
+
+
+def _ca_marginal_rate(income: float, filing_status: str) -> float:
+    """CA marginal rate on ordinary income at a given AGI (used for accumulation tax drag)."""
+    ca_taxable = max(0.0, income - CA_STANDARD_DEDUCTION[filing_status])
+    for upper, rate in CA_ORDINARY_BRACKETS[filing_status]:
+        if upper is None or ca_taxable <= upper:
+            return rate
+    return CA_ORDINARY_BRACKETS[filing_status][-1][1]
 
 
 TAXABLE_TYPES = {"taxable", "reit"}
@@ -56,17 +65,18 @@ def project_accumulation(accounts: list[dict], profile: dict, assumptions: dict)
 
             if atype == "rental_property":
                 passive_income = a.get("net_annual_rental_income", 0.0)
-                eff_state = marginal_rate(passive_income, filing_status) if state == "california" else state_rate
+                eff_state = _ca_marginal_rate((current_income or 0) + passive_income, filing_status) if state == "california" else state_rate
                 tax_drag = passive_income * (fed_rate + eff_state)
 
             elif atype in TAXABLE_TYPES:
                 qual_div = bal * a.get("qualified_dividend_yield", 0.0)
                 ord_inc = bal * a.get("ordinary_income_yield", 0.0)
                 passive_income = qual_div + ord_inc
-                eff_state = fed_rate if state == "california" else state_rate
+                # CA marginal rate on ordinary income (CA taxes LTCGs as ordinary income too)
+                eff_state = _ca_marginal_rate(current_income or 0, filing_status) if state == "california" else state_rate
                 tax_drag = (
                     ord_inc * (fed_rate + eff_state)
-                    + calculate_ltcg_tax(qual_div, max(0, (current_income or 0) - 16100), filing_status)
+                    + calculate_ltcg_tax(qual_div, max(0, (current_income or 0) - STANDARD_DEDUCTION[filing_status]), filing_status)
                     + (qual_div * eff_state if state == "california" else 0)
                 )
 

@@ -3,10 +3,12 @@ import os
 from pathlib import Path
 
 SCENARIOS_DIR = Path(__file__).parent / "scenarios"
+TRACKING_DIR = SCENARIOS_DIR / "tracking"
 
 
 def _ensure_dir():
     SCENARIOS_DIR.mkdir(exist_ok=True)
+    TRACKING_DIR.mkdir(exist_ok=True)
 
 
 def list_scenarios() -> list[str]:
@@ -54,3 +56,28 @@ def delete_scenario(name: str) -> None:
     path = SCENARIOS_DIR / f"{name}.json"
     if path.exists():
         path.unlink()
+
+
+def _safe_name(name: str) -> str:
+    return "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip()
+
+
+def load_tracking(name: str) -> dict:
+    _ensure_dir()
+    path = TRACKING_DIR / f"{_safe_name(name)}_tracking.json"
+    if not path.exists():
+        # Migrate old tracking file from scenarios/ if it exists there
+        old_path = SCENARIOS_DIR / f"{_safe_name(name)}_tracking.json"
+        if old_path.exists():
+            data = json.loads(old_path.read_text(encoding="utf-8"))
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            old_path.unlink()
+            return data
+        return {"baseline": None, "checkins": []}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_tracking(name: str, tracking: dict) -> None:
+    _ensure_dir()
+    path = TRACKING_DIR / f"{_safe_name(name)}_tracking.json"
+    path.write_text(json.dumps(tracking, indent=2), encoding="utf-8")

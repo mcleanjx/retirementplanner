@@ -1,6 +1,6 @@
 import copy
 import pandas as pd
-from constants import RMD_TABLE, RMD_START_AGE, STANDARD_DEDUCTION, BRACKET_CEILINGS
+from constants import RMD_TABLE, RMD_START_AGE, STANDARD_DEDUCTION, BRACKET_CEILINGS, IRMAA_TIERS
 from taxes import (
     calculate_year_taxes,
     calculate_ss_taxable_amount,
@@ -80,16 +80,24 @@ def simulate_retirement(
     filing_status = profile["filing_status"]
     state = profile.get("state", "california")
     state_rate = profile.get("state_tax_rate", 0.0)
-    ss_benefit = profile.get("social_security_benefit", 0.0)
+    inflation = assumptions.get("inflation_rate", 0.03)
+    # Inflate SS from today's dollars to retirement-year nominal dollars.
+    # SSA's "my Social Security" shows benefits in today's purchasing power;
+    # the simulation runs in nominal dollars so we must convert before the loop.
+    _years_to_ret = max(0, profile.get("retirement_age", 65) - profile.get("current_age", 0))
+    _ss_inflate = (1 + inflation) ** _years_to_ret
+    ss_benefit = profile.get("social_security_benefit", 0.0) * _ss_inflate
     ss_start = profile.get("social_security_start_age", 67)
-    spouse_ss = profile.get("spouse_ss_benefit", 0.0)
+    spouse_ss = profile.get("spouse_ss_benefit", 0.0) * _ss_inflate
     spouse_ss_start = profile.get("spouse_ss_start_age", 67)
     spouse_age_offset = (profile.get("spouse_age", profile.get("current_age", 0))
                          - profile.get("current_age", 0))
     survivor_reduction = profile.get("survivor_spending_reduction", 0.25)
-    inflation = assumptions.get("inflation_rate", 0.03)
+    bracket_inflation = assumptions.get("bracket_inflation_rate", 0.025)
     swr = assumptions.get("safe_withdrawal_rate", 0.04)
     ret_return = assumptions.get("retirement_return_rate", 0.05)
+    withdrawal_strategy = assumptions.get("withdrawal_strategy", "tax_efficient")
+    current_age = profile["current_age"]
 
     # Initial spending target (nominal at retirement)
     total_portfolio = sum(a["balance"] for a in accts)
@@ -114,8 +122,11 @@ def simulate_retirement(
     # We track taxes / total_cash_received (not taxes / ordinary_income) so that
     # tax-free Roth withdrawals are included in the denominator — this prevents
     # the gross-up from overshooting when Roth accounts cover part of spending.
-    # 0.15 is a reasonable starting estimate (converges in 1-2 years).
+    # LTCG rate is tracked separately because qualified dividends are often taxed
+    # at 0% for retirees — lumping them with ordinary income grossly overstates
+    # the tax provision on passive income.
     prev_eff_rate = 0.15 if fixed_net_mode else 0.22
+    prev_ltcg_rate = 0.0  # LTCG on qualified dividends is 0% for most retirees at moderate income
 
     rows = []
     warnings = []
@@ -130,6 +141,7 @@ def simulate_retirement(
 
     for age in range(retirement_age, life_expectancy + 1):
         spouse_age = age + spouse_age_offset if filing_status == "married_filing_jointly" else None
+        bracket_factor = (1 + bracket_inflation) ** (age - current_age)
 
         # --- Step 0: Survivor transition ---
         if (not survivor_triggered
@@ -220,11 +232,11 @@ def simulate_retirement(
             conv_start = roth_conversion.get("start_age", retirement_age)
             conv_end = roth_conversion.get("end_age", min(ss_start - 1, RMD_START_AGE - 1))
             if conv_start <= age <= conv_end:
-                std_ded = STANDARD_DEDUCTION[current_fs]
+                std_ded = STANDARD_DEDUCTION[current_fs] * bracket_factor
                 strategy = roth_conversion.get("strategy", "fill_to_bracket")
                 if strategy == "fill_to_bracket":
                     target_rate = roth_conversion.get("target_bracket", 0.12)
-                    ceiling = bracket_ceiling_for_rate(target_rate, current_fs) + std_ded
+                    ceiling = bracket_ceiling_for_rate(target_rate, current_fs, bracket_factor) + std_ded
                     headroom = max(0.0, ceiling - ordinary_income)
                 elif strategy == "fixed_amount":
                     headroom = roth_conversion.get("fixed_amount", 0.0)
@@ -258,11 +270,29 @@ def simulate_retirement(
                         roth_conversion_amount = convert
                         conversion_vintages[age] = conversion_vintages.get(age, 0) + convert
 
+        # Conversion taxes must be paid in cash from the portfolio — not just silently reduce
+        # after_tax_spending. Estimate using target bracket rate (or prev_eff_rate for fixed_amount)
+        # and add to total_spending_need so the surplus-reinvestment check stays accurate.
+        conv_tax_estimate = 0.0
+        if roth_conversion_amount > 0:
+            rc = roth_conversion or {}
+            conv_rate = rc.get("target_bracket", 0.22) if rc.get("strategy", "fill_to_bracket") == "fill_to_bracket" else prev_eff_rate
+            conv_tax_estimate = roth_conversion_amount * conv_rate
+            total_spending_need += conv_tax_estimate
+
         # --- Step 4: Tax-free capital gains harvesting ---
+        # Headroom = how much more LTCG can be realized at 0% federal rate.
+        # The 0% bracket ceiling applies to *taxable* income (after std deduction).
+        # Formula: max LTCG at 0% satisfies  ordinary_income + LTCG - std_ded ≤ limit
+        #   → LTCG ≤ limit + std_ded - ordinary_income
+        # When ordinary_income < std_ded the unused deduction flows through to shelter
+        # LTCG, which is why (ordinary_income - std_ded) is subtracted (becomes negative,
+        # effectively adding the residual deduction to the headroom).
         from constants import LTCG_BRACKETS
-        ltcg_zero_limit = LTCG_BRACKETS[current_fs][0][0]
-        ltcg_headroom = max(0.0, ltcg_zero_limit - (ordinary_income - STANDARD_DEDUCTION[current_fs]) - ltcg_income)
+        ltcg_zero_limit = LTCG_BRACKETS[current_fs][0][0] * bracket_factor
+        ltcg_headroom = max(0.0, ltcg_zero_limit - (ordinary_income - STANDARD_DEDUCTION[current_fs] * bracket_factor) - ltcg_income)
         harvest_total = 0.0
+        harvest_ltcg = 0.0
         for a in accts:
             if a["type"] in TAXABLE_TYPES and a["balance"] > 0 and ltcg_headroom > 0:
                 gr = _gain_ratio(a)
@@ -275,18 +305,25 @@ def simulate_retirement(
                     ltcg_headroom -= harvest
         # Harvested gains are realized LTCG (taxed at 0%) and must appear in MAGI
         # so IRMAA and NIIT thresholds are correctly triggered.
-        ltcg_income += harvest_total
+        harvest_ltcg = harvest_total
+        ltcg_income += harvest_ltcg
 
         # --- Step 5: Discretionary withdrawals ---
         if fixed_net_mode:
             # Refine gross target now that passive income is known.
-            # Approximate after-tax value of passive income using prev effective rate,
-            # then gross up only the remaining gap.
-            passive_net_approx = passive_income_total * (1 - prev_eff_rate)
+            # Use separate rates for LTCG income (qualified dividends, often 0%) and
+            # ordinary passive income (SS, rental, interest) to avoid over-grossing
+            # in portfolios where most passive income is LTCG.
+            passive_ordinary = total_ss + rental_income + inv_ordinary
+            passive_ordinary_net = passive_ordinary * (1 - prev_eff_rate)
+            passive_ltcg_net = inv_ltcg * (1 - prev_ltcg_rate)
+            passive_net_approx = passive_ordinary_net + passive_ltcg_net
             net_still_needed = max(0.0, base_this_year + hc_cost - passive_net_approx)
             remaining_need = net_still_needed / max(0.05, 1 - prev_eff_rate) - rmd_total
-            remaining_need = max(0.0, remaining_need)
+            # conv_tax_estimate not in the gross-up above; fund it directly.
+            remaining_need = max(0.0, remaining_need) + conv_tax_estimate
         else:
+            # total_spending_need already includes conv_tax_estimate (added after Step 3).
             remaining_need = max(0.0, total_spending_need - passive_income_total - rmd_total)
         withdrawal_detail = {}
         total_discretionary_withdrawn = 0.0
@@ -317,34 +354,9 @@ def simulate_retirement(
             taxable_withdrawn += w
             withdrawal_detail[a["name"]] = withdrawal_detail.get(a["name"], 0) + w
 
-        # 5b. Traditional (fill up to top of 22% before Roth)
-        std_ded = STANDARD_DEDUCTION[current_fs]
-        traditional_ceiling = BRACKET_CEILINGS[current_fs].get(0.22, 1e9) + std_ded
-        for a in sorted([a for a in accts if a["type"] in TRADITIONAL_TYPES], key=lambda x: -x["balance"]):
-            if remaining_need <= 0:
-                break
-            trad_headroom = max(0.0, traditional_ceiling - ordinary_income)
-            w_amount = min(remaining_need, trad_headroom)
-            w, oi, lg = _withdraw_from(a, w_amount)
-            ordinary_income += oi
-            ltcg_income += lg
-            remaining_need -= w
-            total_discretionary_withdrawn += w
-            traditional_withdrawn += w
-            withdrawal_detail[a["name"]] = withdrawal_detail.get(a["name"], 0) + w
-
-        # 5c. Roth
-        for a in sorted([a for a in accts if a["type"] in ROTH_TYPES], key=lambda x: -x["balance"]):
-            if remaining_need <= 0:
-                break
-            w, oi, lg = _withdraw_from(a, remaining_need)
-            remaining_need -= w
-            total_discretionary_withdrawn += w
-            roth_withdrawn += w
-            withdrawal_detail[a["name"]] = withdrawal_detail.get(a["name"], 0) + w
-
-        # 5d. Fall back to remaining Traditional if still short
-        if remaining_need > 0:
+        if withdrawal_strategy == "roth_preservation":
+            # 5b. Drain traditional accounts fully before touching Roth.
+            # Accepts higher brackets now to let Roth grow tax-free longer.
             for a in sorted([a for a in accts if a["type"] in TRADITIONAL_TYPES], key=lambda x: -x["balance"]):
                 if remaining_need <= 0:
                     break
@@ -354,6 +366,58 @@ def simulate_retirement(
                 total_discretionary_withdrawn += w
                 traditional_withdrawn += w
                 withdrawal_detail[a["name"]] = withdrawal_detail.get(a["name"], 0) + w
+
+            # 5c. Roth — only once traditional is exhausted
+            for a in sorted([a for a in accts if a["type"] in ROTH_TYPES], key=lambda x: -x["balance"]):
+                if remaining_need <= 0:
+                    break
+                w, oi, lg = _withdraw_from(a, remaining_need)
+                remaining_need -= w
+                total_discretionary_withdrawn += w
+                roth_withdrawn += w
+                withdrawal_detail[a["name"]] = withdrawal_detail.get(a["name"], 0) + w
+
+        else:
+            # tax_efficient (default): fill traditional to top of 22% bracket, then Roth,
+            # then overflow back to traditional if still short.
+            std_ded = STANDARD_DEDUCTION[current_fs] * bracket_factor
+            traditional_ceiling = BRACKET_CEILINGS[current_fs].get(0.22, 1e9) * bracket_factor + std_ded
+
+            # 5b. Traditional up to 22% ceiling
+            for a in sorted([a for a in accts if a["type"] in TRADITIONAL_TYPES], key=lambda x: -x["balance"]):
+                if remaining_need <= 0:
+                    break
+                trad_headroom = max(0.0, traditional_ceiling - ordinary_income)
+                w_amount = min(remaining_need, trad_headroom)
+                w, oi, lg = _withdraw_from(a, w_amount)
+                ordinary_income += oi
+                ltcg_income += lg
+                remaining_need -= w
+                total_discretionary_withdrawn += w
+                traditional_withdrawn += w
+                withdrawal_detail[a["name"]] = withdrawal_detail.get(a["name"], 0) + w
+
+            # 5c. Roth
+            for a in sorted([a for a in accts if a["type"] in ROTH_TYPES], key=lambda x: -x["balance"]):
+                if remaining_need <= 0:
+                    break
+                w, oi, lg = _withdraw_from(a, remaining_need)
+                remaining_need -= w
+                total_discretionary_withdrawn += w
+                roth_withdrawn += w
+                withdrawal_detail[a["name"]] = withdrawal_detail.get(a["name"], 0) + w
+
+            # 5d. Fall back to remaining Traditional if still short
+            if remaining_need > 0:
+                for a in sorted([a for a in accts if a["type"] in TRADITIONAL_TYPES], key=lambda x: -x["balance"]):
+                    if remaining_need <= 0:
+                        break
+                    w, oi, lg = _withdraw_from(a, remaining_need)
+                    ordinary_income += oi
+                    remaining_need -= w
+                    total_discretionary_withdrawn += w
+                    traditional_withdrawn += w
+                    withdrawal_detail[a["name"]] = withdrawal_detail.get(a["name"], 0) + w
 
         # Total cash received from all sources this year.
         # Uses total_ss directly (not ss_taxable) to avoid double-counting.
@@ -382,10 +446,12 @@ def simulate_retirement(
                 })
 
         # --- Step 6: IRMAA + NIIT ---
+        # Use current_fs (not the original filing_status) so that after the survivor
+        # transition we only count one Medicare enrollee, not two.
         num_medicare = 0
         if age >= 65:
             num_medicare += 1
-        if spouse_age is not None and spouse_age >= 65:
+        if current_fs == "married_filing_jointly" and spouse_age is not None and spouse_age >= 65:
             num_medicare += 1
 
         # NII = ordinary dividends + LTCG income (qualified divs + gains) + passive rental.
@@ -404,6 +470,7 @@ def simulate_retirement(
             state_tax_rate=state_rate,
             net_investment_income=nii,
             ss_taxable_amount=ss_taxable,
+            bracket_factor=bracket_factor,
         )
         lifetime_taxes += taxes["total"]
 
@@ -413,6 +480,28 @@ def simulate_retirement(
                 "type": "irmaa",
                 "message": f"Age {age}: IRMAA surcharge of ${taxes['federal_irmaa']:,.0f} applies (MAGI ${taxes['magi']:,.0f}).",
             })
+        # Proactive IRMAA cliff alert — fires when MAGI is within $10,000 of the next tier.
+        if age >= 65 and num_medicare > 0:
+            _magi = taxes["magi"]
+            for _i, (_mfj_u, _sing_u, _pb, _pd) in enumerate(IRMAA_TIERS[:-1]):
+                _tier_upper = _mfj_u if current_fs == "married_filing_jointly" else _sing_u
+                if _tier_upper is None:
+                    continue
+                _scaled = _tier_upper * bracket_factor
+                if _magi < _scaled and _magi >= _scaled - 10000:
+                    _nx = IRMAA_TIERS[_i + 1]
+                    _add = (_nx[2] + _nx[3] - _pb - _pd) * 12 * num_medicare
+                    if _add > 0:
+                        warnings.append({
+                            "age": age,
+                            "type": "irmaa_approaching",
+                            "message": (
+                                f"Age {age}: MAGI ${_magi:,.0f} is ${_scaled - _magi:,.0f} below "
+                                f"the next IRMAA tier (${_scaled:,.0f}). "
+                                f"Staying below saves ${_add:,.0f}/yr in Medicare surcharges."
+                            ),
+                        })
+                    break
 
         # --- Step 7: Apply returns, inflate, advance ---
         for a in accts:
@@ -423,6 +512,9 @@ def simulate_retirement(
                 a["balance"] *= (1 + ret_return)
 
         spending_target *= (1 + inflation)
+        # SS COLA — benefits grow roughly with CPI each year, matching the inflation assumption.
+        ss_benefit *= (1 + inflation)
+        spouse_ss *= (1 + inflation)   # 0 after survivor transition; harmless
         total_balance = sum(a["balance"] for a in accts)
 
         if total_balance <= 0 and portfolio_depleted_age is None:
@@ -442,6 +534,9 @@ def simulate_retirement(
 
         # Update effective rate against spendable cash (not total) for next year's gross-up.
         prev_eff_rate = max(0.05, taxes["total"] / max(1.0, spendable_cash))
+        # Update LTCG rate separately so dividend-heavy portfolios aren't over-grossed.
+        if ltcg_income > 0:
+            prev_ltcg_rate = min(0.25, taxes["federal_ltcg"] / max(1.0, ltcg_income))
 
         rows.append({
             "age": age,
@@ -458,6 +553,7 @@ def simulate_retirement(
             "roth_withdrawal": roth_withdrawn,
             "bank_withdrawal": bank_withdrawn,
             "roth_conversion": roth_conversion_amount,
+            "harvest_ltcg": harvest_ltcg,
             "ordinary_income": ordinary_income,
             "ltcg_income": ltcg_income,
             "federal_ordinary_tax": taxes["federal_ordinary"],
