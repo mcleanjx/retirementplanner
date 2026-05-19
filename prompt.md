@@ -498,6 +498,8 @@ On startup, `_init_state()` automatically loads the **most recently modified** s
 
 Widget key naming convention for account checkboxes: use `chk_global_{account_id}` (not `a_*`) so the keys survive the `_apply_pending_load()` deletion sweep of `a_*` and `p_*` keys. Streamlit's widget binding survives `del st.session_state[key]`, so the prefix must stay outside the deletion range.
 
+**Scenario load — explicit widget key seeding:** Streamlit processes the browser's widget payload before the script runs. Even after `_apply_pending_load()` deletes `p_age`, `p_ret`, etc., browser-restored values can survive and override the loaded data when the widgets render. Fix: after the deletion loop, explicitly set every integer-typed profile widget key (`p_age`, `p_ret`, `p_le`, `p_income`, `p_ss`, `p_ss_age`, `p_sp_age`, `p_sp_ss`, `p_sp_ss_age`, `p_hc_pre`, `p_hc_post`) to the values from the loaded profile. Float and select keys (`p_fs`, `p_state`, `p_state_rate`, `p_surv`) still rely on key deletion + the widget's `value=` parameter because they require unit conversions (decimal ↔ percentage) that the generic seeding loop cannot do uniformly.
+
 ### State Structure
 
 Use Python dataclasses or dicts stored in `st.session_state`:
@@ -653,8 +655,7 @@ Runs N independent trials (default 1,000) with randomized annual returns to mode
 
 **User Inputs (Monte Carlo tab):**
 - **Equity Volatility** (slider, 1–30%, default 12%): standard deviation of annual equity returns. US equities: ~15–17%; balanced 60/40: ~10–12%; conservative: ~6–8%.
-- **Stock Allocation** (slider, 0–100%, default 60%): fraction of each investment account (401k, IRA, Roth, taxable) modeled as equities. The remainder is bonds.
-- **Bond Annual Return** (number input, default 3.5%): expected return on the bond portion. A live caption shows the resulting blended expected return.
+- **Stock Allocation** (slider, 0–100%, default 60%): fraction of each investment account (401k, IRA, Roth, taxable) modeled as equities. The remainder is bonds. Controls path volatility only — does **not** change the expected return.
 - **Trials** (number input, 100–5,000, default 1,000)
 - **Include market crash events** (checkbox, default off): schedules random −20% equity shocks every 10–20 years in each trial.
 
@@ -662,12 +663,13 @@ Runs N independent trials (default 1,000) with randomized annual returns to mode
 
 For investment accounts (all except bank and rental property):
 ```
-stock_r ~ N(stock_mean, equity_vol)          # equity draw
-bond_r  ~ N(bond_return_rate, equity_vol × 0.30)  # bonds: ~30% as volatile
-blended_r = stock_pct × stock_r + (1 − stock_pct) × bond_r
-balance *= (1 + max(−0.60, blended_r))       # floor at −60%
+port_mean = account's own rate (if use_global_return_rate=False), else ret_return
+bond_vol  = equity_vol × 0.30
+port_vol  = stock_pct × equity_vol + (1 − stock_pct) × bond_vol   # blended volatility
+r ~ N(port_mean, port_vol)
+balance *= (1 + max(−0.60, r))       # floor at −60%
 ```
-Where `stock_mean` = the account's global retirement return rate (or its own rate if `use_global_return_rate=False`).
+The expected return equals `ret_return` (the global Retirement Return Rate from Assumptions), matching the deterministic simulation exactly. Stock allocation scales only the path volatility — a 60/40 portfolio is more volatile than a 20/80 portfolio, but both have the same expected return. The 50th-percentile MC path sits slightly below the deterministic line due to unavoidable volatility drag (geometric mean ≈ arithmetic mean − σ²/2).
 
 For bank accounts: `N(own_rate, equity_vol × 0.10)` — near-deterministic.
 For rental property: `N(own_rate, equity_vol × 0.40)` — lower vol than equities, not split by stock/bond.

@@ -142,6 +142,7 @@ def simulate_retirement(
     for age in range(retirement_age, life_expectancy + 1):
         spouse_age = age + spouse_age_offset if filing_status == "married_filing_jointly" else None
         bracket_factor = (1 + bracket_inflation) ** (age - current_age)
+        start_portfolio = sum(a["balance"] for a in accts)
 
         # --- Step 0: Survivor transition ---
         if (not survivor_triggered
@@ -281,29 +282,61 @@ def simulate_retirement(
             total_spending_need += conv_tax_estimate
 
         # --- Step 4: Tax-free capital gains harvesting ---
-        # Headroom = how much more LTCG can be realized at 0% federal rate.
-        # The 0% bracket ceiling applies to *taxable* income (after std deduction).
-        # Formula: max LTCG at 0% satisfies  ordinary_income + LTCG - std_ded ≤ limit
-        #   → LTCG ≤ limit + std_ded - ordinary_income
-        # When ordinary_income < std_ded the unused deduction flows through to shelter
-        # LTCG, which is why (ordinary_income - std_ded) is subtracted (becomes negative,
-        # effectively adding the residual deduction to the headroom).
+        # Headroom = how much more LTCG can fit in the 0% federal bracket above what
+        # withdrawals will already consume.  We estimate withdrawal LTCG first so we
+        # don't harvest gains that would have been at 0% via withdrawals anyway — doing
+        # so just shifts those gains into the 15% bucket and adds California state tax
+        # on the harvest with no offsetting federal benefit.
         from constants import LTCG_BRACKETS
+        std_ded_now = STANDARD_DEDUCTION[current_fs] * bracket_factor
         ltcg_zero_limit = LTCG_BRACKETS[current_fs][0][0] * bracket_factor
-        ltcg_headroom = max(0.0, ltcg_zero_limit - (ordinary_income - STANDARD_DEDUCTION[current_fs] * bracket_factor) - ltcg_income)
+
+        # Estimate the LTCG the upcoming withdrawals will generate so we can reserve
+        # that slice of the 0% bucket for them.
+        harvest_candidates = [
+            a for a in accts
+            if a["type"] in TAXABLE_TYPES
+            and a["balance"] > 0
+            and a.get("withdraw_priority", "normal") != "last"
+            and _gain_ratio(a) > 0
+        ]
+        _taxable_bal = sum(a["balance"] for a in harvest_candidates)
+        _taxable_gain = sum(a["balance"] * _gain_ratio(a) for a in harvest_candidates)
+        _weighted_gr = _taxable_gain / _taxable_bal if _taxable_bal > 0 else 0.0
+        if fixed_net_mode:
+            _passive_net_est = inv_ltcg * (1 - prev_ltcg_rate)
+            _net_needed_est = max(0.0, base_this_year + hc_cost - _passive_net_est)
+            _withdrawal_est = max(0.0, _net_needed_est / max(0.05, 1 - prev_eff_rate) - rmd_total)
+        else:
+            _withdrawal_est = max(0.0, total_spending_need - passive_income_total - rmd_total)
+        # Bank/cash covers withdrawals first with zero LTCG — only the portion that
+        # spills into taxable accounts actually generates capital gains.
+        _bank_available = sum(a["balance"] for a in accts if a["type"] in BANK_TYPES)
+        _from_taxable_est = max(0.0, _withdrawal_est - _bank_available)
+        estimated_withdrawal_ltcg = _from_taxable_est * _weighted_gr
+
+        # True headroom = 0%-bracket space above dividends AND estimated withdrawal LTCG.
+        ltcg_headroom = max(0.0,
+            ltcg_zero_limit
+            - (ordinary_income - std_ded_now)
+            - ltcg_income                    # dividends already realized
+            - estimated_withdrawal_ltcg      # reserve space for withdrawal gains
+        )
+
         harvest_total = 0.0
         harvest_ltcg = 0.0
-        for a in accts:
-            if a["type"] in TAXABLE_TYPES and a["balance"] > 0 and ltcg_headroom > 0:
-                gr = _gain_ratio(a)
-                harvestable = a["balance"] * gr
-                harvest = min(harvestable, ltcg_headroom)
-                if harvest > 0:
-                    # Sell and rebuy: net basis increase = harvest amount; no cash generated.
-                    a["basis"] = a.get("basis", 0.0) + harvest
-                    harvest_total += harvest
-                    ltcg_headroom -= harvest
-        # Harvested gains are realized LTCG (taxed at 0%) and must appear in MAGI
+        total_harvestable = sum(a["balance"] * _gain_ratio(a) for a in harvest_candidates)
+        for a in harvest_candidates:
+            if ltcg_headroom <= 0:
+                break
+            harvestable = a["balance"] * _gain_ratio(a)
+            share = ltcg_headroom * (harvestable / total_harvestable) if total_harvestable > 0 else 0.0
+            harvest = min(harvestable, share)
+            if harvest > 0:
+                # Sell and rebuy: net basis increase = harvest amount; no cash generated.
+                a["basis"] = a.get("basis", 0.0) + harvest
+                harvest_total += harvest
+        # Harvested gains are realized LTCG and must appear in MAGI
         # so IRMAA and NIIT thresholds are correctly triggered.
         harvest_ltcg = harvest_total
         ltcg_income += harvest_ltcg
@@ -331,6 +364,7 @@ def simulate_retirement(
         taxable_withdrawn = 0.0
         traditional_withdrawn = 0.0
         roth_withdrawn = 0.0
+        withdrawal_ltcg = 0.0
 
         # 5_bank. Bank/cash accounts first (no tax cost, low return — drain first)
         for a in sorted([a for a in accts if a["type"] in BANK_TYPES], key=lambda x: -x["balance"]):
@@ -342,17 +376,32 @@ def simulate_retirement(
             bank_withdrawn += w
             withdrawal_detail[a["name"]] = withdrawal_detail.get(a["name"], 0) + w
 
-        # 5a. Taxable / REIT
-        for a in sorted([a for a in accts if a["type"] in TAXABLE_TYPES], key=lambda x: -x["balance"]):
-            if remaining_need <= 0:
-                break
-            w, oi, lg = _withdraw_from(a, remaining_need)
-            ordinary_income += oi
-            ltcg_income += lg
-            remaining_need -= w
-            total_discretionary_withdrawn += w
-            taxable_withdrawn += w
-            withdrawal_detail[a["name"]] = withdrawal_detail.get(a["name"], 0) + w
+        # 5a. Taxable / REIT — proportional across "normal" priority accounts.
+        # Accounts flagged withdraw_priority="last" are held until everything else is exhausted.
+        def _withdraw_taxable_proportional(candidates, need):
+            nonlocal ordinary_income, ltcg_income, withdrawal_ltcg
+            nonlocal total_discretionary_withdrawn, taxable_withdrawn
+            active = [a for a in candidates if a["balance"] > 0]
+            if not active or need <= 0:
+                return need
+            total_bal = sum(a["balance"] for a in active)
+            to_withdraw = min(need, total_bal)
+            for a in active:
+                share = to_withdraw * (a["balance"] / total_bal)
+                w, oi, lg = _withdraw_from(a, share)
+                ordinary_income += oi
+                ltcg_income += lg
+                withdrawal_ltcg += lg
+                total_discretionary_withdrawn += w
+                taxable_withdrawn += w
+                withdrawal_detail[a["name"]] = withdrawal_detail.get(a["name"], 0) + w
+            return max(0.0, need - to_withdraw)
+
+        taxable_normal = [a for a in accts if a["type"] in TAXABLE_TYPES
+                          and a.get("withdraw_priority", "normal") != "last"]
+        taxable_last   = [a for a in accts if a["type"] in TAXABLE_TYPES
+                          and a.get("withdraw_priority", "normal") == "last"]
+        remaining_need = _withdraw_taxable_proportional(taxable_normal, remaining_need)
 
         if withdrawal_strategy == "roth_preservation":
             # 5b. Drain traditional accounts fully before touching Roth.
@@ -418,6 +467,9 @@ def simulate_retirement(
                     total_discretionary_withdrawn += w
                     traditional_withdrawn += w
                     withdrawal_detail[a["name"]] = withdrawal_detail.get(a["name"], 0) + w
+
+        # 5e. Last-resort taxable accounts (e.g. bond funds held as buffer)
+        remaining_need = _withdraw_taxable_proportional(taxable_last, remaining_need)
 
         # Total cash received from all sources this year.
         # Uses total_ss directly (not ss_taxable) to avoid double-counting.
@@ -553,9 +605,12 @@ def simulate_retirement(
             "roth_withdrawal": roth_withdrawn,
             "bank_withdrawal": bank_withdrawn,
             "roth_conversion": roth_conversion_amount,
+            "qual_dividends": inv_ltcg,
             "harvest_ltcg": harvest_ltcg,
+            "withdrawal_ltcg": withdrawal_ltcg,
             "ordinary_income": ordinary_income,
             "ltcg_income": ltcg_income,
+            "magi": taxes["magi"],
             "federal_ordinary_tax": taxes["federal_ordinary"],
             "federal_ltcg_tax": taxes["federal_ltcg"],
             "federal_niit": taxes["federal_niit"],
@@ -566,6 +621,7 @@ def simulate_retirement(
             "surplus_reinvested": surplus_reinvested,
             "healthcare_cost": hc_cost,
             "after_tax_spending": after_tax_spending,
+            "start_portfolio": start_portfolio,
             "total_portfolio": total_balance,
             **{f"bal_{a['name'].replace(' ','_')}": a["balance"] for a in accts},
         })

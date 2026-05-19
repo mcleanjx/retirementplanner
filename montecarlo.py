@@ -41,7 +41,6 @@ def _mc_single_run(
     crash_years: set[int],
     crash_magnitude: float,
     stock_pct: float,
-    bond_return_rate: float,
 ) -> tuple[list[float], int | None]:
     """
     One Monte Carlo trial. Returns (portfolio_balance_by_age, depletion_age_or_None).
@@ -81,6 +80,11 @@ def _mc_single_run(
     survivor_triggered = False
     depleted_age = None
     portfolio_by_age = []
+
+    # Pre-compute volatility constants (fixed for the trial)
+    bond_pct = 1.0 - stock_pct
+    bond_vol = volatility * 0.30
+    portfolio_vol = stock_pct * volatility + bond_pct * bond_vol
 
     for age in range(retirement_age, life_expectancy + 1):
         spouse_age = age + spouse_age_offset if filing_status == "married_filing_jointly" else None
@@ -135,9 +139,6 @@ def _mc_single_run(
                 remaining -= w
 
         # Randomized returns (applied after withdrawals, same timing as deterministic sim)
-        bond_pct = 1.0 - stock_pct
-        # Bonds are ~30% as volatile as equities and draw from a separate distribution
-        bond_vol = volatility * 0.30
         for a in accts:
             if a["type"] == "bank":
                 # Cash: near-deterministic, tiny vol
@@ -148,15 +149,14 @@ def _mc_single_run(
                 base = a.get("return_rate", 0.04)
                 r = float(rng.normal(base, volatility * 0.40))
             else:
-                # Investment accounts: blend equity and bond draws each year
-                stock_mean = (
+                # Investment accounts: portfolio expected return = ret_return (or
+                # account's own rate).  Stock allocation scales volatility only.
+                port_mean = (
                     a.get("return_rate", ret_return)
                     if not a.get("use_global_return_rate", True)
                     else ret_return
                 )
-                stock_r = float(rng.normal(stock_mean, volatility))
-                bond_r = float(rng.normal(bond_return_rate, bond_vol))
-                r = stock_pct * stock_r + bond_pct * bond_r
+                r = float(rng.normal(port_mean, portfolio_vol))
 
             # Floor at -60% to avoid absurd tail draws
             a["balance"] = max(0.0, a["balance"] * (1 + max(-0.6, r)))
@@ -188,11 +188,15 @@ def run_monte_carlo(
     enable_crashes: bool = False,
     crash_magnitude: float = 0.20,
     stock_pct: float = 0.60,
-    bond_return_rate: float = 0.035,
     seed: int | None = None,
 ) -> dict:
     """
     Run N Monte Carlo trials with per-year, per-account randomized returns.
+
+    The expected return for each account matches the deterministic simulation
+    (ret_return from assumptions, or the account's own rate).  The stock/bond
+    allocation controls volatility only: higher stock_pct → more volatile path.
+    Bond volatility is fixed at 30% of equity volatility.
 
     When enable_crashes=True, each trial independently schedules market crashes
     at random 10–20 year intervals. In a crash year, equity accounts take an
@@ -205,8 +209,7 @@ def run_monte_carlo(
         n_runs: number of trials
         n_depleted: number of trials that depleted
         depletion_ages: list of ages at which each failed run depleted
-        volatility: the volatility used
-        enable_crashes / crash_magnitude: parameters used (for staleness check)
+        volatility / stock_pct / enable_crashes / crash_magnitude: params used
     """
     rng = np.random.default_rng(seed)
     retirement_age = profile["retirement_age"]
@@ -225,7 +228,7 @@ def run_monte_carlo(
         )
         bal_series, dep_age = _mc_single_run(
             accts, profile, assumptions, rng, volatility,
-            crash_years, crash_magnitude, stock_pct, bond_return_rate,
+            crash_years, crash_magnitude, stock_pct,
         )
         all_runs.append(bal_series)
         if dep_age is not None:
@@ -250,5 +253,4 @@ def run_monte_carlo(
         "enable_crashes": enable_crashes,
         "crash_magnitude": crash_magnitude,
         "stock_pct": stock_pct,
-        "bond_return_rate": bond_return_rate,
     }

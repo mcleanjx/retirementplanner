@@ -1,16 +1,32 @@
 import uuid
 from datetime import date
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 
 from projections import project_accumulation
 from withdrawals import simulate_retirement
 import charts as _charts
 import montecarlo as _mc
+import montecarlo_v2 as _mc2
 from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking
 from constants import RMD_START_AGE
 
 st.set_page_config(page_title="Retirement Planner", layout="wide")
+
+# Prevent Streamlit's built-in 'C' shortcut (Clear cache) from firing during Ctrl+C (copy).
+components.html(
+    """
+    <script>
+    window.parent.document.addEventListener('keydown', function(e) {
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
+            e.stopImmediatePropagation();
+        }
+    }, true);
+    </script>
+    """,
+    height=0,
+)
 
 # ---------------------------------------------------------------------------
 # Default state
@@ -140,10 +156,54 @@ def _apply_pending_load():
         if k.startswith(("p_", "a_", "rc_")):
             del st.session_state[k]
     st.session_state.profile = data["profile"]
+    # Explicitly seed widget keys for profile fields.  Streamlit processes the
+    # browser's widget payload before running the script, so a browser-restored
+    # value can survive key deletion.  Setting the keys here ensures the loaded
+    # values win when the widgets are rendered below.
+    _p = data["profile"]
+    st.session_state["p_age"] = int(_p["current_age"])
+    st.session_state["p_ret"] = int(_p["retirement_age"])
+    st.session_state["p_le"] = int(_p["life_expectancy"])
+    st.session_state["p_income"] = int(_p.get("current_income", 0) or 0)
+    st.session_state["p_ss"] = int(_p.get("social_security_benefit", 0))
+    st.session_state["p_ss_age"] = int(_p.get("social_security_start_age", 67))
+    st.session_state["p_sp_age"] = int(_p.get("spouse_age", _p["current_age"]))
+    st.session_state["p_sp_ss"] = int(_p.get("spouse_ss_benefit", 0))
+    st.session_state["p_sp_ss_age"] = int(_p.get("spouse_ss_start_age", 67))
+    st.session_state["p_hc_pre"] = int(_p.get("pre_medicare_healthcare", 15000))
+    st.session_state["p_hc_post"] = int(_p.get("post_medicare_healthcare", 12000))
     st.session_state.assumptions = data["assumptions"]
     st.session_state.accounts = data["accounts"]
+    # Explicitly seed all account widget keys so browser-submitted values from
+    # the previous scenario cannot overwrite the freshly loaded data.
+    # Same pattern as the profile p_* keys above.
+    _ACCT_TYPE_LABELS = {
+        "traditional_401k": "Traditional 401(k)",
+        "roth_401k":        "Roth 401(k)",
+        "traditional_ira":  "Traditional IRA",
+        "roth_ira":         "Roth IRA",
+        "taxable":          "Taxable Brokerage",
+        "hsa":              "HSA",
+        "reit":             "REIT (Taxable)",
+        "rental_property":  "Rental Property",
+        "bank":             "Bank Account / Cash",
+    }
     for _a in st.session_state.accounts:
-        st.session_state[f"chk_global_{_a['id']}"] = bool(_a.get("use_global_return_rate", True))
+        _aid = _a["id"]
+        st.session_state[f"chk_global_{_aid}"] = bool(_a.get("use_global_return_rate", True))
+        st.session_state[f"a_name_{_aid}"] = _a["name"]
+        st.session_state[f"a_type_{_aid}"] = _ACCT_TYPE_LABELS.get(_a["type"], _a["type"])
+        st.session_state[f"a_bal_{_aid}"]  = int(_a["balance"])
+        st.session_state[f"a_ret_{_aid}"]  = round(_a.get("return_rate", 0.07) * 100, 4)
+        st.session_state[f"a_contrib_{_aid}"] = int(_a.get("annual_contribution", 0))
+        st.session_state[f"a_cgr_{_aid}"]  = round(_a.get("contribution_growth_rate", 0.0) * 100, 4)
+        st.session_state[f"a_emp_{_aid}"]  = round(_a.get("employer_match_percent", 0.0) * 100, 4)
+        st.session_state[f"a_empl_{_aid}"] = int(_a.get("employer_match_limit", 0))
+        st.session_state[f"a_basis_{_aid}"] = int(_a.get("basis", 0))
+        st.session_state[f"a_qdy_{_aid}"]  = round(_a.get("qualified_dividend_yield", 0.0) * 100, 4)
+        st.session_state[f"a_oiy_{_aid}"]  = round(_a.get("ordinary_income_yield", 0.0) * 100, 4)
+        st.session_state[f"a_rent_{_aid}"] = int(_a.get("net_annual_rental_income", 0))
+        st.session_state[f"a_wlast_{_aid}"] = _a.get("withdraw_priority", "normal") == "last"
     rc = data.get("roth_conversion", DEFAULT_ROTH_CONVERSION.copy())
     # Migrate old single-source format → list format
     if "source_account_id" in rc and "source_account_ids" not in rc:
@@ -196,7 +256,7 @@ def sidebar_profile():
     p = st.session_state.profile
     with st.sidebar.expander("👤 Profile", expanded=True):
         p["current_age"] = st.number_input("Current Age", 18, 80, p["current_age"], key="p_age")
-        p["retirement_age"] = st.number_input("Retirement Age", p["current_age"] + 1, 85, p["retirement_age"], key="p_ret")
+        p["retirement_age"] = st.number_input("Retirement Age", p["current_age"], 85, p["retirement_age"], key="p_ret")
         p["life_expectancy"] = st.number_input("Life Expectancy", p["retirement_age"] + 1, 110, p["life_expectancy"], key="p_le")
         p["filing_status"] = st.selectbox(
             "Filing Status",
@@ -337,6 +397,8 @@ def sidebar_accounts():
                     a["basis"] = float(st.number_input("Cost Basis ($)", 0, 10000000, int(a.get("basis", a["balance"] * 0.5)), 1000, key=f"a_basis_{a['id']}"))
                     a["qualified_dividend_yield"] = _dec(st.number_input("Qualified Dividend Yield (%)", 0.0, 10.0, _pct(a.get("qualified_dividend_yield", 0.015 if a["type"] == "taxable" else 0.0)), 0.1, key=f"a_qdy_{a['id']}"))
                     a["ordinary_income_yield"] = _dec(st.number_input("Ordinary Income Yield (%)", 0.0, 10.0, _pct(a.get("ordinary_income_yield", 0.005 if a["type"] == "taxable" else 0.04)), 0.1, key=f"a_oiy_{a['id']}"))
+                    _hold_last = st.checkbox("Hold for last resort (sell only when all other sources exhausted)", value=a.get("withdraw_priority", "normal") == "last", key=f"a_wlast_{a['id']}")
+                    a["withdraw_priority"] = "last" if _hold_last else "normal"
 
                 if a["type"] == "rental_property":
                     a["basis"] = float(st.number_input("Cost Basis ($)", 0, 10000000, int(a.get("basis", a["balance"] * 0.5)), 1000, key=f"a_basis_{a['id']}"))
@@ -479,6 +541,8 @@ def sidebar_scenarios():
                         a["ordinary_income_yield"] = _dec(s[f"a_oiy_{aid}"])
                     if f"a_rent_{aid}" in s:
                         a["net_annual_rental_income"] = float(s[f"a_rent_{aid}"])
+                    if f"a_wlast_{aid}" in s:
+                        a["withdraw_priority"] = "last" if s[f"a_wlast_{aid}"] else "normal"
                 save_scenario(
                     name,
                     st.session_state.profile,
@@ -614,12 +678,16 @@ def main():
     ])
 
     with tab1:
-        st.plotly_chart(_charts.chart_accumulation(acc_df), use_container_width=True)
-        st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), use_container_width=True)
+        if profile["retirement_age"] == profile["current_age"]:
+            st.info("Retirement age equals current age — no accumulation phase. See the Retirement tab for projections.")
+            st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), use_container_width=True)
+        else:
+            st.plotly_chart(_charts.chart_accumulation(acc_df), use_container_width=True)
+            st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), use_container_width=True)
 
-        if acc_df["tax_drag"].sum() > 0:
-            total_drag = acc_df.groupby("age")["tax_drag"].sum().sum()
-            st.info(f"📊 Estimated tax drag on taxable accounts during accumulation: ${total_drag:,.0f} total.")
+            if acc_df["tax_drag"].sum() > 0:
+                total_drag = acc_df.groupby("age")["tax_drag"].sum().sum()
+                st.info(f"📊 Estimated tax drag on taxable accounts during accumulation: ${total_drag:,.0f} total.")
 
     with tab2:
         st.plotly_chart(_charts.chart_drawdown(ret_df, accounts_at_retirement, assumptions.get("inflation_rate", 0.03), profile["current_age"]), use_container_width=True)
@@ -725,23 +793,29 @@ def main():
         st.dataframe(bal_df.style.format("${:,.0f}", subset=dollar_cols), use_container_width=True)
 
         st.subheader("Retirement Year-by-Year")
+        # Withdrawal % = gross spending need / start-of-year portfolio.
+        # Year 1 start = total_at_retirement; subsequent = prior year's end balance.
+        _display_df = ret_df.copy()
+        _display_df["withdrawal_pct"] = _display_df["spending_target"] / _display_df["start_portfolio"].clip(lower=1.0)
+
         display_cols = [
-            "age", "spending_target", "net_spending_target", "actual_after_tax_net",
-            "spending_override_active",
+            "age", "start_portfolio", "spending_target", "net_spending_target", "actual_after_tax_net",
+            "spending_override_active", "withdrawal_pct",
             "ss_income", "rental_income", "investment_income",
             "rmd_amount", "taxable_withdrawal", "traditional_withdrawal", "roth_withdrawal", "bank_withdrawal",
-            "roth_conversion", "harvest_ltcg", "ordinary_income", "ltcg_income",
+            "roth_conversion", "qual_dividends", "harvest_ltcg", "withdrawal_ltcg", "ordinary_income", "ltcg_income", "magi",
             "total_tax", "effective_tax_rate", "federal_irmaa", "healthcare_cost",
             "after_tax_spending", "total_portfolio",
         ]
-        display_cols = [c for c in display_cols if c in ret_df.columns]
+        display_cols = [c for c in display_cols if c in _display_df.columns]
         # Hide fixed-net-mode-only columns when in SWR mode (they're all None)
         if not fixed_net_mode:
             display_cols = [c for c in display_cols if c not in ("net_spending_target", "actual_after_tax_net")]
         fmt = {c: "${:,.0f}" for c in display_cols
-               if c not in ("age", "effective_tax_rate", "spending_override_active")}
+               if c not in ("age", "effective_tax_rate", "spending_override_active", "withdrawal_pct")}
         fmt["effective_tax_rate"] = "{:.1%}"
-        st.dataframe(ret_df[display_cols].style.format(fmt, na_rep="-"), use_container_width=True)
+        fmt["withdrawal_pct"] = "{:.2%}"
+        st.dataframe(_display_df[display_cols].style.format(fmt, na_rep="-"), use_container_width=True)
 
     with tab5:
         scenario_name = st.session_state.get("sc_name", "My Scenario")
@@ -982,126 +1056,238 @@ def main():
 
     with tab7:
         st.subheader("Monte Carlo Simulation")
-        st.caption(
-            "Runs thousands of trials with randomized annual returns (drawn from a normal distribution, "
-            "independently per account per year) to show the range of possible outcomes. "
-            "**Success** = portfolio never hits $0 before your life expectancy. "
-            "Spending, Social Security, and healthcare follow the same assumptions as the main simulation."
+
+        mc_model = st.radio(
+            "Return model",
+            ["Standard (Normal)", "CMA Log-Normal (Advanced)"],
+            horizontal=True,
+            key="mc_model",
+            help=(
+                "Standard: independent normal draws per account, single volatility parameter. "
+                "CMA Log-Normal: log-normal returns with correlated equity/bond factors, "
+                "stochastic inflation, and CMA-calibrated default volatilities."
+            ),
         )
+        use_v2 = mc_model.startswith("CMA")
 
-        mc_col1, mc_col2 = st.columns([3, 1])
-        with mc_col1:
-            mc_vol = st.slider(
-                "Equity Volatility (std dev %)",
-                min_value=1, max_value=30, value=12, step=1,
+        if use_v2:
+            st.caption(
+                "**CMA Log-Normal model** draws returns from log-normal distributions "
+                "(corrects the arithmetic/geometric mean gap, bounds the left tail at −100%). "
+                "Equity and bond factors are correlated via Cholesky decomposition — "
+                "bad equity years hit all accounts simultaneously. "
+                "Inflation is stochastic (~1.5% std dev around your assumed rate) so real spending "
+                "power varies across trials. "
+                "Default volatilities are calibrated to JPMorgan/Vanguard/BlackRock 10–15yr CMA consensus."
+            )
+        else:
+            st.caption(
+                "**Standard model** draws returns independently from a normal distribution "
+                "per account per year. Simple and fast; underestimates left-tail risk slightly "
+                "because it ignores cross-account correlation and uses fixed inflation. "
+                "**Success** = portfolio never hits $0 before your life expectancy."
+            )
+
+        # --- Parameters ---
+        _ret = assumptions.get("retirement_return_rate", 0.05)
+        if use_v2:
+            vol_col1, vol_col2, vol_col3, n_col = st.columns([2, 2, 2, 1])
+            with vol_col1:
+                mc_equity_vol = st.slider(
+                    "Equity Volatility (%)", min_value=5, max_value=30, value=16, step=1,
+                    help="Std dev of annual equity returns. CMA consensus: US large-cap ~15–16%.",
+                    key="mc_equity_vol",
+                ) / 100.0
+            with vol_col2:
+                mc_bond_vol = st.slider(
+                    "Bond Volatility (%)", min_value=1, max_value=15, value=6, step=1,
+                    help="Std dev of annual bond returns. CMA consensus: US Agg ~5–6%.",
+                    key="mc_bond_vol",
+                ) / 100.0
+            with vol_col3:
+                mc_eq_bond_corr = st.slider(
+                    "Equity-Bond Corr (%)", min_value=-20, max_value=40, value=10, step=5,
+                    help="Long-run equity/bond correlation. CMA consensus: ~0–15%.",
+                    key="mc_eq_bond_corr",
+                ) / 100.0
+            with n_col:
+                mc_n = int(st.number_input(
+                    "Trials", min_value=100, max_value=5000, value=1000, step=100, key="mc_n",
+                ))
+        else:
+            vol_col, n_col = st.columns([3, 1])
+            with vol_col:
+                mc_vol = st.slider(
+                    "Equity Volatility (%)", min_value=1, max_value=30, value=12, step=1,
+                    help=(
+                        "Std dev of annual equity returns. US equities: ~15–17%. "
+                        "Balanced 60/40: ~10–12%. Bond volatility = 30% of this value."
+                    ),
+                    key="mc_vol",
+                ) / 100.0
+            with n_col:
+                mc_n = int(st.number_input(
+                    "Trials", min_value=100, max_value=5000, value=1000, step=100, key="mc_n",
+                ))
+
+        mc_stock_pct = st.slider(
+            "Stock Allocation (%)", min_value=0, max_value=100, value=60, step=5,
+            help=(
+                "Fraction of each investment account modeled as equities; remainder as bonds. "
+                "Controls path volatility only — expected return stays equal to Retirement Return Rate."
+            ),
+            key="mc_stock_pct",
+        ) / 100.0
+
+        if use_v2:
+            from montecarlo_v2 import EQUITY_RISK_PREMIUM
+            _eq_mean = _ret + (1 - mc_stock_pct) * EQUITY_RISK_PREMIUM
+            _bd_mean = _ret - mc_stock_pct * EQUITY_RISK_PREMIUM
+            _eff_vol_v2 = mc_stock_pct * mc_equity_vol + (1 - mc_stock_pct) * mc_bond_vol
+            st.caption(
+                f"Expected portfolio return: **{_ret:.1%}** (matches Retirement Return Rate). "
+                f"Component means: equity **{_eq_mean:.1%}**, bond **{_bd_mean:.1%}** "
+                f"(3pp equity risk premium preserved). "
+                f"Effective portfolio volatility: **{_eff_vol_v2:.1%}**. "
+                f"Inflation draws: {assumptions.get('inflation_rate', 0.03):.1%} ± 1.5% per year. "
+                f"Geometric mean ≈ {_ret - _eff_vol_v2**2/2:.1%}."
+            )
+            mc_withdrawal_mode = st.radio(
+                "Withdrawal rule",
+                ["Constant Real", "Guyton-Klinger Guardrails"],
+                horizontal=True,
+                key="mc_withdrawal_mode",
                 help=(
-                    "Standard deviation of annual equity returns. "
-                    "US equities: ~15–17%. Balanced 60/40 portfolio: ~10–12%. Conservative: ~6–8%. "
-                    "Bond volatility is set to 30% of this value. "
-                    "Bank and rental accounts use their own lower volatility."
+                    "**Constant Real**: spending grows with drawn inflation every year — "
+                    "the classic 'constant purchasing power' approach. "
+                    "**Guyton-Klinger Guardrails**: cut spending 10% when the portfolio withdrawal rate "
+                    "exceeds 120% of its initial level (Capital Preservation Rule); "
+                    "raise spending 10% when it falls below 80% (Prosperity Rule). "
+                    "Guardrails substantially improve success rates by letting spending flex "
+                    "with market outcomes instead of continuing on a fixed trajectory."
                 ),
-                key="mc_vol",
-            ) / 100.0
-        with mc_col2:
-            mc_n = int(st.number_input(
-                "Trials", min_value=100, max_value=5000, value=1000, step=100, key="mc_n"
-            ))
-
-        alloc_col1, alloc_col2 = st.columns(2)
-        with alloc_col1:
-            mc_stock_pct = st.slider(
-                "Stock Allocation (%)",
-                min_value=0, max_value=100, value=60, step=5,
-                help=(
-                    "Portion of each investment account (401k, IRA, Roth, taxable) modeled as equities. "
-                    "The remainder is modeled as bonds. Bank accounts and rental property are unaffected."
-                ),
-                key="mc_stock_pct",
-            ) / 100.0
-        with alloc_col2:
-            mc_bond_return = st.number_input(
-                "Bond Annual Return (%)",
-                min_value=0.0, max_value=10.0, value=3.5, step=0.1,
-                key="mc_bond_return",
-                help="Expected annual return on the bond portion. Bonds have lower volatility and do not crash.",
-            ) / 100.0
-
-        _stock_ret = assumptions.get("retirement_return_rate", 0.05)
-        _blended = mc_stock_pct * _stock_ret + (1 - mc_stock_pct) * mc_bond_return
-        st.caption(
-            f"Expected blended portfolio return: **{_blended:.1%}** "
-            f"({mc_stock_pct:.0%} stocks × {_stock_ret:.1%} + "
-            f"{1 - mc_stock_pct:.0%} bonds × {mc_bond_return:.1%}). "
-            f"Stock return uses the Retirement Return Rate from Assumptions."
-        )
+            )
+            mc_withdrawal_mode_key = "guardrails" if mc_withdrawal_mode.startswith("Guyton") else "constant_real"
+        else:
+            _eff_vol = mc_stock_pct * mc_vol + (1 - mc_stock_pct) * (mc_vol * 0.30)
+            st.caption(
+                f"Expected portfolio return: **{_ret:.1%}** (matches Retirement Return Rate). "
+                f"Effective portfolio volatility: **{_eff_vol:.1%}** "
+                f"({mc_stock_pct:.0%} stocks × {mc_vol:.0%} + "
+                f"{1 - mc_stock_pct:.0%} bonds × {mc_vol * 0.30:.0%}). "
+                f"Geometric mean ≈ {_ret - _eff_vol**2/2:.1%}."
+            )
 
         mc_crashes = st.checkbox(
             "Include market crash events (−20% equity shock every 10–20 years)",
             value=False,
             help=(
-                "Each trial independently schedules one or more crashes during retirement, "
-                "spaced 10–20 years apart. In a crash year, all equity accounts (401k, IRA, Roth, taxable) "
-                "take an additional −20% drop on top of that year's normal random return. "
-                "Bank accounts and rental property are not affected."
+                "Each trial independently schedules crashes spaced 10–20 years apart. "
+                "In a crash year equity accounts take an additional −20% drop. "
+                "Bank accounts and rental property are unaffected."
             ),
             key="mc_crashes",
         )
 
+        det_portfolio = ret_df["total_portfolio"].tolist() if not ret_df.empty else []
+
+        # --- Run button ---
+        run_key = "mc_result_v2" if use_v2 else "mc_result"
         if st.button("▶ Run Monte Carlo", type="primary", key="mc_run"):
             with st.spinner(f"Running {mc_n:,} simulations…"):
-                mc_result = _mc.run_monte_carlo(
-                    accounts_at_retirement=accounts_at_retirement,
-                    profile=profile,
-                    assumptions=assumptions,
-                    n_runs=mc_n,
-                    volatility=mc_vol,
-                    enable_crashes=mc_crashes,
-                    stock_pct=mc_stock_pct,
-                    bond_return_rate=mc_bond_return,
-                )
-            st.session_state["mc_result"] = mc_result
+                if use_v2:
+                    result = _mc2.run_monte_carlo_v2(
+                        accounts_at_retirement=accounts_at_retirement,
+                        profile=profile,
+                        assumptions=assumptions,
+                        n_runs=mc_n,
+                        equity_vol=mc_equity_vol,
+                        bond_vol=mc_bond_vol,
+                        equity_bond_corr=mc_eq_bond_corr,
+                        enable_crashes=mc_crashes,
+                        stock_pct=mc_stock_pct,
+                        withdrawal_mode=mc_withdrawal_mode_key,
+                    )
+                else:
+                    result = _mc.run_monte_carlo(
+                        accounts_at_retirement=accounts_at_retirement,
+                        profile=profile,
+                        assumptions=assumptions,
+                        n_runs=mc_n,
+                        volatility=mc_vol,
+                        enable_crashes=mc_crashes,
+                        stock_pct=mc_stock_pct,
+                    )
+            st.session_state[run_key] = result
 
-        mc_result = st.session_state.get("mc_result")
+        # --- Results for selected model ---
+        mc_result = st.session_state.get(run_key)
         if mc_result:
-            # Invalidate cached result if settings changed since last run
-            stale = (
-                mc_result.get("volatility") != mc_vol
-                or mc_result.get("n_runs") != mc_n
-                or mc_result.get("enable_crashes") != mc_crashes
-                or mc_result.get("stock_pct") != mc_stock_pct
-                or mc_result.get("bond_return_rate") != mc_bond_return
-            )
+            if use_v2:
+                stale = (
+                    mc_result.get("equity_vol") != mc_equity_vol
+                    or mc_result.get("bond_vol") != mc_bond_vol
+                    or mc_result.get("equity_bond_corr") != mc_eq_bond_corr
+                    or mc_result.get("n_runs") != mc_n
+                    or mc_result.get("enable_crashes") != mc_crashes
+                    or mc_result.get("stock_pct") != mc_stock_pct
+                    or mc_result.get("withdrawal_mode") != mc_withdrawal_mode_key
+                )
+            else:
+                stale = (
+                    mc_result.get("volatility") != mc_vol
+                    or mc_result.get("n_runs") != mc_n
+                    or mc_result.get("enable_crashes") != mc_crashes
+                    or mc_result.get("stock_pct") != mc_stock_pct
+                )
             if stale:
                 st.info("Settings changed — click **▶ Run Monte Carlo** to refresh results.")
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Success Rate", f"{mc_result['success_rate']:.1%}")
-            m2.metric(
-                "Median at Life Expectancy",
-                f"${mc_result['percentiles'][50][-1]:,.0f}",
-            )
-            m3.metric(
-                "10th Percentile at Life Expectancy",
-                f"${mc_result['percentiles'][10][-1]:,.0f}",
-            )
-            m4.metric(
-                "Trials Depleted",
-                f"{mc_result['n_depleted']:,} / {mc_result['n_runs']:,}",
-            )
+            m2.metric("Median at Life Expectancy", f"${mc_result['percentiles'][50][-1]:,.0f}")
+            m3.metric("10th Percentile at Life Expectancy", f"${mc_result['percentiles'][10][-1]:,.0f}")
+            m4.metric("Trials Depleted", f"{mc_result['n_depleted']:,} / {mc_result['n_runs']:,}")
 
-            det_portfolio = ret_df["total_portfolio"].tolist() if not ret_df.empty else []
             st.plotly_chart(
                 _charts.chart_monte_carlo(mc_result, det_portfolio),
                 use_container_width=True,
             )
-
             if mc_result["n_depleted"] > 0:
-                st.plotly_chart(
-                    _charts.chart_mc_depletion(mc_result),
-                    use_container_width=True,
-                )
+                st.plotly_chart(_charts.chart_mc_depletion(mc_result), use_container_width=True)
         else:
             st.info("Configure your plan in the sidebar, then click **▶ Run Monte Carlo** to see results.")
+
+        # --- Model comparison (shown when both have been run) ---
+        mc_v1 = st.session_state.get("mc_result")
+        mc_v2 = st.session_state.get("mc_result_v2")
+        if mc_v1 and mc_v2:
+            st.divider()
+            st.subheader("Model Comparison")
+            st.caption(
+                "Both models have been run. Blue = Standard (Normal), Orange = CMA Log-Normal. "
+                "Differences reflect log-normal vs normal distributions, correlated factors, and stochastic inflation."
+            )
+            c1, c2, c3 = st.columns(3)
+            c1.metric(
+                "Success Rate",
+                f"CMA: {mc_v2['success_rate']:.1%}",
+                delta=f"{mc_v2['success_rate'] - mc_v1['success_rate']:+.1%} vs Standard",
+            )
+            c2.metric(
+                "Median Portfolio at Life Expectancy",
+                f"CMA: ${mc_v2['percentiles'][50][-1]:,.0f}",
+                delta=f"${mc_v2['percentiles'][50][-1] - mc_v1['percentiles'][50][-1]:+,.0f} vs Standard",
+            )
+            c3.metric(
+                "10th Percentile at Life Expectancy",
+                f"CMA: ${mc_v2['percentiles'][10][-1]:,.0f}",
+                delta=f"${mc_v2['percentiles'][10][-1] - mc_v1['percentiles'][10][-1]:+,.0f} vs Standard",
+            )
+            st.plotly_chart(
+                _charts.chart_mc_comparison(mc_v1, mc_v2, det_portfolio),
+                use_container_width=True,
+            )
 
 
 if __name__ == "__main__":

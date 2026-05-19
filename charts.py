@@ -429,6 +429,72 @@ def chart_monte_carlo(mc_result: dict, det_portfolio: list[float]) -> go.Figure:
     return fig
 
 
+def chart_mc_comparison(mc_v1: dict, mc_v2: dict, det_portfolio: list[float]) -> go.Figure:
+    """
+    Overlay fan chart comparing Standard (v1, blue) and CMA Log-Normal (v2, orange) results.
+    Both percentile bands are shown together with a shared deterministic baseline.
+    """
+    ages = mc_v1["ages"]
+    p1 = mc_v1["percentiles"]
+    p2 = mc_v2["percentiles"]
+    fig = go.Figure()
+
+    # v1 bands (blue)
+    fig.add_trace(go.Scatter(
+        x=ages + ages[::-1], y=p1[90] + p1[10][::-1],
+        fill="toself", fillcolor="rgba(76, 114, 176, 0.10)",
+        line=dict(color="rgba(0,0,0,0)"), name="Standard 10–90%", hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=ages + ages[::-1], y=p1[75] + p1[25][::-1],
+        fill="toself", fillcolor="rgba(76, 114, 176, 0.22)",
+        line=dict(color="rgba(0,0,0,0)"), name="Standard 25–75%", hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=ages, y=p1[50], name="Standard median",
+        mode="lines", line=dict(color="#4C72B0", width=2.5),
+        hovertemplate="<b>Standard median</b><br>Age: %{x}<br>%{y:$,.0f}<extra></extra>",
+    ))
+
+    # v2 bands (orange)
+    fig.add_trace(go.Scatter(
+        x=ages + ages[::-1], y=p2[90] + p2[10][::-1],
+        fill="toself", fillcolor="rgba(214, 95, 50, 0.10)",
+        line=dict(color="rgba(0,0,0,0)"), name="CMA 10–90%", hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=ages + ages[::-1], y=p2[75] + p2[25][::-1],
+        fill="toself", fillcolor="rgba(214, 95, 50, 0.22)",
+        line=dict(color="rgba(0,0,0,0)"), name="CMA 25–75%", hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=ages, y=p2[50], name="CMA median",
+        mode="lines", line=dict(color="#D65F32", width=2.5),
+        hovertemplate="<b>CMA median</b><br>Age: %{x}<br>%{y:$,.0f}<extra></extra>",
+    ))
+
+    if det_portfolio and len(det_portfolio) == len(ages):
+        fig.add_trace(go.Scatter(
+            x=ages, y=det_portfolio, name="Deterministic",
+            mode="lines", line=dict(color="black", width=2, dash="dash"),
+            hovertemplate="<b>Deterministic</b><br>Age: %{x}<br>%{y:$,.0f}<extra></extra>",
+        ))
+
+    fig.add_hline(y=0, line=dict(color="red", width=1, dash="dot"))
+    fig.update_layout(
+        title=(
+            f"Model Comparison — Standard success: {mc_v1['success_rate']:.1%}  |  "
+            f"CMA success: {mc_v2['success_rate']:.1%}"
+        ),
+        xaxis_title="Age",
+        yaxis_title="Portfolio Balance",
+        yaxis_tickformat="$,.0f",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return fig
+
+
 def chart_mc_depletion(mc_result: dict) -> go.Figure:
     """Histogram of ages at which the portfolio depleted (failed runs only)."""
     ages = mc_result["depletion_ages"]
