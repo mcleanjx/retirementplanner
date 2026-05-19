@@ -9,6 +9,8 @@ from withdrawals import simulate_retirement
 import charts as _charts
 import montecarlo as _mc
 import montecarlo_v2 as _mc2
+import plotly.graph_objects as go
+import optimizer as _opt
 from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking
 from constants import RMD_START_AGE
 
@@ -168,6 +170,7 @@ def _apply_pending_load():
     st.session_state["p_ss"] = int(_p.get("social_security_benefit", 0))
     st.session_state["p_ss_age"] = int(_p.get("social_security_start_age", 67))
     st.session_state["p_sp_age"] = int(_p.get("spouse_age", _p["current_age"]))
+    st.session_state["p_sp_ret"] = int(_p.get("spouse_retirement_age", 65))
     st.session_state["p_sp_ss"] = int(_p.get("spouse_ss_benefit", 0))
     st.session_state["p_sp_ss_age"] = int(_p.get("spouse_ss_start_age", 67))
     st.session_state["p_hc_pre"] = int(_p.get("pre_medicare_healthcare", 15000))
@@ -204,6 +207,7 @@ def _apply_pending_load():
         st.session_state[f"a_oiy_{_aid}"]  = round(_a.get("ordinary_income_yield", 0.0) * 100, 4)
         st.session_state[f"a_rent_{_aid}"] = int(_a.get("net_annual_rental_income", 0))
         st.session_state[f"a_wlast_{_aid}"] = _a.get("withdraw_priority", "normal") == "last"
+        st.session_state[f"a_owner_{_aid}"] = _a.get("owner", "self")
     rc = data.get("roth_conversion", DEFAULT_ROTH_CONVERSION.copy())
     # Migrate old single-source format → list format
     if "source_account_id" in rc and "source_account_ids" not in rc:
@@ -287,6 +291,7 @@ def sidebar_profile():
         if p["filing_status"] == "married_filing_jointly":
             st.markdown("**Spouse**")
             p["spouse_age"] = st.number_input("Spouse Current Age", 18, 80, p.get("spouse_age", p["current_age"]), key="p_sp_age")
+            p["spouse_retirement_age"] = st.number_input("Spouse Retirement Age", p["spouse_age"], 85, p.get("spouse_retirement_age", 65), key="p_sp_ret")
             p["spouse_ss_benefit"] = st.number_input("Spouse SS Benefit ($/yr today's $)", 0, 60000, int(p.get("spouse_ss_benefit", 0)), 500, key="p_sp_ss")
             p["spouse_ss_start_age"] = st.number_input("Spouse SS Start Age", 62, 70, p.get("spouse_ss_start_age", 67), key="p_sp_ss_age")
             p["survivor_spending_reduction"] = _dec(st.number_input(
@@ -355,9 +360,13 @@ def sidebar_assumptions():
 # Sidebar — Accounts
 # ---------------------------------------------------------------------------
 
+OWNER_ACCOUNT_TYPES = {"traditional_401k", "roth_401k", "traditional_ira", "roth_ira", "hsa"}
+
+
 def sidebar_accounts():
     with st.sidebar.expander("🏦 Accounts", expanded=True):
         accts = st.session_state.accounts
+        is_mfj = st.session_state.profile.get("filing_status") == "married_filing_jointly"
         for i, a in enumerate(accts):
             with st.expander(f"{a['name']} ({ACCOUNT_TYPE_LABELS.get(a['type'], a['type'])})", expanded=False):
                 a["name"] = st.text_input("Name", a["name"], key=f"a_name_{a['id']}")
@@ -365,6 +374,19 @@ def sidebar_accounts():
                 type_vals = list(ACCOUNT_TYPES.values())
                 cur_idx = type_vals.index(a["type"]) if a["type"] in type_vals else 0
                 a["type"] = ACCOUNT_TYPES[st.selectbox("Type", type_keys, index=cur_idx, key=f"a_type_{a['id']}")]
+
+                if is_mfj and a["type"] in OWNER_ACCOUNT_TYPES:
+                    owner_options = ["self", "spouse"]
+                    cur_owner_idx = 1 if a.get("owner", "self") == "spouse" else 0
+                    a["owner"] = st.selectbox(
+                        "Owner", owner_options,
+                        format_func=lambda x: "You (primary)" if x == "self" else "Spouse",
+                        index=cur_owner_idx,
+                        key=f"a_owner_{a['id']}",
+                        help="Determines whose retirement age governs when this account can be accessed for Roth conversions.",
+                    )
+                else:
+                    a["owner"] = "self"
 
                 a["balance"] = float(st.number_input("Current Balance ($)", 0, 10000000, int(a["balance"]), 1000, key=f"a_bal_{a['id']}"))
 
@@ -413,6 +435,7 @@ def sidebar_accounts():
                 "id": str(uuid.uuid4())[:8],
                 "name": "New Account",
                 "type": "taxable",
+                "owner": "self",
                 "balance": 0.0,
                 "basis": 0.0,
                 "annual_contribution": 0.0,
@@ -543,6 +566,8 @@ def sidebar_scenarios():
                         a["net_annual_rental_income"] = float(s[f"a_rent_{aid}"])
                     if f"a_wlast_{aid}" in s:
                         a["withdraw_priority"] = "last" if s[f"a_wlast_{aid}"] else "normal"
+                    if f"a_owner_{aid}" in s:
+                        a["owner"] = s[f"a_owner_{aid}"]
                 save_scenario(
                     name,
                     st.session_state.profile,
@@ -656,6 +681,13 @@ def main():
         annual_withdrawal_label = "Annual Withdrawal Target (yr 1)"
         annual_withdrawal = ret_df["spending_target"].iloc[0] if not ret_df.empty else 0
 
+    le_age = profile["life_expectancy"]
+    if not ret_df.empty:
+        le_row = ret_df[ret_df["age"] == le_age]
+        portfolio_at_le = float(le_row["total_portfolio"].iloc[0]) if not le_row.empty else 0.0
+    else:
+        portfolio_at_le = 0.0
+
     st.subheader("Summary")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Portfolio at Retirement", f"${total_at_retirement:,.0f}")
@@ -664,17 +696,18 @@ def main():
     c4.metric("Taxable / Real Estate", f"${taxable_total:,.0f}")
     c5.metric("Portfolio Longevity", longevity_str)
 
-    c6, c7, c8, c9 = st.columns(4)
+    c6, c7, c8, c9, c10 = st.columns(5)
     c6.metric(annual_withdrawal_label, f"${annual_withdrawal:,.0f}")
     c7.metric("Lifetime Taxes", f"${summary['lifetime_taxes']:,.0f}")
     c8.metric("Lifetime Healthcare", f"${summary['lifetime_healthcare']:,.0f}")
     c9.metric("Lifetime Passive Income", f"${summary['lifetime_passive_income']:,.0f}")
+    c10.metric(f"Portfolio at Age {le_age}", f"${portfolio_at_le:,.0f}")
 
     # ---------------------------------------------------------------------------
     # Tabs
     # ---------------------------------------------------------------------------
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "📈 Accumulation", "💰 Retirement", "✏️ Custom Spending", "📋 Data Tables", "📊 Progress", "⚠️ Warnings", "🎲 Monte Carlo"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+        "📈 Accumulation", "💰 Retirement", "✏️ Custom Spending", "📋 Data Tables", "📊 Progress", "⚠️ Warnings", "🎲 Monte Carlo", "🔍 Optimizer", "🏦 Accounts"
     ])
 
     with tab1:
@@ -1288,6 +1321,342 @@ def main():
                 _charts.chart_mc_comparison(mc_v1, mc_v2, det_portfolio),
                 use_container_width=True,
             )
+
+    with tab8:
+        st.subheader("Strategy Optimizer")
+        st.caption(
+            "The optimizer runs many random combinations of withdrawal strategies and Roth conversion "
+            "settings to find the configuration that maximizes your lifetime after-tax income while "
+            "minimizing taxes. It reads your current accounts and profile but **never modifies your "
+            "scenario**. Use the results as a guide, then apply changes manually in the sidebar."
+        )
+
+        # --- Controls ---
+        opt_c1, opt_c2, opt_c3 = st.columns([2, 2, 2])
+        with opt_c1:
+            opt_n = int(st.number_input(
+                "Iterations", min_value=100, max_value=5000, value=500, step=100, key="opt_n",
+                help="Number of random strategy combinations to evaluate. More = better results but slower.",
+            ))
+        with opt_c2:
+            opt_legacy = st.slider(
+                "Legacy Weight (%)", min_value=0, max_value=50, value=20, step=5, key="opt_legacy",
+                help="How much to credit remaining portfolio at end of life. 0% = ignore legacy, 50% = weight it heavily.",
+            ) / 100.0
+        with opt_c3:
+            opt_seed = int(st.number_input(
+                "Random Seed", min_value=1, max_value=9999, value=42, step=1, key="opt_seed",
+                help="Change to explore different random draws with the same iteration count.",
+            ))
+
+        if st.button("▶ Run Optimizer", type="primary", key="opt_run"):
+            with st.spinner(f"Evaluating {opt_n:,} strategy combinations…"):
+                _opt_run_result = _opt.run_optimizer(
+                    accounts_at_retirement=accounts_at_retirement,
+                    profile=profile,
+                    assumptions=assumptions,
+                    roth_conversion_baseline=roth_conversion,
+                    spending_overrides=spending_overrides,
+                    n_iterations=opt_n,
+                    legacy_weight=opt_legacy,
+                    seed=opt_seed,
+                )
+            st.session_state["opt_result"] = _opt_run_result
+
+        opt_result = st.session_state.get("opt_result")
+
+        if not opt_result:
+            st.info("Configure your plan in the sidebar, then click **▶ Run Optimizer** to see recommendations.")
+        else:
+            best = opt_result["best_result"]
+            base = opt_result["baseline_result"]
+            best_df = best["ret_df"]
+            base_df = base["ret_df"]
+            best_summary = best["summary"]
+            base_summary = base["summary"]
+
+            def _lft_spend(df):
+                return float(df["actual_after_tax_net"].sum()) if df is not None and not df.empty else 0.0
+
+            def _lft_tax(df):
+                return float(df["total_tax"].sum()) if df is not None and not df.empty else 0.0
+
+            def _final_port(df):
+                return float(df["total_portfolio"].iloc[-1]) if df is not None and not df.empty else 0.0
+
+            base_spend = _lft_spend(base_df)
+            opt_spend = _lft_spend(best_df)
+            base_tax = _lft_tax(base_df)
+            opt_tax = _lft_tax(best_df)
+            base_port = _final_port(base_df)
+            opt_port = _final_port(best_df)
+            base_depl = base_summary.get("portfolio_depleted_age")
+            opt_depl = best_summary.get("portfolio_depleted_age")
+            base_roth_total = float(base_df["roth_conversion"].sum()) if base_df is not None and not base_df.empty else 0.0
+            opt_roth_total = float(best_df["roth_conversion"].sum()) if best_df is not None and not best_df.empty else 0.0
+
+            # --- Top-line comparison ---
+            st.divider()
+            st.subheader("Results: Baseline vs. Optimized")
+            comparison_data = {
+                "Metric": [
+                    "Lifetime After-Tax Income",
+                    "Lifetime Taxes Paid",
+                    "Final Portfolio Value",
+                    "Total Roth Conversions",
+                    "Portfolio Depleted",
+                    "Trials Evaluated",
+                ],
+                "Baseline": [
+                    f"${base_spend:,.0f}",
+                    f"${base_tax:,.0f}",
+                    f"${base_port:,.0f}",
+                    f"${base_roth_total:,.0f}",
+                    f"Age {base_depl}" if base_depl else "No",
+                    "1 (current settings)",
+                ],
+                "Optimized": [
+                    f"${opt_spend:,.0f}",
+                    f"${opt_tax:,.0f}",
+                    f"${opt_port:,.0f}",
+                    f"${opt_roth_total:,.0f}",
+                    f"Age {opt_depl}" if opt_depl else "No",
+                    f"{opt_result['n_evaluated']:,} of {opt_n:,}",
+                ],
+                "Change": [
+                    f"${opt_spend - base_spend:+,.0f} ({(opt_spend - base_spend) / max(base_spend, 1):.1%})",
+                    f"${opt_tax - base_tax:+,.0f} ({(opt_tax - base_tax) / max(base_tax, 1):.1%})",
+                    f"${opt_port - base_port:+,.0f}",
+                    f"${opt_roth_total - base_roth_total:+,.0f}",
+                    "—",
+                    "—",
+                ],
+            }
+            st.dataframe(pd.DataFrame(comparison_data), use_container_width=True, hide_index=True)
+
+            # --- Recommended strategy settings ---
+            st.divider()
+            st.subheader("Recommended Strategy Settings")
+            st.caption("Apply these settings in the sidebar to activate the optimized strategy.")
+            best_rc = best["roth_conversion"]
+            best_ws = best["withdrawal_strategy"]
+            desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement)
+            desc_df = pd.DataFrame(
+                [{"Setting": k, "Recommended Value": v} for k, v in desc.items()]
+            )
+            st.dataframe(desc_df, use_container_width=True, hide_index=True)
+
+            # --- Year-by-year actions ---
+            st.divider()
+            st.subheader("Recommended Actions by Year")
+            st.caption(
+                "What to do in each retirement year — which accounts to draw from, "
+                "when to convert to Roth, and what to expect in taxes and after-tax income."
+            )
+            actions_df = _opt.build_actions_table(best_df, best_rc, accounts_at_retirement)
+            if not actions_df.empty:
+                dollar_act_cols = [
+                    "Roth Conversion", "RMD", "Traditional Withdrawal",
+                    "Taxable Withdrawal", "Roth Withdrawal", "Bank Withdrawal",
+                    "Total Tax", "After-Tax Income",
+                ]
+                act_fmt = {c: "${:,.0f}" for c in dollar_act_cols if c in actions_df.columns}
+                act_fmt["Eff. Tax Rate"] = "{:.1%}"
+                st.dataframe(
+                    actions_df.style.format(act_fmt, na_rep="—"),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            # --- Account balances by year ---
+            st.divider()
+            st.subheader("Optimized Account Balances by Year")
+            bal_df_opt = _opt.build_balances_table(best_df, accounts_at_retirement)
+            if not bal_df_opt.empty:
+                dollar_bal_cols = [c for c in bal_df_opt.columns if c != "Age"]
+                st.dataframe(
+                    bal_df_opt.style.format("${:,.0f}", subset=dollar_bal_cols),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            # --- Full year-by-year detail ---
+            st.divider()
+            st.subheader("Full Year-by-Year Detail (Optimized)")
+            _opt_display = best_df.copy()
+            _opt_display["withdrawal_pct"] = (
+                _opt_display["spending_target"] / _opt_display["start_portfolio"].clip(lower=1.0)
+            )
+            opt_detail_cols = [
+                "age", "start_portfolio", "spending_target", "net_spending_target", "actual_after_tax_net",
+                "withdrawal_pct",
+                "ss_income", "rental_income", "investment_income",
+                "rmd_amount", "taxable_withdrawal", "traditional_withdrawal", "roth_withdrawal", "bank_withdrawal",
+                "roth_conversion", "qual_dividends", "harvest_ltcg", "withdrawal_ltcg",
+                "ordinary_income", "ltcg_income", "magi",
+                "total_tax", "effective_tax_rate", "federal_irmaa", "healthcare_cost",
+                "after_tax_spending", "total_portfolio",
+            ]
+            opt_detail_cols = [c for c in opt_detail_cols if c in _opt_display.columns]
+            if not fixed_net_mode:
+                opt_detail_cols = [c for c in opt_detail_cols if c not in ("net_spending_target", "actual_after_tax_net")]
+            opt_fmt = {c: "${:,.0f}" for c in opt_detail_cols
+                       if c not in ("age", "effective_tax_rate", "withdrawal_pct")}
+            opt_fmt["effective_tax_rate"] = "{:.1%}"
+            opt_fmt["withdrawal_pct"] = "{:.2%}"
+            st.dataframe(
+                _opt_display[opt_detail_cols].style.format(opt_fmt, na_rep="—"),
+                use_container_width=True,
+            )
+
+            # --- Score distribution ---
+            st.divider()
+            st.subheader("Score Distribution Across Trials")
+            all_scores = opt_result.get("all_scores", [])
+            if len(all_scores) > 1:
+                score_fig = go.Figure()
+                score_fig.add_trace(go.Histogram(
+                    x=all_scores, nbinsx=40, marker_color="steelblue", opacity=0.75,
+                ))
+                score_fig.add_vline(
+                    x=base["score"], line_dash="dash", line_color="orange",
+                    annotation_text="Baseline", annotation_position="top right",
+                )
+                score_fig.add_vline(
+                    x=best["score"], line_dash="dash", line_color="green",
+                    annotation_text="Best Found", annotation_position="top left",
+                )
+                score_fig.update_layout(
+                    title="Optimizer Score Distribution (higher = better)",
+                    xaxis_title="Score",
+                    yaxis_title="Count",
+                    showlegend=False,
+                    height=300,
+                    margin=dict(t=40, b=30),
+                )
+                st.plotly_chart(score_fig, use_container_width=True)
+                st.caption(
+                    f"Orange dashed = baseline ({base['score']:,.0f}). "
+                    f"Green dashed = best found ({best['score']:,.0f}). "
+                    f"Score = lifetime after-tax income − 30% × taxes + {opt_legacy:.0%} × final portfolio."
+                )
+
+
+    with tab9:
+        st.subheader("Account Overview")
+        st.caption(
+            "Edit key account parameters directly in the table. "
+            "Click **Apply Changes** to update projections, then **Save to Scenario** to persist to disk."
+        )
+
+        # Build display dataframe — percentages stored as human-readable values (e.g. 7.0 = 7%)
+        _acct_rows = []
+        for _a in accounts:
+            _acct_rows.append({
+                "Name": _a["name"],
+                "Type": ACCOUNT_TYPE_LABELS.get(_a["type"], _a["type"]),
+                "Current Value ($)": _a["balance"],
+                "Current Basis ($)": _a.get("basis", 0.0),
+                "Return Rate (%)": round(_a.get("return_rate", 0.07) * 100, 4),
+                "Use Global Rate": bool(_a.get("use_global_return_rate", True)),
+                "Qual. Div Yield (%)": round(_a.get("qualified_dividend_yield", 0.0) * 100, 4),
+                "Ord. Income Yield (%)": round(_a.get("ordinary_income_yield", 0.0) * 100, 4),
+                "Total Return (%)": round(
+                    (_a.get("return_rate", 0.07)
+                     + _a.get("qualified_dividend_yield", 0.0)
+                     + _a.get("ordinary_income_yield", 0.0)) * 100, 4
+                ),
+            })
+        _acct_df = pd.DataFrame(_acct_rows)
+
+        _acct_col_cfg = {
+            "Name": st.column_config.TextColumn(disabled=True),
+            "Type": st.column_config.TextColumn(disabled=True),
+            "Current Value ($)": st.column_config.NumberColumn(min_value=0, format="$%.0f"),
+            "Current Basis ($)": st.column_config.NumberColumn(
+                min_value=0, format="$%.0f",
+                help="Cost basis (applies to taxable brokerage, REIT, and rental property accounts)",
+            ),
+            "Return Rate (%)": st.column_config.NumberColumn(
+                min_value=0.0, max_value=30.0, format="%.2f%%",
+                help=(
+                    "Capital appreciation only — does NOT include qualified dividend yield or ordinary income yield. "
+                    "Full return = Return Rate + Qual. Div Yield + Ord. Income Yield (see Total Return column)."
+                ),
+            ),
+            "Use Global Rate": st.column_config.CheckboxColumn(
+                help="When checked, the global Retirement Return Rate is used during the withdrawal phase instead of this account's rate",
+            ),
+            "Qual. Div Yield (%)": st.column_config.NumberColumn(
+                min_value=0.0, max_value=20.0, format="%.2f%%",
+                help="Annual qualified dividend yield (taxable brokerage / REIT accounts)",
+            ),
+            "Ord. Income Yield (%)": st.column_config.NumberColumn(
+                min_value=0.0, max_value=20.0, format="%.2f%%",
+                help="Annual ordinary income yield — e.g. bond interest, non-qualified dividends (taxable / REIT accounts)",
+            ),
+            "Total Return (%)": st.column_config.NumberColumn(
+                disabled=True, format="%.2f%%",
+                help="Calculated: Return Rate + Qual. Div Yield + Ord. Income Yield. This is the full expected annual return for the account.",
+            ),
+        }
+
+        _edited_accts = st.data_editor(
+            _acct_df,
+            column_config=_acct_col_cfg,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            key="acct_table_editor",
+        )
+
+        _btn_col1, _btn_col2, _ = st.columns([2, 2, 8])
+
+        with _btn_col1:
+            if st.button("Apply Changes", key="acct_apply", help="Update projections with edited values (does not save to disk)"):
+                for _i, _a in enumerate(st.session_state.accounts):
+                    _row = _edited_accts.iloc[_i]
+                    _a["balance"] = float(_row["Current Value ($)"])
+                    _a["basis"] = float(_row["Current Basis ($)"])
+                    _a["return_rate"] = _dec(float(_row["Return Rate (%)"]))
+                    _new_global = bool(_row["Use Global Rate"])
+                    _a["use_global_return_rate"] = _new_global
+                    st.session_state[f"chk_global_{_a['id']}"] = _new_global
+                    _a["qualified_dividend_yield"] = _dec(float(_row["Qual. Div Yield (%)"]))
+                    _a["ordinary_income_yield"] = _dec(float(_row["Ord. Income Yield (%)"]))
+                # Clear editor state so the table reinitialises from the updated accounts
+                if "acct_table_editor" in st.session_state:
+                    del st.session_state["acct_table_editor"]
+                st.rerun()
+
+        with _btn_col2:
+            if st.button("💾 Save to Scenario", key="acct_save", type="primary"):
+                # Apply edits first, then save
+                for _i, _a in enumerate(st.session_state.accounts):
+                    _row = _edited_accts.iloc[_i]
+                    _a["balance"] = float(_row["Current Value ($)"])
+                    _a["basis"] = float(_row["Current Basis ($)"])
+                    _a["return_rate"] = _dec(float(_row["Return Rate (%)"]))
+                    _new_global = bool(_row["Use Global Rate"])
+                    _a["use_global_return_rate"] = _new_global
+                    st.session_state[f"chk_global_{_a['id']}"] = _new_global
+                    _a["qualified_dividend_yield"] = _dec(float(_row["Qual. Div Yield (%)"]))
+                    _a["ordinary_income_yield"] = _dec(float(_row["Ord. Income Yield (%)"]))
+                _sc_name = st.session_state.get("sc_name", "My Scenario")
+                try:
+                    save_scenario(
+                        _sc_name,
+                        st.session_state.profile,
+                        st.session_state.assumptions,
+                        st.session_state.accounts,
+                        st.session_state.roth_conversion,
+                    )
+                    if "acct_table_editor" in st.session_state:
+                        del st.session_state["acct_table_editor"]
+                    st.rerun()
+                    st.success(f"Saved '{_sc_name}'")
+                except Exception as _e:
+                    st.error(str(_e))
 
 
 if __name__ == "__main__":
