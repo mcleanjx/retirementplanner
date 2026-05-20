@@ -1,5 +1,7 @@
 # Installation Instructions
 
+> **Warning:** This app is still a work in progress and may contain errors. Use results for informational purposes only and verify any financial figures independently.
+
 ## Prerequisites
 
 ### 1. Python 3.10 or higher
