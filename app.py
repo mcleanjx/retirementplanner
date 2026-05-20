@@ -11,7 +11,7 @@ import montecarlo as _mc
 import montecarlo_v2 as _mc2
 import plotly.graph_objects as go
 import optimizer as _opt
-from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking
+from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking, get_last_used_scenario, set_last_used_scenario
 from constants import RMD_START_AGE
 
 st.set_page_config(page_title="Retirement Planner", layout="wide")
@@ -111,8 +111,8 @@ DEFAULT_ROTH_CONVERSION = {
 
 def _init_state():
     if "profile" not in st.session_state:
-        # Auto-load the most recently modified scenario on first run
-        recent = latest_scenario()
+        # Auto-load the last explicitly used scenario on first run / page refresh
+        recent = get_last_used_scenario()
         if recent:
             try:
                 data = load_scenario(recent)
@@ -122,6 +122,7 @@ def _init_state():
                 st.session_state.accounts = copy.deepcopy(data["accounts"])
                 st.session_state.roth_conversion = data.get("roth_conversion", DEFAULT_ROTH_CONVERSION.copy())
                 st.session_state.spending_overrides = {}
+                st.session_state["sc_name"] = data.get("scenario_name", recent)
                 return
             except Exception:
                 pass
@@ -224,7 +225,9 @@ def _apply_pending_load():
     st.session_state.roth_conversion = rc
     st.session_state.spending_overrides = {}
     # Update the scenario name text input to match the loaded scenario
-    st.session_state["sc_name"] = data.get("scenario_name", "My Scenario")
+    _loaded_name = data.get("scenario_name", "My Scenario")
+    st.session_state["sc_name"] = _loaded_name
+    set_last_used_scenario(_loaded_name)
 
 
 _init_state()
@@ -583,6 +586,7 @@ def sidebar_scenarios():
                     st.session_state.accounts,
                     st.session_state.roth_conversion,
                 )
+                set_last_used_scenario(name)
                 st.success(f"Saved '{name}'")
             except Exception as e:
                 st.error(str(e))
@@ -726,20 +730,78 @@ def main():
     else:
         portfolio_at_le = 0.0
 
-    st.subheader("Summary")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Portfolio at Retirement", f"${total_at_retirement:,.0f}")
-    c2.metric("Pre-Tax", f"${pre_tax_total:,.0f}")
-    c3.metric("Roth / Tax-Free", f"${roth_total:,.0f}")
-    c4.metric("Taxable / Real Estate", f"${taxable_total:,.0f}")
-    c5.metric("Portfolio Longevity", longevity_str)
+    hdr_col, tog_col = st.columns([5, 1])
+    hdr_col.subheader("Summary")
+    compact_view = tog_col.toggle("Snapshot", key="summary_compact", value=False)
 
-    c6, c7, c8, c9, c10 = st.columns(5)
-    c6.metric(annual_withdrawal_label, f"${annual_withdrawal:,.0f}")
-    c7.metric("Lifetime Taxes", f"${summary['lifetime_taxes']:,.0f}")
-    c8.metric("Lifetime Healthcare", f"${summary['lifetime_healthcare']:,.0f}")
-    c9.metric("Lifetime Passive Income", f"${summary['lifetime_passive_income']:,.0f}")
-    c10.metric(f"Portfolio at Age {le_age}", f"${portfolio_at_le:,.0f}")
+    if compact_view:
+        # ── Compact snapshot view ──────────────────────────────────────────────
+        today_portfolio = sum(a["balance"] for a in accounts)
+        hc_today = profile.get(
+            "post_medicare_healthcare" if profile["current_age"] >= 65 else "pre_medicare_healthcare", 0.0
+        )
+        current_spend = assumptions.get("annual_spending_target", 0.0) + hc_today
+
+        day1_spend = float(ret_df["after_tax_spending"].iloc[0]) if not ret_df.empty else 0.0
+        le_row = ret_df[ret_df["age"] == le_age] if not ret_df.empty else ret_df.iloc[0:0]
+        eol_spend = float(le_row["after_tax_spending"].iloc[0]) if not le_row.empty else 0.0
+
+        c_now, c_ret, c_eol = st.columns(3)
+        with c_now:
+            st.markdown(f"**Today  (Age {profile['current_age']})**")
+            st.metric("Portfolio", f"${today_portfolio:,.0f}")
+            st.metric("Annual Spend", f"${current_spend:,.0f}",
+                      help="After-tax spending target + healthcare, in today's dollars")
+        with c_ret:
+            st.markdown(f"**Retirement Day 1  (Age {profile['retirement_age']})**")
+            st.metric("Portfolio", f"${total_at_retirement:,.0f}")
+            st.metric("Annual Spend", f"${day1_spend:,.0f}",
+                      help="Actual after-tax spend (taxes already paid), includes healthcare")
+        with c_eol:
+            st.markdown(f"**End of Life  (Age {le_age})**")
+            if portfolio_at_le <= 0:
+                st.markdown(
+                    f"""<div style="border:2px solid #cc0000;border-radius:8px;padding:10px 14px;background:#fff0f0;margin-bottom:1rem;">
+                    <div style="font-size:0.85rem;color:#888;margin-bottom:4px;">Portfolio</div>
+                    <div style="font-size:1.6rem;font-weight:700;color:#cc0000;">$0 — Depleted</div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.metric("Portfolio", f"${portfolio_at_le:,.0f}")
+            st.metric("Annual Spend", f"${eol_spend:,.0f}",
+                      help="Actual after-tax spend (taxes already paid), includes healthcare")
+    else:
+        # ── Full summary view ──────────────────────────────────────────────────
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Portfolio at Retirement", f"${total_at_retirement:,.0f}")
+        c2.metric("Pre-Tax", f"${pre_tax_total:,.0f}")
+        c3.metric("Roth / Tax-Free", f"${roth_total:,.0f}")
+        c4.metric("Taxable / Real Estate", f"${taxable_total:,.0f}")
+        c5.metric("Portfolio Longevity", longevity_str)
+
+        c6, c7, c8, c9, c10 = st.columns(5)
+        c6.metric(annual_withdrawal_label, f"${annual_withdrawal:,.0f}")
+        c7.metric("Lifetime Taxes", f"${summary['lifetime_taxes']:,.0f}")
+        c8.metric("Lifetime Healthcare", f"${summary['lifetime_healthcare']:,.0f}")
+        c9.metric("Lifetime Passive Income", f"${summary['lifetime_passive_income']:,.0f}")
+        with c10:
+            if portfolio_at_le <= 0:
+                st.markdown(
+                    f"""<div style="border:2px solid #cc0000;border-radius:8px;padding:10px 14px;background:#fff0f0;">
+                    <div style="font-size:0.85rem;color:#888;margin-bottom:4px;">Portfolio at Age {le_age}</div>
+                    <div style="font-size:1.6rem;font-weight:700;color:#cc0000;">$0</div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.metric(f"Portfolio at Age {le_age}", f"${portfolio_at_le:,.0f}")
+
+    if portfolio_at_le <= 0:
+        st.error(
+            "Your portfolio is depleted before your life expectancy — this plan likely won't work. "
+            "Consider increasing your retirement age, reducing spending assumptions, or saving more."
+        )
 
     # ---------------------------------------------------------------------------
     # Tabs
@@ -970,6 +1032,43 @@ def main():
         ci_total = sum(ci_balances.values())
         st.metric("Total Portfolio Entered", f"${ci_total:,.0f}")
 
+        ci_update_accounts = st.checkbox(
+            "Also update account balances in scenario from this check-in",
+            key="ci_update_accounts",
+        )
+
+        basis_accounts = [a for a in accounts if a["type"] in {"taxable", "reit", "rental_property"}]
+        ci_new_basis: dict[str, float] = {}
+        if ci_update_accounts and basis_accounts:
+            ci_update_basis = st.checkbox(
+                "Also update cost basis for taxable accounts",
+                key="ci_update_basis",
+            )
+            if ci_update_basis:
+                st.markdown("**New Cost Basis**")
+                bh1, bh2 = st.columns([3, 2])
+                bh1.markdown("*Account*")
+                bh2.markdown("*Cost Basis ($)*")
+                for a in basis_accounts:
+                    bc1, bc2 = st.columns([3, 2])
+                    bc1.write(a["name"])
+                    ci_new_basis[a["id"]] = float(bc2.number_input(
+                        a["name"],
+                        min_value=0,
+                        max_value=100_000_000,
+                        value=int(a.get("basis", 0)),
+                        step=1000,
+                        key=f"ci_basis_{a['id']}",
+                        label_visibility="collapsed",
+                    ))
+
+        if ci_update_accounts:
+            st.warning(
+                f"Saving will update each account's balance to the values entered above "
+                f"and will set your **current age in the profile to {int(ci_age)}**. "
+                f"This changes your scenario's starting point for future projections."
+            )
+
         save_disabled = ci_total <= 0
         if st.button("Save Check-in", disabled=save_disabled):
             checkins.append({
@@ -982,7 +1081,28 @@ def main():
             })
             tracking["checkins"] = checkins
             save_tracking(scenario_name, tracking)
-            st.success(f"Check-in saved — age {ci_age}: ${ci_total:,.0f}")
+
+            if ci_update_accounts:
+                for a in st.session_state.accounts:
+                    if a["id"] in ci_balances:
+                        a["balance"] = ci_balances[a["id"]]
+                    if a["id"] in ci_new_basis:
+                        a["basis"] = ci_new_basis[a["id"]]
+                st.session_state.profile["current_age"] = int(ci_age)
+                save_scenario(
+                    scenario_name,
+                    st.session_state.profile,
+                    st.session_state.assumptions,
+                    st.session_state.accounts,
+                    st.session_state.roth_conversion,
+                )
+                set_last_used_scenario(scenario_name)
+                st.success(
+                    f"Check-in saved and scenario updated — age set to {int(ci_age)}, "
+                    f"balances updated: ${ci_total:,.0f}"
+                )
+            else:
+                st.success(f"Check-in saved — age {ci_age}: ${ci_total:,.0f}")
             st.rerun()
 
         st.divider()
@@ -1742,6 +1862,7 @@ def main():
                         st.session_state.accounts,
                         st.session_state.roth_conversion,
                     )
+                    set_last_used_scenario(_sc_name)
                     if "acct_table_editor" in st.session_state:
                         del st.session_state["acct_table_editor"]
                     st.rerun()

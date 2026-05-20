@@ -24,6 +24,25 @@ def latest_scenario() -> str | None:
     return max(files, key=lambda p: p.stat().st_mtime).stem
 
 
+_LAST_USED_FILE = SCENARIOS_DIR / ".last_used"
+
+
+def get_last_used_scenario() -> str | None:
+    """Return the name of the last explicitly used scenario, falling back to latest by mtime."""
+    _ensure_dir()
+    if _LAST_USED_FILE.exists():
+        name = _LAST_USED_FILE.read_text(encoding="utf-8").strip()
+        if name and (SCENARIOS_DIR / f"{name}.json").exists():
+            return name
+    return latest_scenario()
+
+
+def set_last_used_scenario(name: str) -> None:
+    """Persist the last-used scenario name so it survives page refreshes."""
+    _ensure_dir()
+    _LAST_USED_FILE.write_text(name, encoding="utf-8")
+
+
 def save_scenario(name: str, profile: dict, assumptions: dict, accounts: list[dict], roth_conversion: dict | None = None) -> None:
     _ensure_dir()
     safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip()
