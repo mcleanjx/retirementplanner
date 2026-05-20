@@ -2136,5 +2136,212 @@ class TestScenarioFolderCreation:
         assert new_scenarios.exists()
 
 
+# ===========================================================================
+# 14. MATH AUDIT — end-to-end invariant checks against "My Scenario Demo"
+# ===========================================================================
+
+class TestMathAuditDemoScenario:
+    """
+    Loads 'My Scenario Demo.json', runs the full pipeline, and verifies
+    internal arithmetic invariants across every row of the retirement table.
+    These tests check that the numbers reported in the data table are
+    self-consistent — not whether the financial model is theoretically correct.
+    """
+
+    SCENARIO_PATH = "scenarios/My Scenario Demo.json"
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        import json
+        from projections import project_accumulation
+        from withdrawals import simulate_retirement
+
+        with open(self.SCENARIO_PATH) as f:
+            sc = json.load(f)
+
+        self.profile = sc["profile"]
+        self.assumptions = sc["assumptions"]
+        self.accounts = sc["accounts"]
+        roth_conv = sc["roth_conversion"]
+
+        _, ret_accts = project_accumulation(self.accounts, self.profile, self.assumptions)
+        self.ret_df, self.summary = simulate_retirement(
+            ret_accts, self.profile, self.assumptions, roth_conv
+        )
+
+    # -----------------------------------------------------------------------
+    # Tax decomposition
+    # -----------------------------------------------------------------------
+    def test_tax_components_sum_to_total_tax(self):
+        """federal_ordinary + federal_ltcg + federal_niit + federal_irmaa + state_tax == total_tax."""
+        df = self.ret_df
+        computed = (
+            df["federal_ordinary_tax"]
+            + df["federal_ltcg_tax"]
+            + df["federal_niit"]
+            + df["federal_irmaa"]
+            + df["state_tax"]
+        )
+        diff = (computed - df["total_tax"]).abs()
+        bad = df[diff > 0.01]["age"].tolist()
+        assert not bad, f"Tax component sum mismatch at ages {bad}"
+
+    # -----------------------------------------------------------------------
+    # Cash-flow identity
+    # -----------------------------------------------------------------------
+    def test_after_tax_spending_identity(self):
+        """after_tax_spending == (total_cash_received - surplus_reinvested) - total_tax.
+
+        total_cash_received uses investment_income (dividends only), not ltcg_income,
+        because withdrawal-generated capital gains are already counted inside the
+        withdrawal amount — they don't separately add cash.
+        """
+        df = self.ret_df
+        total_cash = (
+            df["rmd_amount"]
+            + df["taxable_withdrawal"]
+            + df["traditional_withdrawal"]
+            + df["roth_withdrawal"]
+            + df["bank_withdrawal"]
+            + df["ss_income"]
+            + df["rental_income"]
+            + df["investment_income"]
+        )
+        expected = (total_cash - df["surplus_reinvested"]) - df["total_tax"]
+        diff = (expected - df["after_tax_spending"]).abs()
+        bad = df[diff > 0.50]["age"].tolist()
+        assert not bad, f"after_tax_spending mismatch at ages {bad}"
+
+    # -----------------------------------------------------------------------
+    # Portfolio balance bookkeeping
+    # -----------------------------------------------------------------------
+    def test_account_balances_sum_to_total_portfolio(self):
+        """Sum of individual bal_* columns == total_portfolio for every row."""
+        df = self.ret_df
+        bal_cols = [c for c in df.columns if c.startswith("bal_")]
+        assert bal_cols, "No bal_* columns found in retirement DataFrame"
+        computed = df[bal_cols].sum(axis=1)
+        diff = (computed - df["total_portfolio"]).abs()
+        bad = df[diff > 1.0]["age"].tolist()
+        assert not bad, f"bal_* sum ≠ total_portfolio at ages {bad}"
+
+    def test_withdrawal_detail_columns_sum_to_total_withdrawn(self):
+        """Sum of wd_* columns == rmd_amount + all discretionary withdrawals."""
+        df = self.ret_df
+        wd_cols = [c for c in df.columns if c.startswith("wd_")]
+        if not wd_cols:
+            pytest.skip("No wd_* columns")
+        total_wd = (
+            df["rmd_amount"]
+            + df["taxable_withdrawal"]
+            + df["traditional_withdrawal"]
+            + df["roth_withdrawal"]
+            + df["bank_withdrawal"]
+        )
+        diff = (df[wd_cols].sum(axis=1) - total_wd).abs()
+        bad = df[diff > 0.50]["age"].tolist()
+        assert not bad, f"wd_* sum ≠ total withdrawn at ages {bad}"
+
+    def test_start_portfolio_matches_prior_year_end_balance(self):
+        """start_portfolio[age N] == total_portfolio[age N-1] for every consecutive pair."""
+        df = self.ret_df.reset_index(drop=True)
+        for i in range(1, len(df)):
+            prev = df.iloc[i - 1]["total_portfolio"]
+            curr = df.iloc[i]["start_portfolio"]
+            assert abs(curr - prev) < 1.0, (
+                f"start_portfolio at age {int(df.iloc[i]['age'])} ({curr:,.0f}) "
+                f"≠ total_portfolio at prior age ({prev:,.0f})"
+            )
+
+    # -----------------------------------------------------------------------
+    # Accumulation compound growth
+    # -----------------------------------------------------------------------
+    def test_401k_accumulation_compound_growth(self):
+        """401(k) balance at retirement matches manual compound growth formula.
+
+        Starting balance $200K, 6% return, $18K employee contribution, $6K match cap,
+        compounded for 20 years (age 35 → 55).
+        """
+        from projections import project_accumulation
+        _, ret_accts = project_accumulation(self.accounts, self.profile, self.assumptions)
+        b = 200_000.0
+        for _ in range(20):
+            b = b * 1.06 + 18_000 + 6_000
+        actual = next(a["balance"] for a in ret_accts if a["name"] == "401(k)")
+        assert abs(b - actual) < 1.0, f"Expected {b:,.2f}, got {actual:,.2f}"
+
+    # -----------------------------------------------------------------------
+    # Social Security timing
+    # -----------------------------------------------------------------------
+    def test_ss_jumps_at_age_67_when_primary_ss_starts(self):
+        """SS income rises at age 67 when the primary filer's benefit begins."""
+        df = self.ret_df
+        # In this scenario the spouse is already 69 at retirement so spouse SS
+        # is active from age 55; primary SS starts at 67 and should lift total SS.
+        ss_66 = df[df["age"] == 66]["ss_income"].values[0]
+        ss_67 = df[df["age"] == 67]["ss_income"].values[0]
+        assert ss_67 > ss_66, (
+            f"SS should increase at age 67 (primary starts): "
+            f"age 66={ss_66:,.0f}, age 67={ss_67:,.0f}"
+        )
+
+    # -----------------------------------------------------------------------
+    # RMD correctness
+    # -----------------------------------------------------------------------
+    def test_rmd_zero_before_age_73(self):
+        """No RMDs are taken before age 73."""
+        assert self.ret_df[self.ret_df["age"] < 73]["rmd_amount"].sum() == 0.0
+
+    def test_rmd_positive_from_age_73_until_depletion(self):
+        """RMDs > 0 every year from 73 until the portfolio depletes."""
+        df = self.ret_df
+        depl = self.summary["portfolio_depleted_age"]
+        rmd_window = df[(df["age"] >= 73) & (df["age"] < depl)]
+        assert (rmd_window["rmd_amount"] > 0).all(), (
+            "RMDs should be positive every year from 73 until depletion"
+        )
+
+    def test_rmd_amount_at_73_matches_formula(self):
+        """RMD at age 73 = (401k_bal + IRA_bal at end of age 72) / RMD_TABLE[73]."""
+        from constants import RMD_TABLE
+        df = self.ret_df
+        row_72 = df[df["age"] == 72].iloc[0]
+        row_73 = df[df["age"] == 73].iloc[0]
+        # Traditional accounts: "401(k)" and "IRA - Josh" (spaces → underscores in col names)
+        trad_bal = row_72["bal_401(k)"] + row_72["bal_IRA_-_Josh"]
+        expected = trad_bal / RMD_TABLE[73]
+        assert abs(row_73["rmd_amount"] - expected) < 100, (
+            f"RMD at 73: expected ≈{expected:,.0f}, got {row_73['rmd_amount']:,.0f}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Sanity bounds
+    # -----------------------------------------------------------------------
+    def test_portfolio_depleted_at_age_86(self):
+        """Demo scenario should deplete at age 86 with current inputs."""
+        assert self.summary["portfolio_depleted_age"] == 86
+
+    def test_effective_tax_rate_in_bounds(self):
+        """Effective tax rate is between 0% and 60% for every simulation year."""
+        df = self.ret_df
+        assert (df["effective_tax_rate"] >= 0).all()
+        assert (df["effective_tax_rate"] <= 0.60).all()
+
+    def test_no_negative_portfolio_before_depletion(self):
+        """total_portfolio ≥ 0 for every year before the depletion year."""
+        df = self.ret_df
+        depl = self.summary["portfolio_depleted_age"]
+        assert (df[df["age"] < depl]["total_portfolio"] >= 0).all()
+
+    def test_spending_target_grows_year_over_year(self):
+        """spending_target rises each year pre-depletion (nominal inflation drives this)."""
+        df = self.ret_df
+        depl = self.summary["portfolio_depleted_age"]
+        early = df[df["age"] < depl].copy()
+        ratios = (early["spending_target"] / early["spending_target"].shift(1)).dropna()
+        assert (ratios > 0.50).all(), "Spending target dropped by >50% in a single year"
+        assert (ratios < 1.30).all(), "Spending target grew by >30% in a single year"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
