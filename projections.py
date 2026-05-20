@@ -115,6 +115,9 @@ def project_accumulation(accounts: list[dict], profile: dict, assumptions: dict)
 
     df = pd.DataFrame(rows)
 
+    if df.empty:
+        return df, accts
+
     # Summary columns for stacked charts
     df["tax_bucket"] = df["account_type"].map({
         "traditional_401k": "pre_tax",

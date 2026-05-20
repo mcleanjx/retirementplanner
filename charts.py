@@ -37,6 +37,18 @@ def _fmt(val: float) -> str:
     return f"${val:,.0f}"
 
 
+def _add_current_age_vline(fig: go.Figure, current_age: int, retirement_age: int) -> None:
+    if current_age > retirement_age:
+        fig.add_vline(
+            x=current_age,
+            line_dash="dash",
+            line_color="rgba(255, 120, 0, 0.85)",
+            line_width=2,
+            annotation_text=f"Age {current_age} (now)",
+            annotation_position="top right",
+        )
+
+
 def chart_accumulation(acc_df: pd.DataFrame) -> go.Figure:
     """Stacked area chart of account balances during accumulation."""
     fig = go.Figure()
@@ -101,6 +113,7 @@ def chart_drawdown(
     accounts_at_retirement: list[dict],
     inflation: float = 0.0,
     current_age: int = 0,
+    retirement_age: int = 0,
 ) -> go.Figure:
     """Stacked area chart of remaining balances during retirement.
 
@@ -143,6 +156,7 @@ def chart_drawdown(
             line=dict(color="black", width=2, dash="dash"),
             hovertemplate="<b>Portfolio (today's $)</b><br>Age: %{x}<br>%{y:$,.0f}<extra></extra>",
         ))
+    _add_current_age_vline(fig, current_age, retirement_age)
     fig.update_layout(
         title="Portfolio Drawdown During Retirement",
         xaxis_title="Age",
@@ -158,6 +172,7 @@ def chart_annual_income(
     ret_df: pd.DataFrame,
     inflation: float = 0.0,
     retirement_age: int = 0,
+    current_age: int = 0,
 ) -> go.Figure:
     """Stacked bar chart of annual income sources in retirement.
 
@@ -217,6 +232,7 @@ def chart_annual_income(
             hovertemplate="<b>Spending (retirement-yr $)</b><br>Age: %{x}<br>%{y:$,.0f}<extra></extra>",
         ))
 
+    _add_current_age_vline(fig, current_age, retirement_age)
     fig.update_layout(
         title="Annual Retirement Income & Taxes",
         xaxis_title="Age",
@@ -229,7 +245,7 @@ def chart_annual_income(
     return fig
 
 
-def chart_spending_coverage(ret_df: pd.DataFrame) -> go.Figure:
+def chart_spending_coverage(ret_df: pd.DataFrame, current_age: int = 0, retirement_age: int = 0) -> go.Figure:
     """
     Stacked bar chart showing how spending is funded.
     Organic income (SS, rental, dividends) and traditional distributions (RMDs)
@@ -298,6 +314,7 @@ def chart_spending_coverage(ret_df: pd.DataFrame) -> go.Figure:
         hovertemplate="<b>After-Tax Spending</b><br>Age: %{x}<br>%{y:$,.0f}<extra></extra>",
     ))
 
+    _add_current_age_vline(fig, current_age, retirement_age)
     fig.update_layout(
         title="Retirement Spending: Gross Income, Taxes & Net Spending",
         xaxis_title="Age",
@@ -516,7 +533,7 @@ def chart_mc_depletion(mc_result: dict) -> go.Figure:
     return fig
 
 
-def chart_tax_burden(ret_df: pd.DataFrame) -> go.Figure:
+def chart_tax_burden(ret_df: pd.DataFrame, current_age: int = 0, retirement_age: int = 0) -> go.Figure:
     """Line chart of annual tax components during retirement."""
     fig = go.Figure()
 
@@ -548,6 +565,7 @@ def chart_tax_burden(ret_df: pd.DataFrame) -> go.Figure:
         hovertemplate="<b>Effective Rate</b><br>Age: %{x}<br>%{y:.1f}%<extra></extra>",
     ))
 
+    _add_current_age_vline(fig, current_age, retirement_age)
     fig.update_layout(
         title="Annual Tax Burden During Retirement",
         xaxis_title="Age",

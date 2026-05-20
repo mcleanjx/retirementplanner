@@ -1928,5 +1928,213 @@ class TestSpecGaps:
         assert row["traditional_withdrawal"] == 0.0, "Traditional should not be touched when bank covers spending"
 
 
+# ===========================================================================
+# 11. ALREADY-RETIRED MODE (current_age > retirement_age)
+# ===========================================================================
+
+class TestAlreadyRetired:
+    def test_simulation_runs_when_current_age_exceeds_retirement_age(self):
+        from withdrawals import simulate_retirement
+        accts = [_trad_account(500_000)]
+        p = _base_profile(current_age=70, retirement_age=65, life_expectancy=85)
+        df, summary = simulate_retirement(accts, p, _base_assumptions())
+        assert len(df) > 0
+
+    def test_simulation_starts_at_retirement_age_not_current_age(self):
+        from withdrawals import simulate_retirement
+        accts = [_trad_account(800_000)]
+        p = _base_profile(current_age=72, retirement_age=65, life_expectancy=85)
+        df, _ = simulate_retirement(accts, p, _base_assumptions())
+        assert df["age"].min() == 65
+        assert df["age"].max() == 85
+        assert len(df) == 85 - 65 + 1
+
+    def test_accumulation_returns_empty_df_when_already_retired(self):
+        from projections import project_accumulation
+        accts = [_trad_account(500_000)]
+        p = _base_profile(current_age=70, retirement_age=65, life_expectancy=85)
+        df, final_accts = project_accumulation(accts, p, _base_assumptions())
+        assert df.empty
+        # Accounts pass through unchanged (no growth applied)
+        assert final_accts[0]["balance"] == 500_000
+
+    def test_current_age_equals_retirement_age_still_works(self):
+        from withdrawals import simulate_retirement
+        accts = [_trad_account(500_000)]
+        p = _base_profile(current_age=65, retirement_age=65, life_expectancy=80)
+        df, _ = simulate_retirement(accts, p, _base_assumptions())
+        assert df["age"].min() == 65
+        assert len(df) == 80 - 65 + 1
+
+    def test_rmds_active_when_already_past_rmd_start_age(self):
+        from withdrawals import simulate_retirement
+        from constants import RMD_START_AGE
+        accts = [_trad_account(2_000_000)]
+        # current_age is past RMD start — RMDs must be present from age 73
+        p = _base_profile(current_age=75, retirement_age=65, life_expectancy=85,
+                          social_security_start_age=67)
+        df, _ = simulate_retirement(accts, p, _base_assumptions())
+        rmd_rows = df[df["age"] >= RMD_START_AGE]
+        assert rmd_rows["rmd_amount"].sum() > 0
+
+    def test_life_expectancy_must_exceed_current_age_when_already_retired(self):
+        """life_expectancy must be > max(retirement_age, current_age)."""
+        from withdrawals import simulate_retirement
+        accts = [_trad_account(500_000)]
+        # current_age=72, retirement_age=65, life_expectancy=80 — valid
+        p = _base_profile(current_age=72, retirement_age=65, life_expectancy=80)
+        df, _ = simulate_retirement(accts, p, _base_assumptions())
+        assert len(df) == 80 - 65 + 1
+
+
+# ===========================================================================
+# 12. CHART FUNCTIONS — current-age vertical line
+# ===========================================================================
+
+class TestChartCurrentAgeLine:
+    """Verify retirement charts add a vline when current_age > retirement_age."""
+
+    def _minimal_ret_df(self):
+        import pandas as pd
+        ages = list(range(65, 86))
+        n = len(ages)
+        return pd.DataFrame({
+            "age": ages,
+            "total_portfolio": [500_000 - i * 5_000 for i in range(n)],
+            "start_portfolio": [500_000 - i * 5_000 for i in range(n)],
+            "spending_target": [30_000.0] * n,
+            "net_spending_target": [28_000.0] * n,
+            "after_tax_spending": [28_000.0] * n,
+            "ss_income": [0.0] * n,
+            "rental_income": [0.0] * n,
+            "investment_income": [0.0] * n,
+            "rmd_amount": [0.0] * n,
+            "taxable_withdrawal": [5_000.0] * n,
+            "traditional_withdrawal": [20_000.0] * n,
+            "roth_withdrawal": [0.0] * n,
+            "bank_withdrawal": [0.0] * n,
+            "roth_conversion": [0.0] * n,
+            "harvest_ltcg": [0.0] * n,
+            "total_tax": [2_000.0] * n,
+            "effective_tax_rate": [0.07] * n,
+            "federal_ordinary_tax": [1_500.0] * n,
+            "state_tax": [500.0] * n,
+            "surplus_reinvested": [0.0] * n,
+        })
+
+    def test_drawdown_vline_when_already_retired(self):
+        import charts
+        fig = charts.chart_drawdown(
+            self._minimal_ret_df(), [_trad_account()],
+            current_age=70, retirement_age=65,
+        )
+        assert len(fig.layout.shapes) > 0
+
+    def test_drawdown_no_vline_when_not_yet_retired(self):
+        import charts
+        fig = charts.chart_drawdown(
+            self._minimal_ret_df(), [_trad_account()],
+            current_age=60, retirement_age=65,
+        )
+        assert len(fig.layout.shapes) == 0
+
+    def test_drawdown_no_vline_at_exact_retirement_age(self):
+        import charts
+        fig = charts.chart_drawdown(
+            self._minimal_ret_df(), [_trad_account()],
+            current_age=65, retirement_age=65,
+        )
+        assert len(fig.layout.shapes) == 0
+
+    def test_spending_coverage_vline_when_already_retired(self):
+        import charts
+        fig = charts.chart_spending_coverage(
+            self._minimal_ret_df(), current_age=70, retirement_age=65,
+        )
+        assert len(fig.layout.shapes) > 0
+
+    def test_spending_coverage_no_vline_when_not_yet_retired(self):
+        import charts
+        fig = charts.chart_spending_coverage(
+            self._minimal_ret_df(), current_age=60, retirement_age=65,
+        )
+        assert len(fig.layout.shapes) == 0
+
+    def test_annual_income_vline_when_already_retired(self):
+        import charts
+        fig = charts.chart_annual_income(
+            self._minimal_ret_df(), retirement_age=65, current_age=70,
+        )
+        assert len(fig.layout.shapes) > 0
+
+    def test_annual_income_no_vline_when_not_yet_retired(self):
+        import charts
+        fig = charts.chart_annual_income(
+            self._minimal_ret_df(), retirement_age=65, current_age=60,
+        )
+        assert len(fig.layout.shapes) == 0
+
+    def test_tax_burden_vline_when_already_retired(self):
+        import charts
+        fig = charts.chart_tax_burden(
+            self._minimal_ret_df(), current_age=70, retirement_age=65,
+        )
+        assert len(fig.layout.shapes) > 0
+
+    def test_tax_burden_no_vline_when_not_yet_retired(self):
+        import charts
+        fig = charts.chart_tax_burden(
+            self._minimal_ret_df(), current_age=60, retirement_age=65,
+        )
+        assert len(fig.layout.shapes) == 0
+
+    def test_all_charts_return_figure_with_default_args(self):
+        import charts
+        ret_df = self._minimal_ret_df()
+        assert charts.chart_drawdown(ret_df, [_trad_account()]) is not None
+        assert charts.chart_spending_coverage(ret_df) is not None
+        assert charts.chart_annual_income(ret_df) is not None
+        assert charts.chart_tax_burden(ret_df) is not None
+
+
+# ===========================================================================
+# 13. SCENARIO FOLDER AUTO-CREATION
+# ===========================================================================
+
+class TestScenarioFolderCreation:
+    def test_ensure_dir_creates_both_folders_from_scratch(self, tmp_path, monkeypatch):
+        import scenarios
+        new_scenarios = tmp_path / "scenarios"
+        new_tracking = new_scenarios / "tracking"
+        monkeypatch.setattr(scenarios, "SCENARIOS_DIR", new_scenarios)
+        monkeypatch.setattr(scenarios, "TRACKING_DIR", new_tracking)
+        assert not new_scenarios.exists()
+        assert not new_tracking.exists()
+        scenarios._ensure_dir()
+        assert new_scenarios.exists()
+        assert new_tracking.exists()
+
+    def test_ensure_dir_idempotent(self, tmp_path, monkeypatch):
+        import scenarios
+        new_scenarios = tmp_path / "scenarios"
+        new_tracking = new_scenarios / "tracking"
+        monkeypatch.setattr(scenarios, "SCENARIOS_DIR", new_scenarios)
+        monkeypatch.setattr(scenarios, "TRACKING_DIR", new_tracking)
+        scenarios._ensure_dir()
+        scenarios._ensure_dir()  # must not raise
+        assert new_scenarios.exists()
+        assert new_tracking.exists()
+
+    def test_list_scenarios_creates_dirs_if_missing(self, tmp_path, monkeypatch):
+        import scenarios
+        new_scenarios = tmp_path / "scenarios"
+        new_tracking = new_scenarios / "tracking"
+        monkeypatch.setattr(scenarios, "SCENARIOS_DIR", new_scenarios)
+        monkeypatch.setattr(scenarios, "TRACKING_DIR", new_tracking)
+        result = scenarios.list_scenarios()
+        assert isinstance(result, list)
+        assert new_scenarios.exists()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

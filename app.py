@@ -267,9 +267,9 @@ def _dec(pct: float) -> float:
 def sidebar_profile():
     p = st.session_state.profile
     with st.sidebar.expander("👤 Profile", expanded=True):
-        p["current_age"] = st.number_input("Current Age", 18, 80, p["current_age"], key="p_age")
-        p["retirement_age"] = st.number_input("Retirement Age", p["current_age"], 85, p["retirement_age"], key="p_ret")
-        p["life_expectancy"] = st.number_input("Life Expectancy", p["retirement_age"] + 1, 110, p["life_expectancy"], key="p_le")
+        p["current_age"] = st.number_input("Current Age", 18, 100, p["current_age"], key="p_age")
+        p["retirement_age"] = st.number_input("Retirement Age", 18, 100, p["retirement_age"], key="p_ret")
+        p["life_expectancy"] = st.number_input("Life Expectancy", max(p["retirement_age"], p["current_age"]) + 1, 110, p["life_expectancy"], key="p_le")
         p["filing_status"] = st.selectbox(
             "Filing Status",
             options=list(FILING_STATUS_LABELS.keys()),
@@ -299,7 +299,7 @@ def sidebar_profile():
         if p["filing_status"] == "married_filing_jointly":
             st.markdown("**Spouse**")
             p["spouse_age"] = st.number_input("Spouse Current Age", 18, 80, p.get("spouse_age", p["current_age"]), key="p_sp_age")
-            p["spouse_retirement_age"] = st.number_input("Spouse Retirement Age", p["spouse_age"], 85, p.get("spouse_retirement_age", 65), key="p_sp_ret")
+            p["spouse_retirement_age"] = st.number_input("Spouse Retirement Age", 18, 100, p.get("spouse_retirement_age", 65), key="p_sp_ret")
             p["spouse_ss_benefit"] = st.number_input("Spouse SS Benefit ($/yr today's $)", 0, 60000, int(p.get("spouse_ss_benefit", 0)), 500, key="p_sp_ss")
             p["spouse_ss_start_age"] = st.number_input("Spouse SS Start Age", 62, 70, p.get("spouse_ss_start_age", 67), key="p_sp_ss_age")
             p["survivor_spending_reduction"] = _dec(st.number_input(
@@ -749,8 +749,8 @@ def main():
     ])
 
     with tab1:
-        if profile["retirement_age"] == profile["current_age"]:
-            st.info("Retirement age equals current age — no accumulation phase. See the Retirement tab for projections.")
+        if profile["retirement_age"] <= profile["current_age"]:
+            st.info("Already retired — no accumulation phase. See the Retirement tab for projections.")
             st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), use_container_width=True)
         else:
             st.plotly_chart(_charts.chart_accumulation(acc_df), use_container_width=True)
@@ -761,10 +761,12 @@ def main():
                 st.info(f"📊 Estimated tax drag on taxable accounts during accumulation: ${total_drag:,.0f} total.")
 
     with tab2:
-        st.plotly_chart(_charts.chart_drawdown(ret_df, accounts_at_retirement, assumptions.get("inflation_rate", 0.03), profile["current_age"]), use_container_width=True)
-        st.plotly_chart(_charts.chart_spending_coverage(ret_df), use_container_width=True)
-        st.plotly_chart(_charts.chart_annual_income(ret_df, assumptions.get("inflation_rate", 0.03), profile["retirement_age"]), use_container_width=True)
-        st.plotly_chart(_charts.chart_tax_burden(ret_df), use_container_width=True)
+        _cur_age = profile["current_age"]
+        _ret_age = profile["retirement_age"]
+        st.plotly_chart(_charts.chart_drawdown(ret_df, accounts_at_retirement, assumptions.get("inflation_rate", 0.03), _cur_age, _ret_age), use_container_width=True)
+        st.plotly_chart(_charts.chart_spending_coverage(ret_df, _cur_age, _ret_age), use_container_width=True)
+        st.plotly_chart(_charts.chart_annual_income(ret_df, assumptions.get("inflation_rate", 0.03), _ret_age, _cur_age), use_container_width=True)
+        st.plotly_chart(_charts.chart_tax_burden(ret_df, _cur_age, _ret_age), use_container_width=True)
 
     with tab3:
         fixed_net_mode = assumptions.get("spending_mode") == "fixed"
