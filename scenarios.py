@@ -6,8 +6,8 @@ TRACKING_DIR = SCENARIOS_DIR / "tracking"
 
 
 def _ensure_dir():
-    SCENARIOS_DIR.mkdir(exist_ok=True)
-    TRACKING_DIR.mkdir(exist_ok=True)
+    SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
+    TRACKING_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def list_scenarios() -> list[str]:
