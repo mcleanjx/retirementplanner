@@ -67,7 +67,6 @@ def _owner_min_conv_age(account: dict, profile: dict) -> int:
 
 def _sample_strategy(profile: dict, accounts: list, rng: random.Random) -> tuple[str, dict]:
     """Randomly sample a complete retirement strategy configuration."""
-    retirement_age = profile.get("retirement_age", 65)
     life_expectancy = profile.get("life_expectancy", 90)
     ss_start = profile.get("social_security_start_age", 67)
 
@@ -86,8 +85,12 @@ def _sample_strategy(profile: dict, accounts: list, rng: random.Random) -> tuple
         source_accounts = rng.sample(trad_accounts, n_sources)
         source_ids = [a["id"] for a in source_accounts]
 
-        # Minimum conversion start age = latest "ready" age across all source accounts
-        min_conv_age = max(_owner_min_conv_age(a, profile) for a in source_accounts)
+        # Minimum conversion start age = latest "ready" age across all source accounts,
+        # but never before 60 (Roth 5-year seasoning and practical planning floor).
+        min_conv_age = max(
+            max(_owner_min_conv_age(a, profile) for a in source_accounts),
+            60,
+        )
 
         # Conversion window ceiling: stop before RMDs kick in or SS starts
         conv_max_end = max(
@@ -200,45 +203,55 @@ def _describe_strategy(withdrawal_strategy: str, rc: dict, accounts: list) -> di
 
 def build_actions_table(ret_df: pd.DataFrame, rc: dict, accounts: list) -> pd.DataFrame:
     """
-    Build a per-year recommended actions table from the optimized simulation result.
-    Shows what each account type should do in each retirement year.
+    Per-year cash-flow table.
+
+    Sign convention for account columns:
+      negative = money leaving the account (withdrawal, RMD, Roth conversion source)
+      positive = money entering the account (Roth conversion receipt)
+
+    "Portfolio Draw" = sum of all account columns = net reduction to the portfolio
+    for that year (Roth conversion internal transfers cancel to zero).
+
+    Expense/income context columns are shown separately and are NOT included in
+    Portfolio Draw to avoid double-counting (the account withdrawals ARE the source
+    that funds taxes, healthcare, and living expenses).
     """
     if ret_df is None or ret_df.empty:
         return pd.DataFrame()
 
-    acc_by_id = {a["id"]: a["name"] for a in accounts}
-    source_names = ", ".join(
-        acc_by_id.get(aid, aid) for aid in rc.get("source_account_ids", [])
-    ) if rc.get("enabled") else "—"
-    dest_name = acc_by_id.get(rc.get("destination_account_id", ""), "Roth account") if rc.get("enabled") else "—"
+    def _safe(name: str) -> str:
+        return name.replace(" ", "_")
 
     rows = []
     for _, row in ret_df.iterrows():
-        age = int(row["age"])
-        roth_conv = row.get("roth_conversion", 0.0)
-        rmd = row.get("rmd_amount", 0.0)
+        rec: dict = {"Age": int(row["age"])}
 
-        # Derive primary action label for this year
-        if roth_conv > 0:
-            action = f"Roth Convert ({source_names} → {dest_name})"
-        elif rmd > 0:
-            action = "RMD (Required Minimum Distribution)"
-        else:
-            action = "Standard Withdrawal"
+        portfolio_draw = 0.0
+        for a in accounts:
+            sn = _safe(a["name"])
+            wd        = float(row.get(f"wd_{sn}",        0.0))
+            conv_from = float(row.get(f"conv_from_{sn}", 0.0))
+            conv_to   = float(row.get(f"conv_to_{sn}",   0.0))
+            net = -(wd + conv_from) + conv_to
+            rec[a["name"]] = net
+            portfolio_draw += net
 
-        rows.append({
-            "Age": age,
-            "Primary Action": action,
-            "Roth Conversion": roth_conv,
-            "RMD": rmd,
-            "Traditional Withdrawal": row.get("traditional_withdrawal", 0.0),
-            "Taxable Withdrawal": row.get("taxable_withdrawal", 0.0),
-            "Roth Withdrawal": row.get("roth_withdrawal", 0.0),
-            "Bank Withdrawal": row.get("bank_withdrawal", 0.0),
-            "Total Tax": row.get("total_tax", 0.0),
-            "Eff. Tax Rate": row.get("effective_tax_rate", 0.0),
-            "After-Tax Income": row.get("actual_after_tax_net", 0.0),
-        })
+        # Subtotal: net cash drawn from the portfolio this year
+        rec["Portfolio Draw"] = portfolio_draw
+
+        # Income that offsets the portfolio draw (positive = reduces how much accounts must cover)
+        ss      = float(row.get("ss_income",        0.0))
+        rental  = float(row.get("rental_income",     0.0))
+        inv     = float(row.get("investment_income", 0.0))
+        rec["SS & Passive Income"] = ss + rental + inv
+
+        # Expense breakdown (informational — funded by account withdrawals above)
+        rec["Taxes"]       = -float(row.get("total_tax",            0.0))
+        rec["Healthcare"]  = -float(row.get("healthcare_cost",     0.0))
+        rec["Total Spend"] =  float(row.get("actual_after_tax_net", 0.0))
+
+        rec["Eff. Tax Rate"] = float(row.get("effective_tax_rate", 0.0))
+        rows.append(rec)
 
     return pd.DataFrame(rows)
 

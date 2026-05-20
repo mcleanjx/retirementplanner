@@ -1,6 +1,5 @@
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 
 TAX_BUCKET_COLORS = {
     "pre_tax":     "#4C72B0",

@@ -182,10 +182,9 @@ def simulate_retirement(
         # --- Step 1: Mandatory / passive income ---
         ordinary_income = 0.0
         ltcg_income = 0.0
-        passive_detail = {}
-
         # RMDs
         rmd_total = 0.0
+        rmd_detail: dict[str, float] = {}
         for a in accts:
             if a["type"] in TRADITIONAL_TYPES and age >= RMD_START_AGE:
                 divisor = _rmd_divisor(age)
@@ -193,6 +192,7 @@ def simulate_retirement(
                 actual, oi, lg = _withdraw_from(a, rmd)
                 ordinary_income += oi
                 rmd_total += actual
+                rmd_detail[a["name"]] = rmd_detail.get(a["name"], 0.0) + actual
 
         # Social Security
         total_ss = 0.0
@@ -229,6 +229,8 @@ def simulate_retirement(
 
         # --- Step 3: Roth conversions ---
         roth_conversion_amount = 0.0
+        conv_from_detail: dict[str, float] = {}
+        conv_to_detail: dict[str, float] = {}
         if roth_conversion and roth_conversion.get("enabled"):
             conv_start = roth_conversion.get("start_age", retirement_age)
             conv_end = roth_conversion.get("end_age", min(ss_start - 1, RMD_START_AGE - 1))
@@ -266,7 +268,9 @@ def simulate_retirement(
                         for a in src_accts:
                             portion = (a["balance"] / total_src) * convert
                             a["balance"] -= portion
+                            conv_from_detail[a["name"]] = conv_from_detail.get(a["name"], 0.0) + portion
                         dst["balance"] += convert
+                        conv_to_detail[dst["name"]] = conv_to_detail.get(dst["name"], 0.0) + convert
                         ordinary_income += convert
                         roth_conversion_amount = convert
                         conversion_vintages[age] = conversion_vintages.get(age, 0) + convert
@@ -624,6 +628,9 @@ def simulate_retirement(
             "start_portfolio": start_portfolio,
             "total_portfolio": total_balance,
             **{f"bal_{a['name'].replace(' ','_')}": a["balance"] for a in accts},
+            **{f"wd_{a['name'].replace(' ','_')}": rmd_detail.get(a["name"], 0.0) + withdrawal_detail.get(a["name"], 0.0) for a in accts},
+            **{f"conv_from_{a['name'].replace(' ','_')}": conv_from_detail.get(a["name"], 0.0) for a in accts},
+            **{f"conv_to_{a['name'].replace(' ','_')}": conv_to_detail.get(a["name"], 0.0) for a in accts},
         })
 
     df = pd.DataFrame(rows)

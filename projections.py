@@ -1,6 +1,6 @@
 import pandas as pd
-from taxes import marginal_rate, calculate_ltcg_tax, LTCG_BRACKETS
-from constants import RMD_START_AGE, STANDARD_DEDUCTION, CA_ORDINARY_BRACKETS, CA_STANDARD_DEDUCTION
+from taxes import marginal_rate, calculate_ltcg_tax
+from constants import STANDARD_DEDUCTION, CA_ORDINARY_BRACKETS, CA_STANDARD_DEDUCTION
 
 
 def _ca_marginal_rate(income: float, filing_status: str) -> float:

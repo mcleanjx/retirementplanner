@@ -1,7 +1,7 @@
 from constants import (
     STANDARD_DEDUCTION, ORDINARY_BRACKETS, LTCG_BRACKETS,
     NIIT_RATE, NIIT_THRESHOLD, IRMAA_TIERS,
-    MEDICARE_PART_B_BASE_MONTHLY, SS_TAXABILITY, BRACKET_CEILINGS,
+    SS_TAXABILITY, BRACKET_CEILINGS,
     CA_STANDARD_DEDUCTION, CA_ORDINARY_BRACKETS,
 )
 
@@ -100,11 +100,9 @@ def bracket_ceiling_for_rate(rate: float, filing_status: str, bracket_factor: fl
 def marginal_rate(taxable_income: float, filing_status: str) -> float:
     """Returns the marginal federal rate at a given taxable income level."""
     brackets = ORDINARY_BRACKETS[filing_status]
-    prev = 0.0
     for upper, rate in brackets:
         if upper is None or taxable_income <= upper:
             return rate
-        prev = upper
     return 0.37
 
 

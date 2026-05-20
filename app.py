@@ -176,6 +176,14 @@ def _apply_pending_load():
     st.session_state["p_hc_pre"] = int(_p.get("pre_medicare_healthcare", 15000))
     st.session_state["p_hc_post"] = int(_p.get("post_medicare_healthcare", 12000))
     st.session_state.assumptions = data["assumptions"]
+    _asmp = data["assumptions"]
+    st.session_state["a_inf"]          = float(round(_asmp.get("inflation_rate", 0.03) * 100, 1))
+    st.session_state["a_bracket_inf"]  = float(round(_asmp.get("bracket_inflation_rate", 0.025) * 100, 1))
+    st.session_state["a_ret"]          = float(round(_asmp.get("retirement_return_rate", 0.05) * 100, 1))
+    st.session_state["a_spend_mode"]   = _asmp.get("spending_mode", "swr")
+    st.session_state["a_swr"]          = float(round(_asmp.get("safe_withdrawal_rate", 0.04) * 100, 1))
+    st.session_state["a_spend_target"] = int(_asmp.get("annual_spending_target", 80000))
+    st.session_state["a_withdraw_strat"] = _asmp.get("withdrawal_strategy", "tax_efficient")
     st.session_state.accounts = data["accounts"]
     # Explicitly seed all account widget keys so browser-submitted values from
     # the previous scenario cannot overwrite the freshly loaded data.
@@ -601,8 +609,38 @@ def sidebar_scenarios():
 # ---------------------------------------------------------------------------
 
 def main():
-    st.title("Retirement Planner")
-    st.caption("Model investment accounts, project growth, and optimize tax-efficient withdrawals.")
+    st.markdown(
+        """
+        <div style="
+            border-radius: 12px;
+            padding: 1.1rem 1.6rem;
+            margin-bottom: 1rem;
+            background: linear-gradient(135deg, #1a365d 0%, #2b6cb0 60%, #3182ce 100%);
+            box-shadow: 0 4px 16px rgba(49, 130, 206, 0.25);
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        ">
+            <div style="font-size: 2rem; line-height: 1;">📈</div>
+            <div>
+                <div style="
+                    font-size: 1.55rem;
+                    font-weight: 800;
+                    color: #ffffff;
+                    letter-spacing: -0.01em;
+                    line-height: 1.15;
+                ">Retirement Planner</div>
+                <div style="
+                    font-size: 0.82rem;
+                    color: rgba(255,255,255,0.72);
+                    margin-top: 0.15rem;
+                    letter-spacing: 0.01em;
+                ">Model investment accounts · project growth · optimize tax-efficient withdrawals</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # Sidebar
     sidebar_profile()
@@ -1449,21 +1487,60 @@ def main():
             # --- Year-by-year actions ---
             st.divider()
             st.subheader("Recommended Actions by Year")
-            st.caption(
-                "What to do in each retirement year — which accounts to draw from, "
-                "when to convert to Roth, and what to expect in taxes and after-tax income."
+            st.markdown(
+                "🔴 **Red** — action required: sell / withdraw / convert out of this account. &nbsp;"
+                "🟢 **Green** — money arriving (Roth conversion receipt). &nbsp;"
+                "🟡 **Amber** — expense (taxes, healthcare). &nbsp;"
+                "🔵 **Blue** — passive income offsetting the portfolio draw (SS, dividends, rental). &nbsp;"
+                "💚 **Bold green** — **Total Spend**: what you actually have to live on after all costs. "
+                "Check: |Portfolio Draw| + SS & Passive Income − |Taxes| − |Healthcare| = Total Spend."
             )
             actions_df = _opt.build_actions_table(best_df, best_rc, accounts_at_retirement)
             if not actions_df.empty:
-                dollar_act_cols = [
-                    "Roth Conversion", "RMD", "Traditional Withdrawal",
-                    "Taxable Withdrawal", "Roth Withdrawal", "Bank Withdrawal",
-                    "Total Tax", "After-Tax Income",
-                ]
-                act_fmt = {c: "${:,.0f}" for c in dollar_act_cols if c in actions_df.columns}
+                non_dollar = {"Age", "Eff. Tax Rate"}
+                act_fmt = {c: "${:,.0f}" for c in actions_df.columns if c not in non_dollar}
                 act_fmt["Eff. Tax Rate"] = "{:.1%}"
+
+                _acct_cols    = {a["name"] for a in accounts_at_retirement}
+                _expense_cols = {"Taxes", "Healthcare"}
+                _income_cols  = {"SS & Passive Income"}
+                _draw_cols    = {"Portfolio Draw"}
+                _spend_cols   = {"Total Spend"}
+
+                def _actions_style(df: pd.DataFrame) -> pd.DataFrame:
+                    out = pd.DataFrame("", index=df.index, columns=df.columns)
+                    for col in df.columns:
+                        if col in _acct_cols or col in _draw_cols:
+                            bold = "; font-weight: 600" if col in _draw_cols else ""
+                            out[col] = df[col].apply(lambda v:
+                                f"background-color: #ffd6d6; color: #b30000{bold}"
+                                if isinstance(v, (int, float)) and v < -0.5
+                                else f"background-color: #d6f0d6; color: #1a6b1a{bold}"
+                                if isinstance(v, (int, float)) and v > 0.5
+                                else ""
+                            )
+                        elif col in _expense_cols:
+                            out[col] = df[col].apply(lambda v:
+                                "background-color: #fff0cc; color: #7a5c00"
+                                if isinstance(v, (int, float)) and v < -0.5
+                                else ""
+                            )
+                        elif col in _income_cols:
+                            out[col] = df[col].apply(lambda v:
+                                "background-color: #d6eaf8; color: #1a4f7a"
+                                if isinstance(v, (int, float)) and v > 0.5
+                                else ""
+                            )
+                        elif col in _spend_cols:
+                            out[col] = df[col].apply(lambda v:
+                                "background-color: #b7e4b7; color: #0d5c0d; font-weight: 700"
+                                if isinstance(v, (int, float)) and v > 0.5
+                                else ""
+                            )
+                    return out
+
                 st.dataframe(
-                    actions_df.style.format(act_fmt, na_rep="—"),
+                    actions_df.style.format(act_fmt, na_rep="—").apply(_actions_style, axis=None),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -1559,12 +1636,12 @@ def main():
                 "Current Basis ($)": _a.get("basis", 0.0),
                 "Return Rate (%)": round(_a.get("return_rate", 0.07) * 100, 4),
                 "Use Global Rate": bool(_a.get("use_global_return_rate", True)),
-                "Qual. Div Yield (%)": round(_a.get("qualified_dividend_yield", 0.0) * 100, 4),
-                "Ord. Income Yield (%)": round(_a.get("ordinary_income_yield", 0.0) * 100, 4),
+                "Qual. Div Yield (%)": round(_a.get("qualified_dividend_yield", 0.0) * 100, 4) if _a["type"] in {"taxable", "reit"} else 0.0,
+                "Ord. Income Yield (%)": round(_a.get("ordinary_income_yield", 0.0) * 100, 4) if _a["type"] in {"taxable", "reit"} else 0.0,
                 "Total Return (%)": round(
                     (_a.get("return_rate", 0.07)
-                     + _a.get("qualified_dividend_yield", 0.0)
-                     + _a.get("ordinary_income_yield", 0.0)) * 100, 4
+                     + (_a.get("qualified_dividend_yield", 0.0) if _a["type"] in {"taxable", "reit"} else 0.0)
+                     + (_a.get("ordinary_income_yield", 0.0) if _a["type"] in {"taxable", "reit"} else 0.0)) * 100, 4
                 ),
             })
         _acct_df = pd.DataFrame(_acct_rows)
@@ -1621,9 +1698,15 @@ def main():
                     _a["return_rate"] = _dec(float(_row["Return Rate (%)"]))
                     _new_global = bool(_row["Use Global Rate"])
                     _a["use_global_return_rate"] = _new_global
-                    st.session_state[f"chk_global_{_a['id']}"] = _new_global
-                    _a["qualified_dividend_yield"] = _dec(float(_row["Qual. Div Yield (%)"]))
-                    _a["ordinary_income_yield"] = _dec(float(_row["Ord. Income Yield (%)"]))
+                    _ck = f"chk_global_{_a['id']}"
+                    if _ck in st.session_state:
+                        del st.session_state[_ck]
+                    if _a["type"] in {"taxable", "reit"}:
+                        _a["qualified_dividend_yield"] = _dec(float(_row["Qual. Div Yield (%)"]))
+                        _a["ordinary_income_yield"] = _dec(float(_row["Ord. Income Yield (%)"]))
+                    else:
+                        _a["qualified_dividend_yield"] = 0.0
+                        _a["ordinary_income_yield"] = 0.0
                 # Clear editor state so the table reinitialises from the updated accounts
                 if "acct_table_editor" in st.session_state:
                     del st.session_state["acct_table_editor"]
@@ -1639,9 +1722,15 @@ def main():
                     _a["return_rate"] = _dec(float(_row["Return Rate (%)"]))
                     _new_global = bool(_row["Use Global Rate"])
                     _a["use_global_return_rate"] = _new_global
-                    st.session_state[f"chk_global_{_a['id']}"] = _new_global
-                    _a["qualified_dividend_yield"] = _dec(float(_row["Qual. Div Yield (%)"]))
-                    _a["ordinary_income_yield"] = _dec(float(_row["Ord. Income Yield (%)"]))
+                    _ck = f"chk_global_{_a['id']}"
+                    if _ck in st.session_state:
+                        del st.session_state[_ck]
+                    if _a["type"] in {"taxable", "reit"}:
+                        _a["qualified_dividend_yield"] = _dec(float(_row["Qual. Div Yield (%)"]))
+                        _a["ordinary_income_yield"] = _dec(float(_row["Ord. Income Yield (%)"]))
+                    else:
+                        _a["qualified_dividend_yield"] = 0.0
+                        _a["ordinary_income_yield"] = 0.0
                 _sc_name = st.session_state.get("sc_name", "My Scenario")
                 try:
                     save_scenario(

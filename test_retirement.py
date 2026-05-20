@@ -4,12 +4,7 @@ Comprehensive test suite for the retirement planning simulator.
 Run with:  python -m pytest test_retirement.py -v
 """
 
-import copy
 import json
-import os
-import sys
-import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -577,7 +572,6 @@ class TestSimulateRetirement:
         assert isinstance(summary, dict)
 
     def test_row_count_matches_lifespan(self):
-        p = _base_profile(retirement_age=65, life_expectancy=85)
         df, _ = self._run(profile_kw={"retirement_age": 65, "life_expectancy": 85})
         assert len(df) == 85 - 65 + 1
 
@@ -1192,7 +1186,7 @@ class TestScenarios:
             load_scenario("nonexistent")
 
     def test_save_sanitizes_filename(self):
-        from scenarios import save_scenario, load_scenario
+        from scenarios import save_scenario
         # Special chars in name should be sanitized to underscores
         d = self._scenario_data("My/Scenario<Test>")
         save_scenario(d["name"], d["profile"], d["assumptions"], d["accounts"])
@@ -1441,9 +1435,8 @@ class TestSpecGaps:
         a = _base_assumptions(spending_mode="fixed", annual_spending_target=30_000)
         df, _ = simulate_retirement([roth, last_taxable], p, a)
         # While Roth has balance, taxable_withdrawal should be zero
-        early = df[df["age"] < 70].copy()
         # Roth covers all spending until exhausted — "last" taxable untouched meanwhile
-        roth_col = f"bal_Roth"
+        roth_col = "bal_Roth"
         assert roth_col in df.columns
         # In the first year the Roth covers it entirely; last taxable not touched
         assert df.iloc[0]["taxable_withdrawal"] == 0.0
@@ -1825,7 +1818,6 @@ class TestSpecGaps:
         # In later years, nominal income grows; check ss taxability increases
         # (or at minimum is non-zero in some year when income crosses threshold)
         # The ordinary_income column includes ss_taxable — verify it's non-zero eventually
-        taxable_ss_present = (df["ordinary_income"] > df["ss_income"]).any()
         # ordinary_income > ss_income implies something (RMD or ss_taxable) was added
         assert df["ss_income"].sum() > 0  # SS is being received
 

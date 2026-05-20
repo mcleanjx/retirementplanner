@@ -1,6 +1,5 @@
 import copy
 import numpy as np
-import pandas as pd
 from constants import RMD_TABLE, RMD_START_AGE
 
 TRADITIONAL_TYPES = {"traditional_401k", "traditional_ira"}
