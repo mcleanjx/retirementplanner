@@ -337,14 +337,17 @@ Add a configurable state tax rate (simple flat percentage applied to ordinary in
 **Chart 3: Retirement Drawdown**
 - Type: Stacked area chart — per-account balances, color-shaded within each tax bucket
 - Overlay: Dashed line showing total portfolio in **today's purchasing power** (deflated by `(1+inflation)^(age-current_age)`)
+- Orange vertical line at `current_age` when user is already retired (`current_age > retirement_age`)
 
 **Chart 4: Annual Retirement Income**
 - Type: Stacked bar chart (positive: income sources; negative: taxes)
 - Overlay: After-tax spending line (nominal), plus dash-dot line showing spending in **retirement-year real dollars** (flat line = real spending preserved)
+- Orange vertical line at `current_age` when user is already retired
 
 **Chart 5: Tax Burden Over Time**
 - Type: Line chart with secondary Y-axis for effective tax rate %
 - Series: Federal ordinary, federal LTCG, NIIT, IRMAA, state tax
+- Orange vertical line at `current_age` when user is already retired
 
 **Chart 6: Retirement Spending Coverage**
 - Type: Stacked bar + line overlay (`barmode="relative"`)
@@ -410,6 +413,8 @@ Use a clean, professional design with:
    - Tab 5: Progress Tracking (baseline + check-ins)
    - Tab 6: Warnings & Notes
    - Tab 7: Monte Carlo Simulation
+   - Tab 8: Optimizer
+   - Tab 9: Accounts (spreadsheet editor)
 
 ### Interaction
 
@@ -471,11 +476,15 @@ retirement_planner/
 ├── projections.py          # Accumulation phase calculations (all account types)
 ├── withdrawals.py          # Retirement phase calculations, withdrawal ordering, survivor logic
 ├── montecarlo.py           # Monte Carlo simulation engine (per-year/per-account randomized returns)
+├── montecarlo_v2.py        # CMA log-normal MC engine: correlated equity/bond, stochastic inflation
+├── optimizer.py            # Strategy optimizer: random search over withdrawal + Roth conversion configs
 ├── taxes.py                # Federal/state tax, LTCG, NIIT, IRMAA, SS taxability calculations
 ├── constants.py            # Tax brackets, LTCG thresholds, IRMAA tiers, RMD table, IRS limits
-├── charts.py               # Plotly chart builders (accumulation, retirement, MC fan chart)
-├── scenarios.py            # Save / load / delete / list scenario JSON files
+├── charts.py               # Plotly chart builders (accumulation, retirement, MC fan chart, progress)
+├── scenarios.py            # Save / load / delete / list scenario JSON files; .last_used tracking
+├── test_retirement.py      # End-to-end and unit tests, math audit invariants
 ├── scenarios/              # User scenario files (gitignored)
+├── tracking/               # Per-scenario baseline + check-in files (gitignored)
 └── requirements.txt        # streamlit, plotly, pandas, numpy
 ```
 
@@ -499,6 +508,8 @@ On startup, `_init_state()` automatically loads the **most recently modified** s
 Widget key naming convention for account checkboxes: use `chk_global_{account_id}` (not `a_*`) so the keys survive the `_apply_pending_load()` deletion sweep of `a_*` and `p_*` keys. Streamlit's widget binding survives `del st.session_state[key]`, so the prefix must stay outside the deletion range.
 
 **Scenario load — explicit widget key seeding:** Streamlit processes the browser's widget payload before the script runs. Even after `_apply_pending_load()` deletes `p_age`, `p_ret`, etc., browser-restored values can survive and override the loaded data when the widgets render. Fix: after the deletion loop, explicitly set every integer-typed profile widget key (`p_age`, `p_ret`, `p_le`, `p_income`, `p_ss`, `p_ss_age`, `p_sp_age`, `p_sp_ss`, `p_sp_ss_age`, `p_hc_pre`, `p_hc_post`) to the values from the loaded profile. Float and select keys (`p_fs`, `p_state`, `p_state_rate`, `p_surv`) still rely on key deletion + the widget's `value=` parameter because they require unit conversions (decimal ↔ percentage) that the generic seeding loop cannot do uniformly.
+
+**Last-used scenario persistence:** `scenarios/.last_used` (a plain text file) stores the name of the most recently saved/loaded scenario. `latest_scenario()` reads this file first; falls back to mtime sort. `set_last_used_scenario(name)` is called from the save handler, load handler, and check-in update flow. The `.last_used` file is gitignored along with all other scenario data.
 
 ### State Structure
 
@@ -604,10 +615,10 @@ Persist the full app state (accounts, profile, assumptions, roth_conversion) to 
 ```
 
 **Implementation notes:**
-- Create the `scenarios/` directory on first save if it doesn't exist
+- Create the `scenarios/` and `tracking/` directories automatically (with `parents=True`) on first save
 - Validate the JSON structure on load and show a clear error if the file is malformed or from an incompatible version
-- Add `scenarios/` to `.gitignore` so personal data isn't accidentally committed
-- `scenarios.py` provides: `list_scenarios()`, `latest_scenario()` (most recently modified by mtime), `save_scenario()`, `load_scenario()`, `delete_scenario()`
+- Add `scenarios/` and `tracking/` to `.gitignore` so personal data isn't accidentally committed
+- `scenarios.py` provides: `list_scenarios()`, `latest_scenario()` (reads `scenarios/.last_used`; falls back to mtime), `save_scenario()`, `load_scenario()`, `delete_scenario()`, `set_last_used_scenario()`, `load_tracking()`, `save_tracking()`
 
 ### 8. Roth Conversion Modeling
 
@@ -647,19 +658,32 @@ Allow users to plan and simulate Roth conversions — moving money from Traditio
 
 Runs N independent trials (default 1,000) with randomized annual returns to model sequence-of-returns risk and show the probability that the portfolio survives to life expectancy.
 
-**Core design:**
-- Each trial independently draws per-year, per-account returns from a normal distribution
+The Monte Carlo tab exposes a **Return model** radio button to switch between two engines:
+
+**Standard (Normal)** — `montecarlo.py` (v1):
+- Independent normal draws per account per year, single equity volatility parameter
+- Bond volatility = 30% of equity volatility
+
+**CMA Log-Normal (Advanced)** — `montecarlo_v2.py` (v2):
+- Log-normal returns with correlated equity/bond factors (Cholesky decomposition)
+- Separate equity vol and bond vol sliders; equity-bond correlation slider
+- Stochastic inflation: `N(inflation_rate, 1.5%)` per year — spending inflates by drawn inflation each year
+- Component expected returns calibrated with 3pp equity risk premium so portfolio mean = `retirement_return_rate`
+- See **Section 15** for full v2 specification
+
+**Core design (both engines):**
+- Each trial independently draws per-year, per-account returns
 - Spending, Social Security (with COLA), healthcare, and survivor transition all follow the same logic as the deterministic simulation
 - Results are cached in `st.session_state["mc_result"]` and only recomputed when the user clicks "Run Monte Carlo" — so adjusting other inputs does not re-trigger the expensive computation
 - A staleness hint is shown if any MC parameter changes after the last run
 
-**User Inputs (Monte Carlo tab):**
+**User Inputs (Monte Carlo tab — Standard/v1):**
 - **Equity Volatility** (slider, 1–30%, default 12%): standard deviation of annual equity returns. US equities: ~15–17%; balanced 60/40: ~10–12%; conservative: ~6–8%.
 - **Stock Allocation** (slider, 0–100%, default 60%): fraction of each investment account (401k, IRA, Roth, taxable) modeled as equities. The remainder is bonds. Controls path volatility only — does **not** change the expected return.
 - **Trials** (number input, 100–5,000, default 1,000)
 - **Include market crash events** (checkbox, default off): schedules random −20% equity shocks every 10–20 years in each trial.
 
-**Return model per account per year:**
+**Return model per account per year (Standard/v1):**
 
 For investment accounts (all except bank and rental property):
 ```
@@ -692,6 +716,124 @@ For rental property: `N(own_rate, equity_vol × 0.40)` — lower vol than equiti
 
 The MC uses a simplified withdrawal order (bank → taxable → traditional → Roth) without the full tax optimization of the main simulation. This keeps trial time manageable while still capturing sequence-of-returns risk, which is the primary purpose of the MC analysis.
 
+### 10. Strategy Optimizer
+
+Search over retirement strategy configurations to maximize after-tax lifetime wealth using random search (Monte Carlo optimization over strategy space, not return space).
+
+**Location:** `optimizer.py` — does NOT modify session state or scenario files. Called from the `🔍 Optimizer` tab in `app.py`.
+
+**User Inputs (Optimizer tab):**
+- **Number of strategy trials** (default 200): how many random configurations to evaluate
+- **Legacy weight** (slider, 0–50%, default 10%): weight applied to final portfolio value in the score function — higher values bias the optimizer toward leaving more for heirs
+- A **Run Optimizer** button; results are cached in `session_state["opt_result"]`
+
+**Search space per trial:**
+- Withdrawal strategy: `tax_efficient` or `roth_preservation`
+- Roth conversion: enabled/disabled; if enabled, randomly samples bracket target (10%, 12%, 22%, 24%), fixed vs. fill-to-bracket, start/end age, source and destination accounts
+- 401(k) accounts require separation from service — min conversion start age = owner's retirement age
+- Traditional IRAs: no age restriction on conversions beyond retirement age
+
+**Score function:**
+```
+score = lifetime_after_tax_spending − 0.30 × lifetime_taxes + legacy_weight × final_portfolio
+```
+
+**Output (Optimizer tab):**
+- **Comparison table**: baseline vs. best-found: lifetime after-tax spend, total taxes, final portfolio, total Roth conversions, depletion age, number of trials
+- **Recommended strategy settings**: human-readable table of the best-found strategy (withdrawal mode, Roth conversion parameters)
+- **Recommended actions by year**: color-coded table — 🔴 red = sell/withdraw/convert out of account; 🟢 green = Roth conversion receipt; 🟡 amber = taxes/healthcare expenses; 🔵 blue = passive income offsetting portfolio draw; bold 💚 green = Total Spend (after-tax, checks as: |Portfolio Draw| + SS & Passive − |Taxes| − |Healthcare| = Total Spend)
+- **Optimized account balances by year**
+- **Full year-by-year detail** (same columns as Data Tables tab)
+- **Score distribution histogram**: all trial scores as histogram, with baseline (orange dashed) and best-found (green dashed) vertical lines
+
+### 11. Already-Retired Mode
+
+The app supports users who are already retired (current age ≥ retirement age).
+
+- `current_age` and `retirement_age` inputs accept any value from 18 to 100
+- When `current_age >= retirement_age`, the accumulation phase is empty (no growth projection needed) and the retirement simulation starts immediately from the current balances
+- `project_accumulation` returns an empty DataFrame in this case — all downstream code must guard against an empty accumulation DataFrame
+- All retirement-phase charts render an **orange vertical line** at `current_age` whenever `current_age > retirement_age`, marking "where we are now" in the drawdown
+- The accumulation charts section is hidden / empty when there is no accumulation phase
+
+### 12. Summary Snapshot Toggle
+
+The Summary header has a **Snapshot toggle** (top-right of the Summary section). When off (default), the full 5+5 metric card layout is shown. When on, a compact 3-column view displays:
+
+| Today (Age X) | Retirement Day 1 (Age R) | End of Life (Age LE) |
+|---|---|---|
+| Portfolio | Portfolio | Portfolio |
+| Annual Spend | Annual Spend | Annual Spend |
+
+- "Today" portfolio = sum of all current account balances
+- "Today" annual spend = spending target + applicable healthcare, in today's dollars
+- "Retirement Day 1" = year-1 actual after-tax spending from the simulation
+- "End of Life" = after-tax spending at life expectancy age
+- If the End of Life portfolio is $0 or less, it renders a red warning box ("$0 — Depleted") instead of a metric
+
+### 13. Progress Tracking — Check-in Balance Update
+
+The Progress tab check-in flow was enhanced. After entering actual balances for each account, the user can optionally check **"Update account balances and current age in scenario"**:
+
+- When checked, a second optional section appears allowing the user to also enter new cost basis values for taxable/REIT/rental accounts
+- On save, each account's balance (and optionally basis) is updated in `session_state.accounts`, and `profile["current_age"]` is set to the check-in age
+- The scenario is immediately persisted to disk and `set_last_used_scenario()` is called
+- A warning is shown before confirming: "Saving will update balances and set your current age in the profile to X. This changes your scenario's starting point for future projections."
+- The "Save Check-in" button is disabled if the total is 0 (prevents accidental save of empty check-in)
+
+**Tracking file storage:** `tracking/<scenario_name>.json` — gitignored. `scenarios.py` provides `load_tracking(name)` and `save_tracking(name, data)`.
+
+### 14. Last-Used Scenario Persistence
+
+Scenario auto-load was switched from unreliable mtime comparison to an explicit `.last_used` file.
+
+- `scenarios.py` exports `set_last_used_scenario(name)` which writes the scenario name to `scenarios/.last_used`
+- `latest_scenario()` reads `.last_used` (falls back to mtime sort if the file is absent or the named scenario no longer exists)
+- `set_last_used_scenario()` is called from the save handler, the load handler, and the check-in update flow
+
+### 15. Monte Carlo v2 — CMA Log-Normal Engine (`montecarlo_v2.py`)
+
+An advanced MC engine alongside the standard normal engine (v1). The Monte Carlo tab exposes a **Return model** radio button:
+- **Standard (Normal)**: original engine — independent normal draws, single equity volatility slider
+- **CMA Log-Normal (Advanced)**: uses `montecarlo_v2.py`
+
+**CMA Log-Normal inputs (replaces single equity volatility slider):**
+- **Equity Volatility (%)** (default 16%): std dev of log equity returns; CMA consensus US large-cap ~15–16%
+- **Bond Volatility (%)** (default 6%): std dev of log bond returns; CMA consensus US Agg ~5–6%
+- **Equity-Bond Correlation (%)** (default 10%): long-run correlation; CMA consensus ~0–15%
+
+**Return model:**
+- Equity and bond returns are drawn as correlated log-normal variates (Cholesky decomposition)
+- Each non-bank, non-rental account is split: `stock_pct` equity + `(1 − stock_pct)` bonds
+- Expected portfolio return is preserved at the global `retirement_return_rate` by calibrating component means using a 3pp equity risk premium spread
+- Inflation draws are stochastic: `N(inflation_rate, 1.5%)` per year — spending target inflates by drawn inflation
+
+**Guyton-Klinger Guardrails** (v2 only — `mc_withdrawal_mode` radio):
+- **Constant Real** (default): spending grows by drawn inflation each year
+- **Guyton-Klinger Guardrails**: when the portfolio withdrawal rate rises above 120% of its initial level (Capital Preservation Rule), cut spending 10%; when it falls below 80% (Prosperity Rule), raise spending 10%. Substantially improves success rates.
+
+**Score display caption** (shown below sliders): expected return, component means, effective portfolio volatility, inflation std dev, geometric mean approximation.
+
+### 16. Accounts Tab (`🏦 Accounts`)
+
+Tab 9 provides a spreadsheet-style editor for bulk-updating account parameters without navigating the sidebar expanders.
+
+**Editable columns:**
+- Current Value ($) — `balance`
+- Current Basis ($) — `basis`
+- Return Rate (%) — capital appreciation only, does NOT include dividend yields
+- Use Global Rate — checkbox; uses global `retirement_return_rate` during withdrawal phase
+- Qual. Div Yield (%) — taxable / REIT accounts only
+- Ord. Income Yield (%) — taxable / REIT accounts only
+
+**Read-only columns:**
+- Name, Type (derived from account type)
+- Total Return (%) — calculated: Return Rate + Qual. Div Yield + Ord. Income Yield; tooltip explains this is the full expected annual return
+
+**Buttons:**
+- **Apply Changes**: writes edited values back to `session_state.accounts` and triggers a rerun to update projections — does not write to disk
+- **Save to Scenario**: persists the edits to the current scenario file on disk
+
 ## Stretch Goals (Optional Enhancements)
 
 If time permits, consider adding:
@@ -700,9 +842,9 @@ If time permits, consider adding:
 2. ~~**Sequence of Returns Risk**: Monte Carlo simulation instead of fixed returns~~ *(promoted to core feature — see Section 9)*
 3. ~~**Contribution Limits**: Enforce IRS limits with warnings~~ *(implemented in Warnings tab)*
 4. ~~**Export/Import**: Save scenarios to JSON, load later~~ *(promoted to core feature — see Section 7)*
-5. **Comparison Mode**: Show two scenarios side-by-side
-6. **Print/PDF Report**: Generate a summary report
-7. **Monte Carlo with inflation uncertainty**: Add a second volatility parameter for inflation draws
+5. ~~**Monte Carlo with inflation uncertainty**: Add a second volatility parameter for inflation draws~~ *(implemented in CMA Log-Normal engine — see Section 15)*
+6. **Comparison Mode**: Show two scenarios side-by-side
+7. **Print/PDF Report**: Generate a summary report
 8. **QCDs**: Qualified Charitable Distributions from Traditional accounts (reduces RMD, not taxable)
 9. **Part-time income**: Model phased retirement with declining earned income
 10. **State tax diversity**: Support additional states beyond California + flat-rate

@@ -311,10 +311,14 @@ def sidebar_profile():
         st.markdown("**Healthcare**")
         p["pre_medicare_healthcare"] = st.number_input("Pre-Medicare Annual Cost ($)", 0, 50000, int(p.get("pre_medicare_healthcare", 15000)), 500, key="p_hc_pre")
         p["post_medicare_healthcare"] = st.number_input("Post-Medicare Annual Cost ($)", 0, 50000, int(p.get("post_medicare_healthcare", 12000)), 500, key="p_hc_post")
-        st.caption(
-            "Post-Medicare: include **Part B** (~$2,435/yr/person), Part D, supplemental (Medigap), dental/vision, and out-of-pocket. "
+        st.markdown(
+            "<div style='font-size:0.8rem;color:#888;overflow-wrap:break-word;word-break:break-word;'>"
+            "Post-Medicare: include <b>Part B</b> (~$2,435/yr/person), Part D, supplemental (Medigap), "
+            "dental/vision, and out-of-pocket. "
             "IRMAA surcharges are computed separately from income and added on top. "
             "A healthy couple with Medigap: ~$15,000–$20,000/yr."
+            "</div>",
+            unsafe_allow_html=True,
         )
 
 
@@ -406,6 +410,15 @@ def sidebar_accounts():
                     a["return_rate"] = _dec(st.number_input("Return / Appreciation Rate (%)", 0.0, 20.0, _pct(a["return_rate"]), 0.1, key=f"a_ret_{a['id']}"))
                 else:
                     a["return_rate"] = _dec(st.number_input("Return Rate — accumulation (%)", 0.0, 20.0, _pct(a["return_rate"]), 0.1, key=f"a_ret_{a['id']}"))
+                    if a["type"] in {"taxable", "reit"}:
+                        _qdy = _pct(a.get("qualified_dividend_yield", 0.0))
+                        _oiy = _pct(a.get("ordinary_income_yield", 0.0))
+                        _total_ret = _pct(a["return_rate"]) + _qdy + _oiy
+                        st.caption(
+                            f"Price appreciation only. "
+                            f"Total return = this rate + qualified dividend yield + ordinary income yield "
+                            f"({_pct(a['return_rate']):.2f}% + {_qdy:.2f}% + {_oiy:.2f}% = **{_total_ret:.2f}%** total)."
+                        )
                     use_global = st.checkbox(
                         "Use global retirement return rate",
                         value=a.get("use_global_return_rate", True),
@@ -519,74 +532,79 @@ def sidebar_roth_conversion():
 # Sidebar — Scenario save/load
 # ---------------------------------------------------------------------------
 
+def _do_save(name: str) -> None:
+    """Sync all widget state and persist the current scenario to disk."""
+    # sidebar_roth_conversion() always runs before this handler and
+    # writes widget return values directly into st.session_state.roth_conversion
+    # via "rc[field] = widget()" assignments — that dict is authoritative.
+    # We only need to fix up the two fields that require index→ID translation
+    # (rc_dst stores a list index, not an account ID) and the checkbox-derived
+    # source list (those keys are individually keyed per account).
+    rc = st.session_state.roth_conversion
+    _trad = [a for a in st.session_state.accounts
+             if a["type"] in {"traditional_401k", "traditional_ira"}]
+    if any(f"rc_src_{a['id']}" in st.session_state for a in _trad):
+        rc["source_account_ids"] = [
+            a["id"] for a in _trad
+            if st.session_state.get(f"rc_src_{a['id']}", False)
+        ]
+    _roth = [a for a in st.session_state.accounts
+             if a["type"] in {"roth_401k", "roth_ira"}]
+    if "rc_dst" in st.session_state and _roth:
+        idx = st.session_state["rc_dst"]
+        if 0 <= idx < len(_roth):
+            rc["destination_account_id"] = _roth[idx]["id"]
+    # Sync all account widget values explicitly — widgets inside
+    # collapsed expanders may not have run, so the dict could be stale.
+    for a in st.session_state.accounts:
+        aid = a["id"]
+        s = st.session_state
+        if f"a_name_{aid}" in s:
+            a["name"] = s[f"a_name_{aid}"]
+        if f"a_type_{aid}" in s:
+            a["type"] = ACCOUNT_TYPES.get(s[f"a_type_{aid}"], a["type"])
+        if f"a_bal_{aid}" in s:
+            a["balance"] = float(s[f"a_bal_{aid}"])
+        if f"a_ret_{aid}" in s:
+            a["return_rate"] = _dec(s[f"a_ret_{aid}"])
+        if f"chk_global_{aid}" in s:
+            a["use_global_return_rate"] = bool(s[f"chk_global_{aid}"])
+        if f"a_contrib_{aid}" in s:
+            a["annual_contribution"] = float(s[f"a_contrib_{aid}"])
+        if f"a_cgr_{aid}" in s:
+            a["contribution_growth_rate"] = _dec(s[f"a_cgr_{aid}"])
+        if f"a_emp_{aid}" in s:
+            a["employer_match_percent"] = _dec(s[f"a_emp_{aid}"])
+        if f"a_empl_{aid}" in s:
+            a["employer_match_limit"] = float(s[f"a_empl_{aid}"])
+        if f"a_basis_{aid}" in s:
+            a["basis"] = float(s[f"a_basis_{aid}"])
+        if f"a_qdy_{aid}" in s:
+            a["qualified_dividend_yield"] = _dec(s[f"a_qdy_{aid}"])
+        if f"a_oiy_{aid}" in s:
+            a["ordinary_income_yield"] = _dec(s[f"a_oiy_{aid}"])
+        if f"a_rent_{aid}" in s:
+            a["net_annual_rental_income"] = float(s[f"a_rent_{aid}"])
+        if f"a_wlast_{aid}" in s:
+            a["withdraw_priority"] = "last" if s[f"a_wlast_{aid}"] else "normal"
+        if f"a_owner_{aid}" in s:
+            a["owner"] = s[f"a_owner_{aid}"]
+    save_scenario(
+        name,
+        st.session_state.profile,
+        st.session_state.assumptions,
+        st.session_state.accounts,
+        st.session_state.roth_conversion,
+    )
+    set_last_used_scenario(name)
+
+
 def sidebar_scenarios():
     with st.sidebar.expander("💾 Scenarios", expanded=False):
         name = st.text_input("Scenario Name", "My Scenario", key="sc_name")
         if st.button("Save", key="sc_save"):
             try:
-                # sidebar_roth_conversion() always runs before this handler and
-                # writes widget return values directly into st.session_state.roth_conversion
-                # via "rc[field] = widget()" assignments — that dict is authoritative.
-                # We only need to fix up the two fields that require index→ID translation
-                # (rc_dst stores a list index, not an account ID) and the checkbox-derived
-                # source list (those keys are individually keyed per account).
-                rc = st.session_state.roth_conversion
-                _trad = [a for a in st.session_state.accounts
-                         if a["type"] in {"traditional_401k", "traditional_ira"}]
-                if any(f"rc_src_{a['id']}" in st.session_state for a in _trad):
-                    rc["source_account_ids"] = [
-                        a["id"] for a in _trad
-                        if st.session_state.get(f"rc_src_{a['id']}", False)
-                    ]
-                _roth = [a for a in st.session_state.accounts
-                         if a["type"] in {"roth_401k", "roth_ira"}]
-                if "rc_dst" in st.session_state and _roth:
-                    idx = st.session_state["rc_dst"]
-                    if 0 <= idx < len(_roth):
-                        rc["destination_account_id"] = _roth[idx]["id"]
-                # Sync all account widget values explicitly — widgets inside
-                # collapsed expanders may not have run, so the dict could be stale.
-                for a in st.session_state.accounts:
-                    aid = a["id"]
-                    s = st.session_state
-                    if f"a_name_{aid}" in s:
-                        a["name"] = s[f"a_name_{aid}"]
-                    if f"a_type_{aid}" in s:
-                        a["type"] = ACCOUNT_TYPES.get(s[f"a_type_{aid}"], a["type"])
-                    if f"a_bal_{aid}" in s:
-                        a["balance"] = float(s[f"a_bal_{aid}"])
-                    if f"a_ret_{aid}" in s:
-                        a["return_rate"] = _dec(s[f"a_ret_{aid}"])
-                    if f"chk_global_{aid}" in s:
-                        a["use_global_return_rate"] = bool(s[f"chk_global_{aid}"])
-                    if f"a_contrib_{aid}" in s:
-                        a["annual_contribution"] = float(s[f"a_contrib_{aid}"])
-                    if f"a_cgr_{aid}" in s:
-                        a["contribution_growth_rate"] = _dec(s[f"a_cgr_{aid}"])
-                    if f"a_emp_{aid}" in s:
-                        a["employer_match_percent"] = _dec(s[f"a_emp_{aid}"])
-                    if f"a_empl_{aid}" in s:
-                        a["employer_match_limit"] = float(s[f"a_empl_{aid}"])
-                    if f"a_basis_{aid}" in s:
-                        a["basis"] = float(s[f"a_basis_{aid}"])
-                    if f"a_qdy_{aid}" in s:
-                        a["qualified_dividend_yield"] = _dec(s[f"a_qdy_{aid}"])
-                    if f"a_oiy_{aid}" in s:
-                        a["ordinary_income_yield"] = _dec(s[f"a_oiy_{aid}"])
-                    if f"a_rent_{aid}" in s:
-                        a["net_annual_rental_income"] = float(s[f"a_rent_{aid}"])
-                    if f"a_wlast_{aid}" in s:
-                        a["withdraw_priority"] = "last" if s[f"a_wlast_{aid}"] else "normal"
-                    if f"a_owner_{aid}" in s:
-                        a["owner"] = s[f"a_owner_{aid}"]
-                save_scenario(
-                    name,
-                    st.session_state.profile,
-                    st.session_state.assumptions,
-                    st.session_state.accounts,
-                    st.session_state.roth_conversion,
-                )
-                set_last_used_scenario(name)
+                _do_save(name)
                 st.success(f"Saved '{name}'")
             except Exception as e:
                 st.error(str(e))
@@ -647,6 +665,19 @@ def main():
     )
 
     # Sidebar
+    sc_display = st.session_state.get("sc_name", "My Scenario")
+    _sb_name_col, _sb_save_col = st.sidebar.columns([3, 1])
+    _sb_name_col.markdown(
+        f"<div style='font-size:0.78rem;color:#888;margin-bottom:0.1rem;'>Scenario</div>"
+        f"<div style='font-size:1rem;font-weight:600;margin-bottom:0.75rem;'>{sc_display}</div>",
+        unsafe_allow_html=True,
+    )
+    if _sb_save_col.button("💾 Save", key="sc_quicksave", help=f"Save '{sc_display}'", use_container_width=True):
+        try:
+            _do_save(sc_display)
+            st.sidebar.success("Saved ✓", icon="💾")
+        except Exception as e:
+            st.sidebar.error(str(e))
     sidebar_profile()
     sidebar_assumptions()
     sidebar_accounts()
@@ -878,9 +909,9 @@ def main():
             if col == "Age":
                 continue
             elif col == "Override (0 = use default)":
-                col_config[col] = st.column_config.NumberColumn(min_value=0, format="$%.0f")
+                col_config[col] = st.column_config.NumberColumn(min_value=0, format="$%,.0f")
             else:
-                col_config[col] = st.column_config.NumberColumn(disabled=True, format="$%.0f")
+                col_config[col] = st.column_config.NumberColumn(disabled=True, format="$%,.0f")
 
         edited = st.data_editor(
             editor_df,
@@ -1442,6 +1473,30 @@ def main():
             m3.metric("10th Percentile at Life Expectancy", f"${mc_result['percentiles'][10][-1]:,.0f}")
             m4.metric("Trials Depleted", f"{mc_result['n_depleted']:,} / {mc_result['n_runs']:,}")
 
+            with st.expander("📖 What makes a good result?", expanded=False):
+                st.caption(
+                    "Guidance based on financial planning research (Bengen 1994, Pfau, Kitces). "
+                    "Success rate = % of simulated market sequences where the portfolio lasted to life expectancy."
+                )
+                bench_df = pd.DataFrame({
+                    "Success Rate": ["≥ 95%", "90 – 95%", "80 – 90%", "70 – 80%", "< 70%"],
+                    "Rating":       ["Very Safe", "Strong ✓", "Moderate", "Caution ⚠️", "High Risk ❌"],
+                    "Shortfall Odds": ["1 in 20+", "~1 in 10–20", "~1 in 5–10", "~1 in 4–5", "> 1 in 3"],
+                    "What to do": [
+                        "May be over-funded — consider spending more or retiring earlier",
+                        "Standard CFP planning target — solid safety margin",
+                        "Acceptable if you can flex spending 10–15% in a bad sequence",
+                        "Build a contingency: part-time work, cut discretionary spend",
+                        "Plan needs revision — save more, spend less, or retire later",
+                    ],
+                })
+                st.dataframe(bench_df, use_container_width=True, hide_index=True)
+                st.caption(
+                    "**10th percentile portfolio at life expectancy**: if this is above $0, your plan "
+                    "survives even unlucky market sequences. A 90%+ success rate *and* a positive 10th "
+                    "percentile together indicate a robust plan."
+                )
+
             st.plotly_chart(
                 _charts.chart_monte_carlo(mc_result, det_portfolio),
                 use_container_width=True,
@@ -1594,18 +1649,6 @@ def main():
             }
             st.dataframe(pd.DataFrame(comparison_data), use_container_width=True, hide_index=True)
 
-            # --- Recommended strategy settings ---
-            st.divider()
-            st.subheader("Recommended Strategy Settings")
-            st.caption("Apply these settings in the sidebar to activate the optimized strategy.")
-            best_rc = best["roth_conversion"]
-            best_ws = best["withdrawal_strategy"]
-            desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement)
-            desc_df = pd.DataFrame(
-                [{"Setting": k, "Recommended Value": v} for k, v in desc.items()]
-            )
-            st.dataframe(desc_df, use_container_width=True, hide_index=True)
-
             # --- Year-by-year actions ---
             st.divider()
             st.subheader("Recommended Actions by Year")
@@ -1617,6 +1660,8 @@ def main():
                 "💚 **Bold green** — **Total Spend**: what you actually have to live on after all costs. "
                 "Check: |Portfolio Draw| + SS & Passive Income − |Taxes| − |Healthcare| = Total Spend."
             )
+            best_rc = best["roth_conversion"]
+            best_ws = best["withdrawal_strategy"]
             actions_df = _opt.build_actions_table(best_df, best_rc, accounts_at_retirement)
             if not actions_df.empty:
                 non_dollar = {"Age", "Eff. Tax Rate"}
@@ -1666,6 +1711,16 @@ def main():
                     use_container_width=True,
                     hide_index=True,
                 )
+
+            # --- Recommended strategy settings ---
+            st.divider()
+            st.subheader("Recommended Strategy Settings")
+            st.caption("Apply these settings in the sidebar to activate the optimized strategy.")
+            desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement)
+            desc_df = pd.DataFrame(
+                [{"Setting": k, "Recommended Value": v} for k, v in desc.items()]
+            )
+            st.dataframe(desc_df, use_container_width=True, hide_index=True)
 
             # --- Account balances by year ---
             st.divider()
@@ -1771,9 +1826,9 @@ def main():
         _acct_col_cfg = {
             "Name": st.column_config.TextColumn(disabled=True),
             "Type": st.column_config.TextColumn(disabled=True),
-            "Current Value ($)": st.column_config.NumberColumn(min_value=0, format="$%.0f"),
+            "Current Value ($)": st.column_config.NumberColumn(min_value=0, format="$%,.0f"),
             "Current Basis ($)": st.column_config.NumberColumn(
-                min_value=0, format="$%.0f",
+                min_value=0, format="$%,.0f",
                 help="Cost basis (applies to taxable brokerage, REIT, and rental property accounts)",
             ),
             "Return Rate (%)": st.column_config.NumberColumn(
