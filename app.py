@@ -905,9 +905,9 @@ def main():
             if col == "Age":
                 continue
             elif col == "Override (0 = use default)":
-                col_config[col] = st.column_config.NumberColumn(min_value=0, format="$")
+                col_config[col] = st.column_config.NumberColumn(min_value=0, format="$%,.0f")
             else:
-                col_config[col] = st.column_config.NumberColumn(disabled=True, format="$")
+                col_config[col] = st.column_config.NumberColumn(disabled=True, format="$%,.0f")
 
         edited = st.data_editor(
             editor_df,
@@ -1822,9 +1822,9 @@ def main():
         _acct_col_cfg = {
             "Name": st.column_config.TextColumn(disabled=True),
             "Type": st.column_config.TextColumn(disabled=True),
-            "Current Value ($)": st.column_config.NumberColumn(min_value=0, format="$"),
+            "Current Value ($)": st.column_config.NumberColumn(min_value=0, format="$%,.0f"),
             "Current Basis ($)": st.column_config.NumberColumn(
-                min_value=0, format="$",
+                min_value=0, format="$%,.0f",
                 help="Cost basis (applies to taxable brokerage, REIT, and rental property accounts)",
             ),
             "Return Rate (%)": st.column_config.NumberColumn(
