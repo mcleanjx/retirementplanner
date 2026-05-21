@@ -528,74 +528,79 @@ def sidebar_roth_conversion():
 # Sidebar — Scenario save/load
 # ---------------------------------------------------------------------------
 
+def _do_save(name: str) -> None:
+    """Sync all widget state and persist the current scenario to disk."""
+    # sidebar_roth_conversion() always runs before this handler and
+    # writes widget return values directly into st.session_state.roth_conversion
+    # via "rc[field] = widget()" assignments — that dict is authoritative.
+    # We only need to fix up the two fields that require index→ID translation
+    # (rc_dst stores a list index, not an account ID) and the checkbox-derived
+    # source list (those keys are individually keyed per account).
+    rc = st.session_state.roth_conversion
+    _trad = [a for a in st.session_state.accounts
+             if a["type"] in {"traditional_401k", "traditional_ira"}]
+    if any(f"rc_src_{a['id']}" in st.session_state for a in _trad):
+        rc["source_account_ids"] = [
+            a["id"] for a in _trad
+            if st.session_state.get(f"rc_src_{a['id']}", False)
+        ]
+    _roth = [a for a in st.session_state.accounts
+             if a["type"] in {"roth_401k", "roth_ira"}]
+    if "rc_dst" in st.session_state and _roth:
+        idx = st.session_state["rc_dst"]
+        if 0 <= idx < len(_roth):
+            rc["destination_account_id"] = _roth[idx]["id"]
+    # Sync all account widget values explicitly — widgets inside
+    # collapsed expanders may not have run, so the dict could be stale.
+    for a in st.session_state.accounts:
+        aid = a["id"]
+        s = st.session_state
+        if f"a_name_{aid}" in s:
+            a["name"] = s[f"a_name_{aid}"]
+        if f"a_type_{aid}" in s:
+            a["type"] = ACCOUNT_TYPES.get(s[f"a_type_{aid}"], a["type"])
+        if f"a_bal_{aid}" in s:
+            a["balance"] = float(s[f"a_bal_{aid}"])
+        if f"a_ret_{aid}" in s:
+            a["return_rate"] = _dec(s[f"a_ret_{aid}"])
+        if f"chk_global_{aid}" in s:
+            a["use_global_return_rate"] = bool(s[f"chk_global_{aid}"])
+        if f"a_contrib_{aid}" in s:
+            a["annual_contribution"] = float(s[f"a_contrib_{aid}"])
+        if f"a_cgr_{aid}" in s:
+            a["contribution_growth_rate"] = _dec(s[f"a_cgr_{aid}"])
+        if f"a_emp_{aid}" in s:
+            a["employer_match_percent"] = _dec(s[f"a_emp_{aid}"])
+        if f"a_empl_{aid}" in s:
+            a["employer_match_limit"] = float(s[f"a_empl_{aid}"])
+        if f"a_basis_{aid}" in s:
+            a["basis"] = float(s[f"a_basis_{aid}"])
+        if f"a_qdy_{aid}" in s:
+            a["qualified_dividend_yield"] = _dec(s[f"a_qdy_{aid}"])
+        if f"a_oiy_{aid}" in s:
+            a["ordinary_income_yield"] = _dec(s[f"a_oiy_{aid}"])
+        if f"a_rent_{aid}" in s:
+            a["net_annual_rental_income"] = float(s[f"a_rent_{aid}"])
+        if f"a_wlast_{aid}" in s:
+            a["withdraw_priority"] = "last" if s[f"a_wlast_{aid}"] else "normal"
+        if f"a_owner_{aid}" in s:
+            a["owner"] = s[f"a_owner_{aid}"]
+    save_scenario(
+        name,
+        st.session_state.profile,
+        st.session_state.assumptions,
+        st.session_state.accounts,
+        st.session_state.roth_conversion,
+    )
+    set_last_used_scenario(name)
+
+
 def sidebar_scenarios():
     with st.sidebar.expander("💾 Scenarios", expanded=False):
         name = st.text_input("Scenario Name", "My Scenario", key="sc_name")
         if st.button("Save", key="sc_save"):
             try:
-                # sidebar_roth_conversion() always runs before this handler and
-                # writes widget return values directly into st.session_state.roth_conversion
-                # via "rc[field] = widget()" assignments — that dict is authoritative.
-                # We only need to fix up the two fields that require index→ID translation
-                # (rc_dst stores a list index, not an account ID) and the checkbox-derived
-                # source list (those keys are individually keyed per account).
-                rc = st.session_state.roth_conversion
-                _trad = [a for a in st.session_state.accounts
-                         if a["type"] in {"traditional_401k", "traditional_ira"}]
-                if any(f"rc_src_{a['id']}" in st.session_state for a in _trad):
-                    rc["source_account_ids"] = [
-                        a["id"] for a in _trad
-                        if st.session_state.get(f"rc_src_{a['id']}", False)
-                    ]
-                _roth = [a for a in st.session_state.accounts
-                         if a["type"] in {"roth_401k", "roth_ira"}]
-                if "rc_dst" in st.session_state and _roth:
-                    idx = st.session_state["rc_dst"]
-                    if 0 <= idx < len(_roth):
-                        rc["destination_account_id"] = _roth[idx]["id"]
-                # Sync all account widget values explicitly — widgets inside
-                # collapsed expanders may not have run, so the dict could be stale.
-                for a in st.session_state.accounts:
-                    aid = a["id"]
-                    s = st.session_state
-                    if f"a_name_{aid}" in s:
-                        a["name"] = s[f"a_name_{aid}"]
-                    if f"a_type_{aid}" in s:
-                        a["type"] = ACCOUNT_TYPES.get(s[f"a_type_{aid}"], a["type"])
-                    if f"a_bal_{aid}" in s:
-                        a["balance"] = float(s[f"a_bal_{aid}"])
-                    if f"a_ret_{aid}" in s:
-                        a["return_rate"] = _dec(s[f"a_ret_{aid}"])
-                    if f"chk_global_{aid}" in s:
-                        a["use_global_return_rate"] = bool(s[f"chk_global_{aid}"])
-                    if f"a_contrib_{aid}" in s:
-                        a["annual_contribution"] = float(s[f"a_contrib_{aid}"])
-                    if f"a_cgr_{aid}" in s:
-                        a["contribution_growth_rate"] = _dec(s[f"a_cgr_{aid}"])
-                    if f"a_emp_{aid}" in s:
-                        a["employer_match_percent"] = _dec(s[f"a_emp_{aid}"])
-                    if f"a_empl_{aid}" in s:
-                        a["employer_match_limit"] = float(s[f"a_empl_{aid}"])
-                    if f"a_basis_{aid}" in s:
-                        a["basis"] = float(s[f"a_basis_{aid}"])
-                    if f"a_qdy_{aid}" in s:
-                        a["qualified_dividend_yield"] = _dec(s[f"a_qdy_{aid}"])
-                    if f"a_oiy_{aid}" in s:
-                        a["ordinary_income_yield"] = _dec(s[f"a_oiy_{aid}"])
-                    if f"a_rent_{aid}" in s:
-                        a["net_annual_rental_income"] = float(s[f"a_rent_{aid}"])
-                    if f"a_wlast_{aid}" in s:
-                        a["withdraw_priority"] = "last" if s[f"a_wlast_{aid}"] else "normal"
-                    if f"a_owner_{aid}" in s:
-                        a["owner"] = s[f"a_owner_{aid}"]
-                save_scenario(
-                    name,
-                    st.session_state.profile,
-                    st.session_state.assumptions,
-                    st.session_state.accounts,
-                    st.session_state.roth_conversion,
-                )
-                set_last_used_scenario(name)
+                _do_save(name)
                 st.success(f"Saved '{name}'")
             except Exception as e:
                 st.error(str(e))
@@ -657,11 +662,18 @@ def main():
 
     # Sidebar
     sc_display = st.session_state.get("sc_name", "My Scenario")
-    st.sidebar.markdown(
+    _sb_name_col, _sb_save_col = st.sidebar.columns([3, 1])
+    _sb_name_col.markdown(
         f"<div style='font-size:0.78rem;color:#888;margin-bottom:0.1rem;'>Scenario</div>"
         f"<div style='font-size:1rem;font-weight:600;margin-bottom:0.75rem;'>{sc_display}</div>",
         unsafe_allow_html=True,
     )
+    if _sb_save_col.button("💾 Save", key="sc_quicksave", help=f"Save '{sc_display}'", use_container_width=True):
+        try:
+            _do_save(sc_display)
+            st.sidebar.success("Saved ✓", icon="💾")
+        except Exception as e:
+            st.sidebar.error(str(e))
     sidebar_profile()
     sidebar_assumptions()
     sidebar_accounts()
