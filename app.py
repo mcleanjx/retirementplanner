@@ -311,10 +311,14 @@ def sidebar_profile():
         st.markdown("**Healthcare**")
         p["pre_medicare_healthcare"] = st.number_input("Pre-Medicare Annual Cost ($)", 0, 50000, int(p.get("pre_medicare_healthcare", 15000)), 500, key="p_hc_pre")
         p["post_medicare_healthcare"] = st.number_input("Post-Medicare Annual Cost ($)", 0, 50000, int(p.get("post_medicare_healthcare", 12000)), 500, key="p_hc_post")
-        st.caption(
-            "Post-Medicare: include **Part B** (~$2,435/yr/person), Part D, supplemental (Medigap), dental/vision, and out-of-pocket. "
+        st.markdown(
+            "<div style='font-size:0.8rem;color:#888;overflow-wrap:break-word;word-break:break-word;'>"
+            "Post-Medicare: include <b>Part B</b> (~$2,435/yr/person), Part D, supplemental (Medigap), "
+            "dental/vision, and out-of-pocket. "
             "IRMAA surcharges are computed separately from income and added on top. "
             "A healthy couple with Medigap: ~$15,000–$20,000/yr."
+            "</div>",
+            unsafe_allow_html=True,
         )
 
 
