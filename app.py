@@ -406,6 +406,15 @@ def sidebar_accounts():
                     a["return_rate"] = _dec(st.number_input("Return / Appreciation Rate (%)", 0.0, 20.0, _pct(a["return_rate"]), 0.1, key=f"a_ret_{a['id']}"))
                 else:
                     a["return_rate"] = _dec(st.number_input("Return Rate — accumulation (%)", 0.0, 20.0, _pct(a["return_rate"]), 0.1, key=f"a_ret_{a['id']}"))
+                    if a["type"] in {"taxable", "reit"}:
+                        _qdy = _pct(a.get("qualified_dividend_yield", 0.0))
+                        _oiy = _pct(a.get("ordinary_income_yield", 0.0))
+                        _total_ret = _pct(a["return_rate"]) + _qdy + _oiy
+                        st.caption(
+                            f"Price appreciation only. "
+                            f"Total return = this rate + qualified dividend yield + ordinary income yield "
+                            f"({_pct(a['return_rate']):.2f}% + {_qdy:.2f}% + {_oiy:.2f}% = **{_total_ret:.2f}%** total)."
+                        )
                     use_global = st.checkbox(
                         "Use global retirement return rate",
                         value=a.get("use_global_return_rate", True),
@@ -647,6 +656,12 @@ def main():
     )
 
     # Sidebar
+    sc_display = st.session_state.get("sc_name", "My Scenario")
+    st.sidebar.markdown(
+        f"<div style='font-size:0.78rem;color:#888;margin-bottom:0.1rem;'>Scenario</div>"
+        f"<div style='font-size:1rem;font-weight:600;margin-bottom:0.75rem;'>{sc_display}</div>",
+        unsafe_allow_html=True,
+    )
     sidebar_profile()
     sidebar_assumptions()
     sidebar_accounts()
@@ -878,9 +893,9 @@ def main():
             if col == "Age":
                 continue
             elif col == "Override (0 = use default)":
-                col_config[col] = st.column_config.NumberColumn(min_value=0, format="$%.0f")
+                col_config[col] = st.column_config.NumberColumn(min_value=0, format="$")
             else:
-                col_config[col] = st.column_config.NumberColumn(disabled=True, format="$%.0f")
+                col_config[col] = st.column_config.NumberColumn(disabled=True, format="$")
 
         edited = st.data_editor(
             editor_df,
@@ -1442,6 +1457,30 @@ def main():
             m3.metric("10th Percentile at Life Expectancy", f"${mc_result['percentiles'][10][-1]:,.0f}")
             m4.metric("Trials Depleted", f"{mc_result['n_depleted']:,} / {mc_result['n_runs']:,}")
 
+            with st.expander("📖 What makes a good result?", expanded=False):
+                st.caption(
+                    "Guidance based on financial planning research (Bengen 1994, Pfau, Kitces). "
+                    "Success rate = % of simulated market sequences where the portfolio lasted to life expectancy."
+                )
+                bench_df = pd.DataFrame({
+                    "Success Rate": ["≥ 95%", "90 – 95%", "80 – 90%", "70 – 80%", "< 70%"],
+                    "Rating":       ["Very Safe", "Strong ✓", "Moderate", "Caution ⚠️", "High Risk ❌"],
+                    "Shortfall Odds": ["1 in 20+", "~1 in 10–20", "~1 in 5–10", "~1 in 4–5", "> 1 in 3"],
+                    "What to do": [
+                        "May be over-funded — consider spending more or retiring earlier",
+                        "Standard CFP planning target — solid safety margin",
+                        "Acceptable if you can flex spending 10–15% in a bad sequence",
+                        "Build a contingency: part-time work, cut discretionary spend",
+                        "Plan needs revision — save more, spend less, or retire later",
+                    ],
+                })
+                st.dataframe(bench_df, use_container_width=True, hide_index=True)
+                st.caption(
+                    "**10th percentile portfolio at life expectancy**: if this is above $0, your plan "
+                    "survives even unlucky market sequences. A 90%+ success rate *and* a positive 10th "
+                    "percentile together indicate a robust plan."
+                )
+
             st.plotly_chart(
                 _charts.chart_monte_carlo(mc_result, det_portfolio),
                 use_container_width=True,
@@ -1594,18 +1633,6 @@ def main():
             }
             st.dataframe(pd.DataFrame(comparison_data), use_container_width=True, hide_index=True)
 
-            # --- Recommended strategy settings ---
-            st.divider()
-            st.subheader("Recommended Strategy Settings")
-            st.caption("Apply these settings in the sidebar to activate the optimized strategy.")
-            best_rc = best["roth_conversion"]
-            best_ws = best["withdrawal_strategy"]
-            desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement)
-            desc_df = pd.DataFrame(
-                [{"Setting": k, "Recommended Value": v} for k, v in desc.items()]
-            )
-            st.dataframe(desc_df, use_container_width=True, hide_index=True)
-
             # --- Year-by-year actions ---
             st.divider()
             st.subheader("Recommended Actions by Year")
@@ -1617,6 +1644,8 @@ def main():
                 "💚 **Bold green** — **Total Spend**: what you actually have to live on after all costs. "
                 "Check: |Portfolio Draw| + SS & Passive Income − |Taxes| − |Healthcare| = Total Spend."
             )
+            best_rc = best["roth_conversion"]
+            best_ws = best["withdrawal_strategy"]
             actions_df = _opt.build_actions_table(best_df, best_rc, accounts_at_retirement)
             if not actions_df.empty:
                 non_dollar = {"Age", "Eff. Tax Rate"}
@@ -1666,6 +1695,16 @@ def main():
                     use_container_width=True,
                     hide_index=True,
                 )
+
+            # --- Recommended strategy settings ---
+            st.divider()
+            st.subheader("Recommended Strategy Settings")
+            st.caption("Apply these settings in the sidebar to activate the optimized strategy.")
+            desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement)
+            desc_df = pd.DataFrame(
+                [{"Setting": k, "Recommended Value": v} for k, v in desc.items()]
+            )
+            st.dataframe(desc_df, use_container_width=True, hide_index=True)
 
             # --- Account balances by year ---
             st.divider()
@@ -1771,9 +1810,9 @@ def main():
         _acct_col_cfg = {
             "Name": st.column_config.TextColumn(disabled=True),
             "Type": st.column_config.TextColumn(disabled=True),
-            "Current Value ($)": st.column_config.NumberColumn(min_value=0, format="$%.0f"),
+            "Current Value ($)": st.column_config.NumberColumn(min_value=0, format="$"),
             "Current Basis ($)": st.column_config.NumberColumn(
-                min_value=0, format="$%.0f",
+                min_value=0, format="$",
                 help="Cost basis (applies to taxable brokerage, REIT, and rental property accounts)",
             ),
             "Return Rate (%)": st.column_config.NumberColumn(
