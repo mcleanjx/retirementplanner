@@ -108,7 +108,7 @@ def _mc_single_run_v2(
     retirement_age = profile["retirement_age"]
     life_expectancy = profile["life_expectancy"]
     inflation_mean = assumptions.get("inflation_rate", 0.03)
-    ret_return = assumptions.get("retirement_return_rate", 0.05)
+    ret_return = assumptions.get("retirement_return_rate", 0.065)
     swr = assumptions.get("safe_withdrawal_rate", 0.04)
     spending_mode = assumptions.get("spending_mode", "swr")
     filing_status = profile["filing_status"]

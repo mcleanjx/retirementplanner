@@ -57,7 +57,7 @@ DEFAULT_ASSUMPTIONS = {
     "inflation_rate": 0.03,
     "bracket_inflation_rate": 0.025,
     "safe_withdrawal_rate": 0.04,
-    "retirement_return_rate": 0.05,
+    "retirement_return_rate": 0.065,
     "spending_mode": "swr",
     "annual_spending_target": 80000.0,
     "withdrawal_strategy": "tax_efficient",
@@ -180,7 +180,7 @@ def _apply_pending_load():
     _asmp = data["assumptions"]
     st.session_state["a_inf"]          = float(round(_asmp.get("inflation_rate", 0.03) * 100, 1))
     st.session_state["a_bracket_inf"]  = float(round(_asmp.get("bracket_inflation_rate", 0.025) * 100, 1))
-    st.session_state["a_ret"]          = float(round(_asmp.get("retirement_return_rate", 0.05) * 100, 1))
+    st.session_state["a_ret"]          = float(round(_asmp.get("retirement_return_rate", 0.065) * 100, 1))
     st.session_state["a_spend_mode"]   = _asmp.get("spending_mode", "swr")
     st.session_state["a_swr"]          = float(round(_asmp.get("safe_withdrawal_rate", 0.04) * 100, 1))
     st.session_state["a_spend_target"] = int(_asmp.get("annual_spending_target", 80000))
@@ -373,7 +373,12 @@ def sidebar_assumptions():
         ))
         st.caption("Annual rate at which bracket thresholds, standard deduction, NIIT/IRMAA limits, and state brackets grow. SS taxability thresholds are not indexed — bracket creep on SS is intentional.")
         a["retirement_return_rate"] = _dec(st.number_input("Retirement Return Rate — capital appreciation (%)", 0.0, 15.0, _pct(a["retirement_return_rate"]), 0.1, key="a_ret"))
-        st.caption("Applied to accounts set to 'use global rate'. Set this to total return minus dividend yield (e.g. 5% if portfolio returns 6.5% total and pays 1.5% dividends).")
+        st.caption(
+            "Applied to accounts set to 'use global rate'. "
+            "Default 6.5% reflects Shiller historical real equity total return of ~7.1–7.3% (1871–2025) less ~0.5–1% for a blended stock/bond portfolio. "
+            "If your portfolio pays meaningful dividends, reduce this by the yield (e.g. use 5.0% if total return is 6.5% and dividend yield is 1.5%). "
+            "Note: current CAPE (~39) is historically elevated, suggesting forward returns may be below the long-run average."
+        )
 
         st.markdown("**Income Needed in Retirement**")
         a["spending_mode"] = st.radio(
@@ -463,7 +468,7 @@ def sidebar_accounts():
                         key=f"chk_global_{a['id']}",
                     )
                     a["use_global_return_rate"] = use_global
-                    global_ret = st.session_state.assumptions.get("retirement_return_rate", 0.05)
+                    global_ret = st.session_state.assumptions.get("retirement_return_rate", 0.065)
                     if use_global:
                         st.caption(f"Retirement growth: {_pct(global_ret):.1f}% (global rate)")
                     else:
@@ -1520,7 +1525,7 @@ def main():
             )
 
         # --- Parameters ---
-        _ret = assumptions.get("retirement_return_rate", 0.05)
+        _ret = assumptions.get("retirement_return_rate", 0.065)
         if use_v2:
             vol_col1, vol_col2, vol_col3, n_col = st.columns([2, 2, 2, 1])
             with vol_col1:
