@@ -648,11 +648,19 @@ def simulate_retirement(
         after_tax_spending = spendable_cash - taxes["total"]
         actual_after_tax_net = after_tax_spending - hc_cost
 
-        # Update effective rate against spendable cash (not total) for next year's gross-up.
-        # Don't let the rate drop more than 20 % per year — a bank-heavy year can
-        # push the blended rate close to 0 %, which then causes large under-provisions
-        # the following year when withdrawals shift back to taxable sources.
-        _computed_rate = max(0.05, taxes["total"] / max(1.0, spendable_cash))
+        # Update effective rate for next year's gross-up.
+        # The denominator should reflect only the cash that generates taxable income:
+        # - bank withdrawals are tax-free → exclude
+        # - Roth withdrawals are tax-free → exclude
+        # - taxable account basis returns are not taxed (only the gain is) → exclude
+        # Failing to exclude these dilutes prev_eff_rate, causing the gross-up to
+        # under-provision in future years when those tax-free sources aren't available
+        # (e.g. bank at buffer floor in RMD years, Roth already spent out).
+        # Also cap the drop at 20 %/year to guard against sudden income-mix shifts.
+        _basis_return = max(0.0, taxable_withdrawn - withdrawal_ltcg)
+        _non_taxable = bank_withdrawn + _basis_return + roth_withdrawn
+        _taxable_spendable = max(1.0, spendable_cash - _non_taxable)
+        _computed_rate = max(0.05, taxes["total"] / _taxable_spendable)
         prev_eff_rate = max(_computed_rate, prev_eff_rate * 0.80)
         # Update LTCG rate separately so dividend-heavy portfolios aren't over-grossed.
         if ltcg_income > 0:
