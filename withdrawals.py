@@ -60,6 +60,188 @@ def _withdraw_from(account: dict, amount: float) -> tuple[float, float, float]:
     return amount, 0.0, 0.0
 
 
+def _discretionary_after_tax_net(
+    trial_need: float,
+    accts_snapshot: list,
+    withdrawal_strategy: str,
+    ord_income_pre: float,
+    ltcg_pre: float,
+    rmd_total: float,
+    total_ss: float,
+    inv_ordinary: float,
+    inv_ltcg: float,
+    rental_income: float,
+    hc_cost: float,
+    current_fs: str,
+    state: str,
+    age: int,
+    spouse_age,
+    num_medicare: int,
+    state_rate: float,
+    bracket_factor: float,
+    ss_taxable: float,
+) -> float:
+    """Dry-run: compute after_tax_net for a given gross discretionary withdrawal."""
+    accts = copy.deepcopy(accts_snapshot)
+    oi = ord_income_pre
+    li = ltcg_pre
+    need = trial_need
+    total_disc = 0.0
+
+    # Bank first (tax-free, respect bank_buffer)
+    for a in sorted([a for a in accts if a["type"] in BANK_TYPES], key=lambda x: -x["balance"]):
+        if need <= 0:
+            break
+        avail = max(0.0, a["balance"] - a.get("bank_buffer", 0.0))
+        w, _, _ = _withdraw_from(a, min(need, avail))
+        need -= w
+        total_disc += w
+
+    # Taxable normal (proportional)
+    txn = [a for a in accts if a["type"] in TAXABLE_TYPES and a.get("withdraw_priority", "normal") != "last"]
+    active_txn = [a for a in txn if a["balance"] > 0]
+    if active_txn and need > 0:
+        total_bal = sum(a["balance"] for a in active_txn)
+        to_w = min(need, total_bal)
+        for a in active_txn:
+            w, _, lg = _withdraw_from(a, to_w * (a["balance"] / total_bal))
+            li += lg
+            total_disc += w
+        need -= to_w
+
+    if withdrawal_strategy == "roth_preservation":
+        for a in sorted([a for a in accts if a["type"] in TRADITIONAL_TYPES], key=lambda x: -x["balance"]):
+            if need <= 0:
+                break
+            w, wi, _ = _withdraw_from(a, need)
+            oi += wi
+            need -= w
+            total_disc += w
+        for a in sorted([a for a in accts if a["type"] in ROTH_TYPES], key=lambda x: -x["balance"]):
+            if need <= 0:
+                break
+            w, _, _ = _withdraw_from(a, need)
+            need -= w
+            total_disc += w
+    else:  # tax_efficient
+        std_ded = STANDARD_DEDUCTION[current_fs] * bracket_factor
+        traditional_ceiling = BRACKET_CEILINGS[current_fs].get(0.22, 1e9) * bracket_factor + std_ded
+        for a in sorted([a for a in accts if a["type"] in TRADITIONAL_TYPES], key=lambda x: -x["balance"]):
+            if need <= 0:
+                break
+            headroom = max(0.0, traditional_ceiling - oi)
+            w, wi, _ = _withdraw_from(a, min(need, headroom))
+            oi += wi
+            need -= w
+            total_disc += w
+        for a in sorted([a for a in accts if a["type"] in ROTH_TYPES], key=lambda x: -x["balance"]):
+            if need <= 0:
+                break
+            w, _, _ = _withdraw_from(a, need)
+            need -= w
+            total_disc += w
+        if need > 0:
+            for a in sorted([a for a in accts if a["type"] in TRADITIONAL_TYPES], key=lambda x: -x["balance"]):
+                if need <= 0:
+                    break
+                w, wi, _ = _withdraw_from(a, need)
+                oi += wi
+                need -= w
+                total_disc += w
+
+    # Taxable last (proportional)
+    txl = [a for a in accts if a["type"] in TAXABLE_TYPES and a.get("withdraw_priority", "normal") == "last"]
+    active_txl = [a for a in txl if a["balance"] > 0]
+    if active_txl and need > 0:
+        total_bal = sum(a["balance"] for a in active_txl)
+        to_w = min(need, total_bal)
+        for a in active_txl:
+            w, _, lg = _withdraw_from(a, to_w * (a["balance"] / total_bal))
+            li += lg
+            total_disc += w
+        need -= to_w
+
+    total_cash = rmd_total + total_disc + total_ss + rental_income + inv_ordinary + inv_ltcg
+    nii = inv_ordinary + li + rental_income
+    taxes = calculate_year_taxes(
+        ordinary_income=oi,
+        ltcg_income=li,
+        filing_status=current_fs,
+        state=state,
+        age=age,
+        spouse_age=spouse_age,
+        num_medicare_eligible=num_medicare,
+        ss_income=total_ss,
+        state_tax_rate=state_rate,
+        net_investment_income=nii,
+        ss_taxable_amount=ss_taxable,
+        bracket_factor=bracket_factor,
+    )
+    return total_cash - taxes["total"] - hc_cost
+
+
+def _solve_discretionary_need(
+    net_target: float,
+    accts: list,
+    withdrawal_strategy: str,
+    ord_income_pre: float,
+    ltcg_pre: float,
+    rmd_total: float,
+    total_ss: float,
+    inv_ordinary: float,
+    inv_ltcg: float,
+    rental_income: float,
+    hc_cost: float,
+    current_fs: str,
+    state: str,
+    age: int,
+    spouse_age,
+    num_medicare: int,
+    state_rate: float,
+    bracket_factor: float,
+    ss_taxable: float,
+) -> float:
+    """Bisect to find gross discretionary withdrawal yielding net_target after-tax net."""
+    kw = dict(
+        accts_snapshot=accts,
+        withdrawal_strategy=withdrawal_strategy,
+        ord_income_pre=ord_income_pre,
+        ltcg_pre=ltcg_pre,
+        rmd_total=rmd_total,
+        total_ss=total_ss,
+        inv_ordinary=inv_ordinary,
+        inv_ltcg=inv_ltcg,
+        rental_income=rental_income,
+        hc_cost=hc_cost,
+        current_fs=current_fs,
+        state=state,
+        age=age,
+        spouse_age=spouse_age,
+        num_medicare=num_medicare,
+        state_rate=state_rate,
+        bracket_factor=bracket_factor,
+        ss_taxable=ss_taxable,
+    )
+    if _discretionary_after_tax_net(0.0, **kw) >= net_target:
+        return 0.0
+    total_avail = sum(
+        a["balance"] for a in accts
+        if a["type"] in BANK_TYPES | TAXABLE_TYPES | TRADITIONAL_TYPES | ROTH_TYPES
+    )
+    if _discretionary_after_tax_net(total_avail, **kw) < net_target:
+        return total_avail
+    lo, hi = 0.0, total_avail
+    for _ in range(50):
+        if hi - lo < 1.0:
+            break
+        mid = (lo + hi) / 2.0
+        if _discretionary_after_tax_net(mid, **kw) < net_target:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
 def simulate_retirement(
     accounts: list[dict],
     profile: dict,
@@ -348,20 +530,38 @@ def simulate_retirement(
         harvest_ltcg = harvest_total
         ltcg_income += harvest_ltcg
 
+        # num_medicare needed here for binary search tax calls (also used in Step 6)
+        num_medicare = 0
+        if age >= 65:
+            num_medicare += 1
+        if current_fs == "married_filing_jointly" and spouse_age is not None and spouse_age >= 65:
+            num_medicare += 1
+
         # --- Step 5: Discretionary withdrawals ---
         if fixed_net_mode:
-            # Refine gross target now that passive income is known.
-            # Use separate rates for LTCG income (qualified dividends, often 0%) and
-            # ordinary passive income (SS, rental, interest) to avoid over-grossing
-            # in portfolios where most passive income is LTCG.
-            passive_ordinary = total_ss + rental_income + inv_ordinary
-            passive_ordinary_net = passive_ordinary * (1 - prev_eff_rate)
-            passive_ltcg_net = inv_ltcg * (1 - prev_ltcg_rate)
-            passive_net_approx = passive_ordinary_net + passive_ltcg_net
-            net_still_needed = max(0.0, base_this_year + hc_cost - passive_net_approx)
-            remaining_need = net_still_needed / max(0.05, 1 - prev_eff_rate) - rmd_total
-            # conv_tax_estimate not in the gross-up above; fund it directly.
-            remaining_need = max(0.0, remaining_need) + conv_tax_estimate
+            # Binary search: find exact gross withdrawal yielding net_target_this_year after tax.
+            # Replaces the prev_eff_rate gross-up; converges to $1 precision in ≤50 iterations.
+            remaining_need = _solve_discretionary_need(
+                net_target=net_target_this_year,
+                accts=accts,
+                withdrawal_strategy=withdrawal_strategy,
+                ord_income_pre=ordinary_income,
+                ltcg_pre=ltcg_income,
+                rmd_total=rmd_total,
+                total_ss=total_ss,
+                inv_ordinary=inv_ordinary,
+                inv_ltcg=inv_ltcg,
+                rental_income=rental_income,
+                hc_cost=hc_cost,
+                current_fs=current_fs,
+                state=state,
+                age=age,
+                spouse_age=spouse_age,
+                num_medicare=num_medicare,
+                state_rate=state_rate,
+                bracket_factor=bracket_factor,
+                ss_taxable=ss_taxable,
+            )
         else:
             # total_spending_need already includes conv_tax_estimate (added after Step 3).
             remaining_need = max(0.0, total_spending_need - passive_income_total - rmd_total)
@@ -374,8 +574,7 @@ def simulate_retirement(
         withdrawal_ltcg = 0.0
 
         # 5_bank. Bank/cash accounts first (no tax cost, low return — drain first).
-        # Respect per-account bank_buffer: leave that amount untouched during planned
-        # funding so it stays available for the Step-6.5 correction.
+        # Respect per-account bank_buffer: leave that amount as a cash reserve.
         for a in sorted([a for a in accts if a["type"] in BANK_TYPES], key=lambda x: -x["balance"]):
             if remaining_need <= 0:
                 break
@@ -490,33 +689,28 @@ def simulate_retirement(
             + total_ss + rental_income + inv_ordinary + inv_ltcg
         )
 
-        # Reinvest any surplus cash that exceeds the spending target.
-        # This covers RMD excess, passive income surplus (SS + dividends > target), etc.
-        # Reinvestment happens before Step 7 so the surplus earns returns this year.
-        surplus_reinvested = max(0.0, total_cash_received - total_spending_need)
-        if surplus_reinvested > 0:
-            for a in accts:
-                if a["type"] in {"taxable", "bank"}:
-                    a["balance"] += surplus_reinvested
-                    if a["type"] == "taxable":
-                        a["basis"] = a.get("basis", 0.0) + surplus_reinvested
-                    break
-            if surplus_reinvested > total_spending_need * 0.1:
-                warnings.append({
-                    "age": age,
-                    "type": "rmd_excess",
-                    "message": f"Age {age}: Income (${total_cash_received:,.0f}) exceeded spending target by ${surplus_reinvested:,.0f} — excess reinvested.",
-                })
+        # Reinvest surplus cash above the spending target.
+        # Non-fixed mode: computed now (before taxes) using gross spending estimate.
+        # Fixed mode: computed after Step 6 taxes for exactness.
+        if not fixed_net_mode:
+            surplus_reinvested = max(0.0, total_cash_received - total_spending_need)
+            if surplus_reinvested > 0:
+                for a in accts:
+                    if a["type"] in {"taxable", "bank"}:
+                        a["balance"] += surplus_reinvested
+                        if a["type"] == "taxable":
+                            a["basis"] = a.get("basis", 0.0) + surplus_reinvested
+                        break
+                if surplus_reinvested > total_spending_need * 0.1:
+                    warnings.append({
+                        "age": age,
+                        "type": "rmd_excess",
+                        "message": f"Age {age}: Income (${total_cash_received:,.0f}) exceeded spending target by ${surplus_reinvested:,.0f} — excess reinvested.",
+                    })
+        else:
+            surplus_reinvested = 0.0  # computed after Step 6 taxes
 
         # --- Step 6: IRMAA + NIIT ---
-        # Use current_fs (not the original filing_status) so that after the survivor
-        # transition we only count one Medicare enrollee, not two.
-        num_medicare = 0
-        if age >= 65:
-            num_medicare += 1
-        if current_fs == "married_filing_jointly" and spouse_age is not None and spouse_age >= 65:
-            num_medicare += 1
-
         # NII = ordinary dividends + LTCG income (qualified divs + gains) + passive rental.
         # Excludes: RMDs, traditional withdrawals, SS — those are ordinary income but not NII.
         nii = inv_ordinary + ltcg_income + rental_income
@@ -566,58 +760,26 @@ def simulate_retirement(
                         })
                     break
 
-        # --- Step 6.5: Bank as two-way spending buffer (fixed-net mode only) ---
-        # The gross-up in Step 5 uses prev_eff_rate to estimate taxes; actual taxes
-        # differ because the income mix changes year to year (e.g. bank withdrawals
-        # carry zero taxable income, Roth is tax-free, etc.).  The bank account acts
-        # as a cash float that absorbs these estimation errors so that
-        # actual_after_tax_net always equals net_spending_target.
-        # Since bank is tax-free, adjusting it does not invalidate the computed taxes.
-        #
-        #  delta > 0  (over-provision): excess stays in bank instead of being spent.
-        #    · Reverse the bank withdrawal up to what was taken this step.
-        #    · Any remainder beyond bank_withdrawn is a net deposit (the household
-        #      saves lower-than-expected taxes on other-account withdrawals).
-        #  delta < 0  (under-provision): bank covers the shortfall up to its balance.
-        if fixed_net_mode and net_target_this_year is not None:
-            _spendable = total_cash_received - surplus_reinvested
-            _delta = (_spendable - taxes["total"] - hc_cost) - net_target_this_year
-            _bank_acc = next((a for a in accts if a["type"] in BANK_TYPES), None)
-
-            if _bank_acc and _delta > 1.0:
-                # Over-provision — save excess in bank.
-                # _reverse: portion that genuinely reverses the Step-5 bank withdrawal.
-                # _net_deposit: remainder from lower-than-expected taxes on other accounts.
-                # We route _net_deposit through surplus_reinvested so the row identity
-                # (total_cash - surplus - taxes == after_tax_spending) remains intact.
-                _reverse = min(_delta, bank_withdrawn)
-                _net_deposit = _delta - _reverse
-                _bank_acc["balance"] += _delta
-                withdrawal_detail[_bank_acc["name"]] = (
-                    withdrawal_detail.get(_bank_acc["name"], 0.0) - _reverse
-                )
-                total_cash_received           -= _reverse
-                bank_withdrawn                -= _reverse
-                total_discretionary_withdrawn -= _reverse
-                surplus_reinvested            += _net_deposit
-
-            elif _bank_acc and _delta < -1.0:
-                # Under-provision — draw from bank to cover shortfall.
-                # Do NOT recalculate surplus_reinvested here: surplus was already computed
-                # and deposited before this step. Re-running max(0, cash - need) would
-                # absorb the bank draw into a larger surplus, cancelling the correction.
-                # Note: the buffer restricts planned (Step 5) withdrawals only; the
-                # correction draw may temporarily reduce the bank below the buffer floor,
-                # but over-provisions in subsequent years rebuild it above the floor.
-                _draw = min(abs(_delta), _bank_acc["balance"])
-                if _draw > 0:
-                    _bank_acc["balance"] -= _draw
-                    withdrawal_detail[_bank_acc["name"]] = (
-                        withdrawal_detail.get(_bank_acc["name"], 0.0) + _draw
-                    )
-                    total_cash_received           += _draw
-                    bank_withdrawn                += _draw
-                    total_discretionary_withdrawn += _draw
+        # Fixed-net mode: compute exact surplus now that actual taxes are known.
+        # Binary search makes total_cash - taxes - hc_cost ≈ net_target, so surplus
+        # is typically ~$0. In RMD-heavy years where passive income alone exceeds
+        # the target, surplus captures and reinvests the excess.
+        if fixed_net_mode:
+            surplus_reinvested = max(0.0, total_cash_received - taxes["total"] - hc_cost - net_target_this_year)
+            if surplus_reinvested > 0:
+                for a in accts:
+                    if a["type"] in {"taxable", "bank"}:
+                        a["balance"] += surplus_reinvested
+                        if a["type"] == "taxable":
+                            a["basis"] = a.get("basis", 0.0) + surplus_reinvested
+                        break
+                if surplus_reinvested > net_target_this_year * 0.1:
+                    warnings.append({
+                        "age": age,
+                        "type": "rmd_excess",
+                        "message": f"Age {age}: Income (${total_cash_received:,.0f}) exceeded spending target by ${surplus_reinvested:,.0f} — excess reinvested.",
+                    })
+            total_spending_need = net_target_this_year + taxes["total"] + hc_cost
 
         # --- Step 7: Apply returns, inflate, advance ---
         for a in accts:
@@ -648,19 +810,13 @@ def simulate_retirement(
         after_tax_spending = spendable_cash - taxes["total"]
         actual_after_tax_net = after_tax_spending - hc_cost
 
-        # Update effective rate for next year's gross-up.
-        # The denominator should reflect only the cash that generates taxable income:
-        # - bank withdrawals are tax-free → exclude
-        # - Roth withdrawals are tax-free → exclude
-        # - taxable account basis returns are not taxed (only the gain is) → exclude
-        # Failing to exclude these dilutes prev_eff_rate, causing the gross-up to
-        # under-provision in future years when those tax-free sources aren't available
-        # (e.g. bank at buffer floor in RMD years, Roth already spent out).
-        # Also cap the drop at 20 %/year to guard against sudden income-mix shifts.
+        # Update prev_eff_rate — used only for Step 4 LTCG harvest estimation.
+        # (Fixed-net spending uses binary search; this rate is no longer used for gross-up.)
         _basis_return = max(0.0, taxable_withdrawn - withdrawal_ltcg)
         _non_taxable = bank_withdrawn + _basis_return + roth_withdrawn
         _taxable_spendable = max(1.0, spendable_cash - _non_taxable)
-        _computed_rate = max(0.05, taxes["total"] / _taxable_spendable)
+        _withdrawal_taxes = max(0.0, taxes["total"] - conv_tax_estimate)
+        _computed_rate = min(0.45, max(0.05, _withdrawal_taxes / _taxable_spendable))
         prev_eff_rate = max(_computed_rate, prev_eff_rate * 0.80)
         # Update LTCG rate separately so dividend-heavy portfolios aren't over-grossed.
         if ltcg_income > 0:

@@ -300,7 +300,11 @@ def sidebar_profile():
     with st.sidebar.expander("1. 👤 Profile", expanded=True):
         p["current_age"] = st.number_input("Current Age", 18, 100, p["current_age"], key="p_age")
         p["retirement_age"] = st.number_input("Retirement Age", 18, 100, p["retirement_age"], key="p_ret")
-        p["life_expectancy"] = st.number_input("Life Expectancy", max(p["retirement_age"], p["current_age"]) + 1, 110, p["life_expectancy"], key="p_le")
+        _p_le_min = max(p["retirement_age"], p["current_age"]) + 1
+        _p_le_val = max(p["life_expectancy"], _p_le_min)
+        if st.session_state.get("p_le", _p_le_val) < _p_le_min:
+            st.session_state["p_le"] = _p_le_min
+        p["life_expectancy"] = st.number_input("Life Expectancy", _p_le_min, 110, _p_le_val, key="p_le")
         if p["retirement_age"] < p["current_age"]:
             st.warning("Retirement age is before current age — the app treats this as already retired.")
         if p["life_expectancy"] <= p["retirement_age"]:
@@ -551,8 +555,16 @@ def sidebar_roth_conversion():
             else:
                 rc["fixed_amount"] = float(st.number_input("Annual Conversion ($)", 0, 500000, int(rc.get("fixed_amount", 10000)), 1000, key="rc_fixed"))
 
-            rc["start_age"] = st.number_input("Conversion Start Age", p["retirement_age"], 80, rc.get("start_age", p["retirement_age"]), key="rc_start")
-            rc["end_age"] = st.number_input("Conversion End Age", rc["start_age"], 85, rc.get("end_age", min(p.get("social_security_start_age", 67) - 1, RMD_START_AGE - 1)), key="rc_end")
+            _rc_start_min = p["retirement_age"]
+            _rc_start_val = max(rc.get("start_age", _rc_start_min), _rc_start_min)
+            if st.session_state.get("rc_start", _rc_start_val) < _rc_start_min:
+                st.session_state["rc_start"] = _rc_start_min
+            rc["start_age"] = st.number_input("Conversion Start Age", _rc_start_min, 80, _rc_start_val, key="rc_start")
+            _rc_end_min = rc["start_age"]
+            _rc_end_val = max(rc.get("end_age", _rc_end_min), _rc_end_min)
+            if st.session_state.get("rc_end", _rc_end_val) < _rc_end_min:
+                st.session_state["rc_end"] = _rc_end_min
+            rc["end_age"] = st.number_input("Conversion End Age", _rc_end_min, 85, _rc_end_val, key="rc_end")
 
             trad_accts = [a for a in accts if a["type"] in {"traditional_401k", "traditional_ira"}]
             roth_accts = [a for a in accts if a["type"] in {"roth_401k", "roth_ira"}]
@@ -1196,6 +1208,8 @@ def main():
         st.subheader("Record Actual Balances")
         col_age, col_note = st.columns([1, 2])
         with col_age:
+            if st.session_state.get("ci_age", profile["current_age"]) < profile["current_age"]:
+                st.session_state["ci_age"] = profile["current_age"]
             ci_age = st.number_input(
                 "Your Age at Check-in",
                 min_value=profile["current_age"],
