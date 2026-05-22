@@ -1110,6 +1110,7 @@ def main():
         # Year 1 start = total_at_retirement; subsequent = prior year's end balance.
         _display_df = ret_df.copy()
         _display_df["withdrawal_pct"] = _display_df["spending_target"] / _display_df["start_portfolio"].clip(lower=1.0)
+        _display_df["net_spending_delta"] = _display_df["actual_after_tax_net"] - _display_df["net_spending_target"]
 
         display_cols = [
             # ── Context ──────────────────────────────────────────
@@ -1129,19 +1130,28 @@ def main():
             # ── Tax bill ─────────────────────────────────────────
             "total_tax", "effective_tax_rate", "federal_irmaa", "healthcare_cost",
             # ── Result ────────────────────────────────────────────
-            "after_tax_spending", "actual_after_tax_net", "surplus_reinvested",
+            "after_tax_spending", "actual_after_tax_net", "net_spending_delta", "surplus_reinvested",
             # ── End state ─────────────────────────────────────────
             "total_portfolio",
         ]
         display_cols = [c for c in display_cols if c in _display_df.columns]
         # Hide fixed-net-mode-only columns when in SWR mode (they're all None)
         if not fixed_net_mode:
-            display_cols = [c for c in display_cols if c not in ("net_spending_target", "actual_after_tax_net")]
+            display_cols = [c for c in display_cols if c not in ("net_spending_target", "actual_after_tax_net", "net_spending_delta")]
         fmt = {c: "${:,.0f}" for c in display_cols
                if c not in ("age", "effective_tax_rate", "spending_override_active", "withdrawal_pct")}
         fmt["effective_tax_rate"] = "{:.1%}"
         fmt["withdrawal_pct"] = "{:.2%}"
-        st.dataframe(_display_df[display_cols].style.format(fmt, na_rep="-"), use_container_width=True)
+
+        def _color_delta(val):
+            if not isinstance(val, (int, float)) or val == 0:
+                return ""
+            return "color: red" if val < -1 else "color: green" if val > 1 else ""
+
+        styled = _display_df[display_cols].style.format(fmt, na_rep="-")
+        if "net_spending_delta" in display_cols:
+            styled = styled.map(_color_delta, subset=["net_spending_delta"])
+        st.dataframe(styled, use_container_width=True)
 
     with tab5:
         scenario_name = st.session_state.get("sc_name", "My Scenario")
