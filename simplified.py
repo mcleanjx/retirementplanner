@@ -346,20 +346,26 @@ def _compute_score(ret_df, summary, profile):
 # ---------------------------------------------------------------------------
 
 def _progress_bar(step: int):
-    labels = ["About You", "Your Savings", "Retirement Income", "Your Goal", "Review"]
+    """Clickable progress bar. Completed steps are buttons; future steps are disabled."""
+    labels = ["About You", "Accounts", "Income", "Your Goal", "Review"]
+    wizard_complete = st.session_state.get("wizard_complete", False)
     cols = st.columns(len(labels))
     for i, (col, label) in enumerate(zip(cols, labels), 1):
-        active = i == step
-        done = i < step
-        color = "#2b6cb0" if active else ("#48bb78" if done else "#cbd5e0")
-        weight = "700" if active else "400"
-        col.markdown(
-            f"<div style='text-align:center;font-size:0.78rem;color:{color};"
-            f"font-weight:{weight};border-bottom:2.5px solid {color};padding-bottom:4px;'>"
-            f"{'✓ ' if done else ''}{label}</div>",
-            unsafe_allow_html=True,
+        is_active = (i == step) and not wizard_complete
+        # A step is done if we're past it in the wizard, or the wizard is complete
+        is_done = (i < step) or wizard_complete
+        btn_label = f"✓ {label}" if is_done else label
+        clicked = col.button(
+            btn_label,
+            key=f"wprog_{i}",
+            use_container_width=True,
+            type="primary" if is_active else "secondary",
+            disabled=not is_done and not is_active,
         )
-    st.write("")
+        if clicked and (not is_active):
+            st.session_state.wizard_step = i
+            st.session_state.wizard_complete = False
+            st.rerun()
 
 
 def _nav_buttons(step: int, can_next: bool = True, next_label: str = "Next →"):
@@ -604,7 +610,6 @@ def _step5_review():
 
 def _show_wizard():
     step = st.session_state.wizard_step
-    _progress_bar(step)
     if step == 1:
         _step1()
     elif step == 2:
@@ -914,6 +919,99 @@ def _render_income_sources(ret_df, profile):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _render_balance_breakdown(acc_df, ret_df, profile, w):
+    """Stacked area chart of account balances by type over time."""
+    st.subheader("Account Balances by Type")
+
+    adv_type_to_simple = {
+        "traditional_401k": "tax_deferred", "traditional_ira": "tax_deferred",
+        "roth_401k": "roth",               "roth_ira": "roth",   "hsa": "roth",
+        "taxable": "taxable",              "reit": "taxable",
+        "bank": "bank",
+    }
+    type_display = {
+        "tax_deferred": "Tax-Deferred (401k/IRA)",
+        "roth":         "Roth",
+        "taxable":      "Taxable",
+        "bank":         "Bank/Cash",
+    }
+    colors = {
+        "tax_deferred": "#2b6cb0",
+        "roth":         "#805ad5",
+        "taxable":      "#ed8936",
+        "bank":         "#38b2ac",
+    }
+
+    # Accumulation phase — acc_df has account_type column
+    acc_by_type: dict[str, dict[int, float]] = {}
+    if not acc_df.empty:
+        for _, row in acc_df.iterrows():
+            simple = adv_type_to_simple.get(row["account_type"])
+            if simple is None:
+                continue
+            age = int(row["age"])
+            acc_by_type.setdefault(simple, {})[age] = \
+                acc_by_type[simple].get(age, 0.0) + float(row["balance"])
+
+    # Retirement phase — ret_df has bal_{name} columns
+    ret_by_type: dict[str, dict[int, float]] = {}
+    if not ret_df.empty:
+        for wa in w.get("accounts", []):
+            col = "bal_" + wa["name"].replace(" ", "_")
+            if col not in ret_df.columns:
+                continue
+            simple = wa["type_simple"]
+            for _, row in ret_df.iterrows():
+                age = int(row["age"])
+                ret_by_type.setdefault(simple, {})[age] = \
+                    ret_by_type[simple].get(age, 0.0) + float(row.get(col, 0))
+
+    all_types = set(acc_by_type) | set(ret_by_type)
+    if not all_types:
+        return
+
+    all_ages = sorted(
+        {a for d in acc_by_type.values() for a in d}
+        | {a for d in ret_by_type.values() for a in d}
+    )
+    if not all_ages:
+        return
+
+    fig = go.Figure()
+    for st_key in ["tax_deferred", "roth", "taxable", "bank"]:
+        if st_key not in all_types:
+            continue
+        acc_d = acc_by_type.get(st_key, {})
+        ret_d = ret_by_type.get(st_key, {})
+        vals = [acc_d.get(age, ret_d.get(age, 0.0)) for age in all_ages]
+        if max(vals, default=0) < 1:
+            continue
+        fig.add_trace(go.Scatter(
+            x=all_ages, y=vals,
+            stackgroup="one",
+            name=type_display[st_key],
+            mode="lines",
+            line=dict(color=colors[st_key], width=0.5),
+            fillcolor=colors[st_key] + "99",
+            hovertemplate=f"{type_display[st_key]}: ${{y:,.0f}}<extra></extra>",
+        ))
+
+    fig.add_vline(
+        x=profile["retirement_age"], line_dash="dot", line_color="#718096",
+        annotation_text=f"Retire ({profile['retirement_age']})",
+        annotation_position="top right",
+    )
+    fig.update_layout(
+        height=280,
+        margin=dict(l=0, r=0, t=10, b=0),
+        yaxis=dict(tickprefix="$", tickformat=",.0f", title=None),
+        xaxis=dict(title="Age"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        plot_bgcolor="white", paper_bgcolor="white",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def _render_levers(base_score: int, base_surplus: float, base_depletion, profile, w):
     st.subheader("Move the Needle")
     st.caption("Adjust these sliders to see how small changes affect your score.")
@@ -990,6 +1088,9 @@ These are reasonable defaults. Switch to **Advanced Mode** to customize any of t
 def run_simplified_mode():
     _init_wizard()
 
+    # Progress bar always visible — allows navigation from results back to any step
+    _progress_bar(st.session_state.wizard_step)
+
     if not st.session_state.wizard_complete:
         _show_wizard()
         return
@@ -1012,26 +1113,29 @@ def run_simplified_mode():
     score, surplus = _compute_score(ret_df, summary, profile)
     depletion = summary.get("portfolio_depleted_age")
 
-    # ── Panel 1: Score card ────────────────────────────────────────────────
+    # ── Score card ─────────────────────────────────────────────────────────
     _render_score_card(score, surplus, profile, depletion, mc_result)
 
     st.divider()
 
-    # ── Panel 2: Spending summary ──────────────────────────────────────────
+    # ── Spending summary ───────────────────────────────────────────────────
     _render_spending_summary(ret_df, profile, assumptions)
 
     st.divider()
 
-    # ── Panels 3 & 4 side-by-side ─────────────────────────────────────────
+    # ── Portfolio curve (left) + Account balance breakdown (right) ─────────
     col_left, col_right = st.columns([3, 2])
     with col_left:
         _render_portfolio_curve(acc_df, ret_df, profile, mc_result)
     with col_right:
-        _render_income_sources(ret_df, profile)
+        _render_balance_breakdown(acc_df, ret_df, profile, w)
+
+    # ── Income sources by decade (full width) ─────────────────────────────
+    _render_income_sources(ret_df, profile)
 
     st.divider()
 
-    # ── Panel 4: Levers ───────────────────────────────────────────────────
+    # ── Levers ────────────────────────────────────────────────────────────
     _render_levers(score, surplus, depletion, profile, w)
 
     st.divider()
