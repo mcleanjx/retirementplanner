@@ -33,46 +33,115 @@ _SIMPLE_DEFAULTS = {
 
 
 # ---------------------------------------------------------------------------
-# Wizard state init
+# Account type mapping between advanced and simplified
 # ---------------------------------------------------------------------------
 
+_SIMPLE_TYPE_LABELS = {
+    "tax_deferred": "Tax-Deferred (401k / IRA / 403b)",
+    "roth":         "Roth (Roth 401k / Roth IRA)",
+    "taxable":      "Taxable Brokerage",
+    "bank":         "Bank / Cash",
+}
+
+_ADV_TO_SIMPLE_TYPE = {
+    "traditional_401k": "tax_deferred",
+    "traditional_ira":  "tax_deferred",
+    "roth_401k":        "roth",
+    "roth_ira":         "roth",
+    "hsa":              "roth",
+    "taxable":          "taxable",
+    "reit":             "taxable",
+    "bank":             "bank",
+    # rental_property handled separately (income, not balance)
+}
+
+_SIMPLE_TO_ADV_TYPE = {
+    "tax_deferred": "traditional_401k",
+    "roth":         "roth_ira",
+    "taxable":      "taxable",
+    "bank":         "bank",
+}
+
+
+def _accounts_from_advanced(adv_accounts: list) -> list:
+    """Convert advanced account list to simplified wizard account list."""
+    simple = []
+    for a in adv_accounts:
+        st = _ADV_TO_SIMPLE_TYPE.get(a.get("type", ""), None)
+        if st is None:
+            continue  # rental_property etc. handled via income fields
+        simple.append({
+            "id": a["id"],
+            "name": a["name"],
+            "type_simple": st,
+            "balance": float(a.get("balance", 0)),
+            "annual_contribution": float(a.get("annual_contribution", 0)),
+        })
+    if not simple:
+        simple = [{
+            "id": "simple_acc1",
+            "name": "Retirement Savings",
+            "type_simple": "tax_deferred",
+            "balance": 200000.0,
+            "annual_contribution": 15000.0,
+        }]
+    return simple
+
+
+# ---------------------------------------------------------------------------
+# Wizard state init / sync
+# ---------------------------------------------------------------------------
+
+def _build_wizard_from_state() -> dict:
+    """Build a fresh wizard dict from current session state (profile + accounts)."""
+    p = st.session_state.get("profile", {})
+    adv_accounts = st.session_state.get("accounts", [])
+    assumptions = st.session_state.get("assumptions", {})
+
+    # Determine if there's rental/pension income in advanced accounts
+    rental_total = sum(
+        a.get("net_annual_rental_income", 0)
+        for a in adv_accounts
+        if a.get("type") == "rental_property"
+    )
+
+    current_income = float(p.get("current_income", 100000) or 100000)
+    spend_target = float(assumptions.get("annual_spending_target", current_income * 0.80))
+
+    return {
+        # Step 1
+        "current_age": int(p.get("current_age", 40)),
+        "retirement_age": int(p.get("retirement_age", 65)),
+        "life_expectancy": int(p.get("life_expectancy", 90)),
+        "married": p.get("filing_status") == "married_filing_jointly",
+        "spouse_age": int(p.get("spouse_age", 40)),
+        # Step 2 — individual accounts
+        "accounts": _accounts_from_advanced(adv_accounts),
+        # Step 3
+        "has_ss": float(p.get("social_security_benefit", 0)) > 0,
+        "ss_benefit": float(p.get("social_security_benefit", 24000)),
+        "ss_start_age": int(p.get("social_security_start_age", 67)),
+        "spouse_ss_benefit": float(p.get("spouse_ss_benefit", 0)),
+        "spouse_ss_start_age": int(p.get("spouse_ss_start_age", 67)),
+        "has_pension": False,
+        "pension": 0.0,
+        "has_rental": rental_total > 0,
+        "rental_income": float(rental_total),
+        # Step 4
+        "spending_mode": "dollar",
+        "spending_pct": 80,
+        "spending_dollar": int(spend_target),
+        "current_income": current_income,
+        "investment_style": "Moderate",
+    }
+
+
 def _init_wizard():
-    if "wizard" not in st.session_state:
-        p = st.session_state.get("profile", {})
-        accts = st.session_state.get("accounts", [])
-        total_savings = sum(a.get("balance", 0) for a in accts)
-        total_contrib = sum(a.get("annual_contribution", 0) for a in accts)
-        st.session_state.wizard = {
-            # Step 1
-            "current_age": int(p.get("current_age", 40)),
-            "retirement_age": int(p.get("retirement_age", 65)),
-            "life_expectancy": int(p.get("life_expectancy", 90)),
-            "married": p.get("filing_status") == "married_filing_jointly",
-            "spouse_age": int(p.get("spouse_age", 40)),
-            # Step 2
-            "total_savings": float(total_savings or 200000),
-            "split_savings": False,
-            "trad_savings": float(total_savings or 200000),
-            "roth_savings": 0.0,
-            "other_savings": 0.0,
-            "annual_savings": float(total_contrib or 15000),
-            # Step 3
-            "has_ss": True,
-            "ss_benefit": float(p.get("social_security_benefit", 24000)),
-            "ss_start_age": int(p.get("social_security_start_age", 67)),
-            "spouse_ss_benefit": float(p.get("spouse_ss_benefit", 0)),
-            "spouse_ss_start_age": int(p.get("spouse_ss_start_age", 67)),
-            "has_pension": False,
-            "pension": 0.0,
-            "has_rental": False,
-            "rental_income": 0.0,
-            # Step 4
-            "spending_mode": "pct",
-            "spending_pct": 80,
-            "spending_dollar": int(p.get("current_income", 100000) * 0.80) or 70000,
-            "current_income": float(p.get("current_income", 100000)),
-            "investment_style": "Moderate",
-        }
+    needs_sync = st.session_state.pop("wizard_needs_sync", False)
+    if "wizard" not in st.session_state or needs_sync:
+        st.session_state.wizard = _build_wizard_from_state()
+        st.session_state.wizard_step = 1
+        st.session_state.wizard_complete = False
     if "wizard_step" not in st.session_state:
         st.session_state.wizard_step = 1
     if "wizard_complete" not in st.session_state:
@@ -138,25 +207,24 @@ def _build_simple_plan(w: dict, extra_savings: float = 0.0,
     }
 
     accounts = []
-    if w["split_savings"]:
-        if w["trad_savings"] > 0:
-            accounts.append(_make_acct("Tax-Deferred (401k/IRA)", "traditional_401k",
-                                       w["trad_savings"], w["annual_savings"], return_rate))
-        if w["roth_savings"] > 0:
-            accounts.append(_make_acct("Roth Savings", "roth_ira",
-                                       w["roth_savings"], 0.0, return_rate, basis=w["roth_savings"]))
-        if w["other_savings"] > 0:
-            accounts.append(_make_acct("Other Investments", "taxable",
-                                       w["other_savings"], 0.0, return_rate,
-                                       basis=w["other_savings"] * 0.7))
-        if not accounts:
-            accounts.append(_make_acct("Retirement Savings", "traditional_401k",
-                                       w["total_savings"], w["annual_savings"] + extra_savings, return_rate))
-        else:
-            accounts[0]["annual_contribution"] += extra_savings
-    else:
-        accounts.append(_make_acct("Retirement Savings", "traditional_401k",
-                                   w["total_savings"], w["annual_savings"] + extra_savings, return_rate))
+    first_investable = True
+    for wa in w.get("accounts", []):
+        acct_type = _SIMPLE_TO_ADV_TYPE.get(wa["type_simple"], "traditional_401k")
+        basis = (
+            wa["balance"] if acct_type == "roth_ira"
+            else wa["balance"] * 0.7 if acct_type == "taxable"
+            else 0.0
+        )
+        contrib = wa["annual_contribution"]
+        if first_investable and extra_savings:
+            contrib += extra_savings
+            first_investable = False
+        accounts.append(_make_acct(
+            wa["name"], acct_type, wa["balance"], contrib,
+            return_rate, basis=basis, acct_id=wa["id"],
+        ))
+        if first_investable:
+            first_investable = False
 
     if w.get("has_rental") and w.get("rental_income", 0) > 0:
         accounts.append({
@@ -207,9 +275,9 @@ def _build_simple_plan(w: dict, extra_savings: float = 0.0,
     return profile, assumptions, accounts, rc
 
 
-def _make_acct(name, acct_type, balance, contribution, return_rate, basis=0.0):
+def _make_acct(name, acct_type, balance, contribution, return_rate, basis=0.0, acct_id=None):
     return {
-        "id": f"simple_{acct_type}",
+        "id": acct_id or f"simple_{acct_type}_{uuid.uuid4().hex[:6]}",
         "name": name,
         "type": acct_type,
         "balance": float(balance),
@@ -219,7 +287,7 @@ def _make_acct(name, acct_type, balance, contribution, return_rate, basis=0.0):
         "return_rate": float(return_rate),
         "employer_match_percent": 0.0,
         "employer_match_limit": 0.0,
-        "qualified_dividend_yield": 0.0 if acct_type != "taxable" else 0.015,
+        "qualified_dividend_yield": 0.015 if acct_type == "taxable" else 0.0,
         "ordinary_income_yield": 0.0,
         "net_annual_rental_income": 0.0,
         "use_global_return_rate": False,
@@ -313,42 +381,63 @@ def _step1():
 
 def _step2():
     w = st.session_state.wizard
-    st.subheader("Step 2 — Your Savings")
-
-    st.caption("Add up all your retirement accounts: 401(k), IRA, Roth IRA, and investment accounts.")
-    w["total_savings"] = float(st.number_input(
-        "Total retirement savings today ($)", 0, 10_000_000,
-        int(w["total_savings"]), 10000, key="wiz_total_sav"
-    ))
-
-    w["split_savings"] = st.toggle(
-        "Split by account type (optional — helps accuracy)",
-        value=w["split_savings"], key="wiz_split"
+    st.subheader("Step 2 — Your Accounts")
+    st.caption(
+        "Enter each of your retirement and investment accounts. "
+        "Include 401(k), IRA, Roth IRA, brokerage, and bank accounts."
     )
-    if w["split_savings"]:
-        st.caption("Enter your balance in each bucket. They should add up to your total above.")
-        cs1, cs2, cs3 = st.columns(3)
-        w["trad_savings"] = float(cs1.number_input(
-            "Tax-deferred (401k/IRA) ($)", 0, 10_000_000, int(w["trad_savings"]), 10000, key="wiz_trad"
-        ))
-        w["roth_savings"] = float(cs2.number_input(
-            "Roth / tax-free ($)", 0, 10_000_000, int(w["roth_savings"]), 10000, key="wiz_roth"
-        ))
-        w["other_savings"] = float(cs3.number_input(
-            "Taxable brokerage / other ($)", 0, 10_000_000, int(w["other_savings"]), 10000, key="wiz_other"
-        ))
-        entered_total = w["trad_savings"] + w["roth_savings"] + w["other_savings"]
-        if abs(entered_total - w["total_savings"]) > 1000:
-            st.warning(f"Split total (${entered_total:,.0f}) differs from total savings (${w['total_savings']:,.0f}).")
 
-    w["annual_savings"] = float(st.number_input(
-        "How much are you saving for retirement each year? ($)",
-        0, 200000, int(w["annual_savings"]), 500,
-        help="Include your contributions plus any employer match.",
-        key="wiz_ann_sav"
-    ))
+    accts = w.setdefault("accounts", [])
+    to_delete = None
 
-    if _nav_buttons(2, next_label="Next →"):
+    for i, a in enumerate(accts):
+        with st.container(border=True):
+            c_name, c_type, c_del = st.columns([3, 3, 1])
+            a["name"] = c_name.text_input("Account name", a["name"], key=f"wiz_aname_{i}")
+            type_labels = list(_SIMPLE_TYPE_LABELS.keys())
+            cur_idx = type_labels.index(a["type_simple"]) if a["type_simple"] in type_labels else 0
+            chosen = c_type.selectbox(
+                "Type",
+                type_labels,
+                index=cur_idx,
+                format_func=lambda k: _SIMPLE_TYPE_LABELS[k],
+                key=f"wiz_atype_{i}",
+            )
+            a["type_simple"] = chosen
+            c_del.write("")
+            c_del.write("")
+            if c_del.button("✕", key=f"wiz_adel_{i}", help="Remove this account"):
+                to_delete = i
+
+            c_bal, c_contrib = st.columns(2)
+            a["balance"] = float(c_bal.number_input(
+                "Current balance ($)", 0, 10_000_000, int(a["balance"]), 1000, key=f"wiz_abal_{i}"
+            ))
+            a["annual_contribution"] = float(c_contrib.number_input(
+                "Annual contribution ($)", 0, 200_000, int(a["annual_contribution"]), 500,
+                help="Your contributions + any employer match",
+                key=f"wiz_acontrib_{i}",
+            ))
+
+    if to_delete is not None:
+        accts.pop(to_delete)
+        st.rerun()
+
+    if st.button("+ Add Account", key="wiz_add_acct"):
+        accts.append({
+            "id": f"simple_{uuid.uuid4().hex[:8]}",
+            "name": f"Account {len(accts) + 1}",
+            "type_simple": "tax_deferred",
+            "balance": 0.0,
+            "annual_contribution": 0.0,
+        })
+        st.rerun()
+
+    if not accts:
+        st.warning("Add at least one account to continue.")
+
+    can_next = len(accts) > 0
+    if _nav_buttons(2, can_next=can_next, next_label="Next →"):
         st.session_state.wizard_step = 3
         st.rerun()
 
@@ -461,10 +550,19 @@ def _step5_review():
         else float(w["spending_dollar"])
     )
 
+    total_savings = sum(a["balance"] for a in w.get("accounts", []))
+    total_contrib = sum(a["annual_contribution"] for a in w.get("accounts", []))
+    acct_lines = "\n".join(
+        f"  - **{a['name']}** ({_SIMPLE_TYPE_LABELS.get(a['type_simple'], a['type_simple'])}): "
+        f"${a['balance']:,.0f} balance, ${a['annual_contribution']:,.0f}/yr"
+        for a in w.get("accounts", [])
+    )
+
     st.markdown(f"""
 **Based on what you told us:**
 - You'll retire at **{w['retirement_age']}** with a plan running to age **{w['life_expectancy']}**
-- Current savings: **${w['total_savings']:,.0f}**, saving **${w['annual_savings']:,.0f}/year**
+- Total savings: **${total_savings:,.0f}** across {len(w.get('accounts', []))} account(s), contributing **${total_contrib:,.0f}/year**
+{acct_lines}
 - Social Security: **${w['ss_benefit']:,.0f}/year** starting at **{w['ss_start_age']}**
 {f"- Spouse SS: **${w['spouse_ss_benefit']:,.0f}/year**" if w['married'] and w['has_ss'] else ""}
 {f"- Pension: **${w['pension']:,.0f}/year**" if w.get('has_pension') and w.get('pension',0) > 0 else ""}

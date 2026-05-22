@@ -111,6 +111,8 @@ DEFAULT_ROTH_CONVERSION = {
 
 
 def _init_state():
+    if "ui_mode" not in st.session_state:
+        st.session_state.ui_mode = "simple" if not list_scenarios() else "advanced"
     if "profile" not in st.session_state:
         # Auto-load the last explicitly used scenario on first run / page refresh
         recent = get_last_used_scenario()
@@ -137,8 +139,6 @@ def _init_state():
         st.session_state.roth_conversion = DEFAULT_ROTH_CONVERSION.copy()
     if "spending_overrides" not in st.session_state:
         st.session_state.spending_overrides = {}
-    if "ui_mode" not in st.session_state:
-        st.session_state.ui_mode = "simple" if not list_scenarios() else "advanced"
     # Set chk_global_* keys from account dicts so the checkbox renders correctly.
     # Uses chk_global_ prefix (not a_*) so these keys are never deleted by
     # _apply_pending_load's deletion loop, avoiding the delete-then-set problem.
@@ -741,6 +741,7 @@ def main():
         )
         if mode_choice == "Simple" and st.session_state.ui_mode != "simple":
             st.session_state.ui_mode = "simple"
+            st.session_state.wizard_needs_sync = True
             st.rerun()
         elif mode_choice == "Advanced" and st.session_state.ui_mode != "advanced":
             st.session_state.ui_mode = "advanced"
