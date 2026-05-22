@@ -8,7 +8,11 @@ import pandas as pd
 
 from projections import project_accumulation
 from withdrawals import simulate_retirement
+from montecarlo_v2 import run_monte_carlo_v2
 from constants import RMD_START_AGE
+
+_MC_TRIALS = 500  # fast enough for auto-run; user can't adjust in simple mode
+_MC_STOCK_PCT = {"Conservative": 0.30, "Moderate": 0.60, "Aggressive": 0.85}
 
 # ---------------------------------------------------------------------------
 # Expert defaults applied silently in simplified mode
@@ -300,9 +304,24 @@ def _run_projection(profile, assumptions, accounts, rc):
         for a in accts_at_ret:
             a["use_global_return_rate"] = False
         ret_df, summary = simulate_retirement(accts_at_ret, profile, assumptions, rc, {})
-        return acc_df, ret_df, summary
+        return acc_df, ret_df, summary, accts_at_ret
     except Exception as e:
-        return pd.DataFrame(), pd.DataFrame(), {"error": str(e)}
+        return pd.DataFrame(), pd.DataFrame(), {"error": str(e)}, []
+
+
+def _run_mc(accts_at_ret: list, profile: dict, assumptions: dict, style: str) -> dict:
+    if not accts_at_ret:
+        return {}
+    stock_pct = _MC_STOCK_PCT.get(style, 0.60)
+    try:
+        return run_monte_carlo_v2(
+            accts_at_ret, profile, assumptions,
+            n_runs=_MC_TRIALS,
+            stock_pct=stock_pct,
+            seed=42,
+        )
+    except Exception:
+        return {}
 
 
 def _compute_score(ret_df, summary, profile):
@@ -615,80 +634,206 @@ def _score_color(score: int) -> tuple[str, str, str]:
     return "#fed7d7", "#9b2c2c", "At Risk"
 
 
-def _render_score_card(score: int, surplus: float, profile: dict, depletion_age):
+def _render_score_card(score: int, surplus: float, profile: dict, depletion_age, mc_result: dict):
     bg, fg, label = _score_color(score)
     le = profile["life_expectancy"]
-    ret = profile["retirement_age"]
 
     if depletion_age:
         detail = (
-            f"Your portfolio runs out at age **{depletion_age}** — "
+            f"Median projection: portfolio runs out at age **{depletion_age}** — "
             f"{le - depletion_age} years short of your plan."
         )
     elif surplus > 0:
-        detail = f"You have a projected **${surplus:,.0f} surplus** remaining at age {le}."
+        detail = f"Median projection: **${surplus:,.0f} surplus** remaining at age {le}."
     else:
-        detail = f"Your portfolio lasts through age {le}."
+        detail = f"Median projection: portfolio lasts through age {le}."
 
     display_score = min(score, 100)
+    mc_pct = int(mc_result.get("success_rate", 0) * 100) if mc_result else None
+
+    mc_color = (
+        "#276749" if mc_pct and mc_pct >= 85 else
+        "#744210" if mc_pct and mc_pct >= 70 else
+        "#9b2c2c" if mc_pct else "#718096"
+    )
 
     st.markdown(
         f"""
         <div style="background:{bg};border-radius:16px;padding:1.5rem 2rem;
-                    text-align:center;margin-bottom:1rem;">
-            <div style="font-size:0.9rem;color:{fg};font-weight:600;
-                        letter-spacing:0.05em;text-transform:uppercase;">
-                Your Retirement Score
+                    margin-bottom:1rem;display:flex;align-items:center;gap:2rem;
+                    flex-wrap:wrap;">
+            <div style="flex:1;min-width:160px;text-align:center;">
+                <div style="font-size:0.85rem;color:{fg};font-weight:600;
+                            letter-spacing:0.05em;text-transform:uppercase;">
+                    Retirement Score
+                </div>
+                <div style="font-size:3.5rem;font-weight:800;color:{fg};line-height:1.1;">
+                    {display_score}%
+                </div>
+                <div style="font-size:1.1rem;font-weight:700;color:{fg};">
+                    {label}
+                </div>
             </div>
-            <div style="font-size:4rem;font-weight:800;color:{fg};line-height:1.1;">
-                {display_score}%
-            </div>
-            <div style="font-size:1.3rem;font-weight:700;color:{fg};">
-                {label}
-            </div>
+            {f'''<div style="flex:1;min-width:160px;text-align:center;
+                        border-left:2px solid {fg}33;padding-left:2rem;">
+                <div style="font-size:0.85rem;color:{mc_color};font-weight:600;
+                            letter-spacing:0.05em;text-transform:uppercase;">
+                    Market Scenarios
+                </div>
+                <div style="font-size:3.5rem;font-weight:800;color:{mc_color};line-height:1.1;">
+                    {mc_pct}%
+                </div>
+                <div style="font-size:1.1rem;font-weight:700;color:{mc_color};">
+                    of 500 simulations succeed
+                </div>
+            </div>''' if mc_pct is not None else ''}
         </div>
         """,
         unsafe_allow_html=True,
     )
-    st.markdown(detail)
+    st.caption(detail)
 
 
-def _render_portfolio_curve(acc_df, ret_df, profile):
+def _render_spending_summary(ret_df: pd.DataFrame, profile: dict, assumptions: dict):
+    if ret_df.empty:
+        return
+
+    inflation = _SIMPLE_DEFAULTS["inflation_rate"]
+    years_to_ret = max(0, profile["retirement_age"] - profile["current_age"])
+    spending_today = assumptions["annual_spending_target"]
+    spending_nominal_yr1 = spending_today * (1 + inflation) ** years_to_ret
+
+    row1 = ret_df.iloc[0]
+    after_tax_yr1 = float(row1["after_tax_spending"])
+    ss_yr1 = float(row1["ss_income"])
+    rental_yr1 = float(row1["rental_income"])
+    portfolio_yr1 = max(0.0, after_tax_yr1 - ss_yr1 - rental_yr1)
+
+    st.subheader("What You Can Spend")
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "Your spending goal",
+        f"${spending_today:,.0f}/yr",
+        help="In today's dollars — what you entered in the wizard",
+    )
+    c2.metric(
+        f"In retirement (age {profile['retirement_age']})",
+        f"${spending_nominal_yr1:,.0f}/yr",
+        help=f"Same purchasing power in future (nominal) dollars after {years_to_ret} years of inflation",
+    )
+    c3.metric(
+        "After-tax spending (year 1)",
+        f"${after_tax_yr1:,.0f}/yr",
+        help="Actual after-tax cash — what the simulation shows you'll receive after taxes",
+    )
+
+    # Income breakdown bar for year 1
+    if after_tax_yr1 > 0:
+        trad_w = float(row1.get("traditional_withdrawal", 0))
+        roth_w = float(row1.get("roth_withdrawal", 0))
+        taxable_w = float(row1.get("taxable_withdrawal", 0)) + float(row1.get("bank_withdrawal", 0))
+
+        sources = {
+            "Social Security": ss_yr1,
+            "Tax-Deferred Accts": trad_w,
+            "Roth Accounts": roth_w,
+            "Taxable / Other": taxable_w,
+            "Pension / Rental": rental_yr1,
+        }
+        sources = {k: v for k, v in sources.items() if v > 1}
+
+        if sources:
+            colors = {
+                "Social Security":   "#48bb78",
+                "Tax-Deferred Accts": "#2b6cb0",
+                "Roth Accounts":     "#805ad5",
+                "Taxable / Other":   "#ed8936",
+                "Pension / Rental":  "#38b2ac",
+            }
+            fig = go.Figure()
+            for name, val in sources.items():
+                fig.add_trace(go.Bar(
+                    name=name, x=["Year 1 income sources"], y=[val],
+                    marker_color=colors.get(name, "#718096"),
+                    hovertemplate=f"{name}: ${{y:,.0f}}<extra></extra>",
+                ))
+            fig.update_layout(
+                barmode="stack", height=100,
+                margin=dict(l=0, r=0, t=0, b=0),
+                yaxis=dict(tickprefix="$", tickformat=",.0f", title=None),
+                xaxis=dict(title=None, showticklabels=False),
+                legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0),
+                plot_bgcolor="white", paper_bgcolor="white",
+                showlegend=True,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_portfolio_curve(acc_df, ret_df, profile, mc_result: dict):
     st.subheader("Will My Money Last?")
-    ages, balances = [], []
-
+    acc_ages, acc_bals = [], []
     if not acc_df.empty:
         for age_val, grp in acc_df.groupby("age"):
-            ages.append(int(age_val))
-            balances.append(float(grp["balance"].sum()))
+            acc_ages.append(int(age_val))
+            acc_bals.append(float(grp["balance"].sum()))
 
+    ret_ages, ret_bals = [], []
     if not ret_df.empty:
         for _, row in ret_df.iterrows():
-            ages.append(int(row["age"]))
-            balances.append(float(row["total_portfolio"]))
+            ret_ages.append(int(row["age"]))
+            ret_bals.append(float(row["total_portfolio"]))
 
-    if not ages:
+    if not acc_ages and not ret_ages:
         st.info("No projection data available.")
         return
 
     fig = go.Figure()
-    colors = [
-        "#2b6cb0" if b > 0 else "#e53e3e"
-        for b in balances
-    ]
-    fig.add_trace(go.Scatter(
-        x=ages, y=balances,
-        mode="lines",
-        fill="tozeroy",
-        fillcolor="rgba(43,108,176,0.15)",
-        line=dict(color="#2b6cb0", width=2.5),
-        name="Portfolio Balance",
-        hovertemplate="Age %{x}: $%{y:,.0f}<extra></extra>",
-    ))
-    fig.add_hline(y=0, line_dash="dash", line_color="#e53e3e", line_width=1.5,
-                  annotation_text="$0", annotation_position="right")
-
     ret_age = profile["retirement_age"]
+
+    # MC fan bands (retirement phase only)
+    if mc_result and "ages" in mc_result and "percentiles" in mc_result:
+        mc_ages = mc_result["ages"]
+        p10 = mc_result["percentiles"]["10"]
+        p90 = mc_result["percentiles"]["90"]
+        p50 = mc_result["percentiles"]["50"]
+        fig.add_trace(go.Scatter(
+            x=mc_ages + mc_ages[::-1],
+            y=p90 + p10[::-1],
+            fill="toself",
+            fillcolor="rgba(43,108,176,0.12)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name="10–90th percentile",
+            hoverinfo="skip",
+        ))
+        fig.add_trace(go.Scatter(
+            x=mc_ages, y=p50,
+            mode="lines",
+            line=dict(color="#2b6cb0", width=1.5, dash="dot"),
+            name="Median scenario",
+            hovertemplate="Age %{x} (median): $%{y:,.0f}<extra></extra>",
+        ))
+
+    # Accumulation phase
+    if acc_ages:
+        fig.add_trace(go.Scatter(
+            x=acc_ages, y=acc_bals,
+            mode="lines",
+            line=dict(color="#48bb78", width=2.5),
+            name="Accumulation",
+            hovertemplate="Age %{x}: $%{y:,.0f}<extra></extra>",
+        ))
+
+    # Deterministic retirement path
+    if ret_ages:
+        fig.add_trace(go.Scatter(
+            x=ret_ages, y=ret_bals,
+            mode="lines",
+            line=dict(color="#2b6cb0", width=2.5),
+            name="Expected path",
+            hovertemplate="Age %{x}: $%{y:,.0f}<extra></extra>",
+        ))
+
+    fig.add_hline(y=0, line_dash="dash", line_color="#e53e3e", line_width=1.5)
     fig.add_vline(x=ret_age, line_dash="dot", line_color="#718096",
                   annotation_text=f"Retire ({ret_age})", annotation_position="top right")
 
@@ -697,7 +842,7 @@ def _render_portfolio_curve(acc_df, ret_df, profile):
         margin=dict(l=0, r=0, t=10, b=0),
         yaxis=dict(tickprefix="$", tickformat=",.0f", title=None),
         xaxis=dict(title="Age"),
-        showlegend=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         plot_bgcolor="white",
         paper_bgcolor="white",
     )
@@ -707,51 +852,61 @@ def _render_portfolio_curve(acc_df, ret_df, profile):
 def _render_income_sources(ret_df, profile):
     if ret_df.empty:
         return
-    st.subheader("Where Will My Income Come From?")
+    st.subheader("Income by Source, by Decade")
 
     ret_age = profile["retirement_age"]
     le = profile["life_expectancy"]
 
-    decades = []
+    series = {
+        "Tax-Deferred Accts": [],
+        "Roth Accounts":      [],
+        "Taxable / Other":    [],
+        "Social Security":    [],
+        "Pension / Rental":   [],
+    }
+    decade_labels = []
+
     for start in range(ret_age, le, 10):
         end = min(start + 10, le + 1)
-        label = f"Age {start}s" if end - start > 5 else f"Age {start}–{end-1}"
         mask = (ret_df["age"] >= start) & (ret_df["age"] < end)
         chunk = ret_df[mask]
         if chunk.empty:
             continue
-        ss = chunk["ss_income"].mean()
-        rental = chunk["rental_income"].mean()
-        portfolio = chunk["after_tax_spending"].mean() - ss - rental
-        portfolio = max(0.0, portfolio)
-        decades.append({"label": label, "ss": ss, "rental": rental, "portfolio": portfolio})
+        label = f"{start}–{end - 1}"
+        decade_labels.append(label)
+        series["Tax-Deferred Accts"].append(chunk["traditional_withdrawal"].mean())
+        series["Roth Accounts"].append(chunk["roth_withdrawal"].mean())
+        series["Taxable / Other"].append(
+            chunk["taxable_withdrawal"].mean() + chunk["bank_withdrawal"].mean()
+        )
+        series["Social Security"].append(chunk["ss_income"].mean())
+        series["Pension / Rental"].append(chunk["rental_income"].mean())
 
-    if not decades:
+    if not decade_labels:
         return
 
-    labels = [d["label"] for d in decades]
+    colors = {
+        "Tax-Deferred Accts": "#2b6cb0",
+        "Roth Accounts":      "#805ad5",
+        "Taxable / Other":    "#ed8936",
+        "Social Security":    "#48bb78",
+        "Pension / Rental":   "#38b2ac",
+    }
     fig = go.Figure()
-    fig.add_trace(go.Bar(
-        name="Portfolio", x=labels, y=[d["portfolio"] for d in decades],
-        marker_color="#2b6cb0",
-        hovertemplate="%{y:$,.0f}<extra>Portfolio</extra>",
-    ))
-    fig.add_trace(go.Bar(
-        name="Social Security", x=labels, y=[d["ss"] for d in decades],
-        marker_color="#48bb78",
-        hovertemplate="%{y:$,.0f}<extra>Social Security</extra>",
-    ))
-    fig.add_trace(go.Bar(
-        name="Other Income", x=labels, y=[d["rental"] for d in decades],
-        marker_color="#ed8936",
-        hovertemplate="%{y:$,.0f}<extra>Other Income</extra>",
-    ))
+    for name, vals in series.items():
+        if max(vals, default=0) < 1:
+            continue
+        fig.add_trace(go.Bar(
+            name=name, x=decade_labels, y=vals,
+            marker_color=colors[name],
+            hovertemplate=f"{name}: ${{y:,.0f}}<extra></extra>",
+        ))
     fig.update_layout(
         barmode="stack",
         height=280,
         margin=dict(l=0, r=0, t=10, b=0),
-        yaxis=dict(tickprefix="$", tickformat=",.0f", title=None),
-        xaxis=dict(title=None),
+        yaxis=dict(tickprefix="$", tickformat=",.0f", title="Annual (avg)"),
+        xaxis=dict(title="Age range"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         plot_bgcolor="white",
         paper_bgcolor="white",
@@ -784,7 +939,7 @@ def _render_levers(base_score: int, base_surplus: float, base_depletion, profile
             retirement_age_delta=ret_delta,
             spending_delta=-float(spend_delta),
         )
-        _, ret_df_adj, summary_adj = _run_projection(profile_adj, assumptions_adj, accounts_adj, rc_adj)
+        _, ret_df_adj, summary_adj, _ = _run_projection(profile_adj, assumptions_adj, accounts_adj, rc_adj)
         new_score, new_surplus = _compute_score(ret_df_adj, summary_adj, profile_adj)
         delta = new_score - base_score
         sign = "+" if delta >= 0 else ""
@@ -841,7 +996,7 @@ def run_simplified_mode():
 
     w = st.session_state.wizard
     profile, assumptions, accounts, rc = _build_simple_plan(w)
-    acc_df, ret_df, summary = _run_projection(profile, assumptions, accounts, rc)
+    acc_df, ret_df, summary, accts_at_ret = _run_projection(profile, assumptions, accounts, rc)
 
     if "error" in summary:
         st.error(f"Projection error: {summary['error']}")
@@ -851,18 +1006,26 @@ def run_simplified_mode():
             st.rerun()
         return
 
+    with st.spinner("Running market simulations…"):
+        mc_result = _run_mc(accts_at_ret, profile, assumptions, w.get("investment_style", "Moderate"))
+
     score, surplus = _compute_score(ret_df, summary, profile)
     depletion = summary.get("portfolio_depleted_age")
 
     # ── Panel 1: Score card ────────────────────────────────────────────────
-    _render_score_card(score, surplus, profile, depletion)
+    _render_score_card(score, surplus, profile, depletion, mc_result)
 
     st.divider()
 
-    # ── Panels 2 & 3 side-by-side ─────────────────────────────────────────
+    # ── Panel 2: Spending summary ──────────────────────────────────────────
+    _render_spending_summary(ret_df, profile, assumptions)
+
+    st.divider()
+
+    # ── Panels 3 & 4 side-by-side ─────────────────────────────────────────
     col_left, col_right = st.columns([3, 2])
     with col_left:
-        _render_portfolio_curve(acc_df, ret_df, profile)
+        _render_portfolio_curve(acc_df, ret_df, profile, mc_result)
     with col_right:
         _render_income_sources(ret_df, profile)
 
