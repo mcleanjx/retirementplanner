@@ -793,9 +793,9 @@ def _render_portfolio_curve(acc_df, ret_df, profile, mc_result: dict):
     # MC fan bands (retirement phase only)
     if mc_result and "ages" in mc_result and "percentiles" in mc_result:
         mc_ages = mc_result["ages"]
-        p10 = mc_result["percentiles"]["10"]
-        p90 = mc_result["percentiles"]["90"]
-        p50 = mc_result["percentiles"]["50"]
+        p10 = mc_result["percentiles"][10]
+        p90 = mc_result["percentiles"][90]
+        p50 = mc_result["percentiles"][50]
         fig.add_trace(go.Scatter(
             x=mc_ages + mc_ages[::-1],
             y=p90 + p10[::-1],
