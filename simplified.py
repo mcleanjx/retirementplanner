@@ -941,6 +941,12 @@ def _render_balance_breakdown(acc_df, ret_df, profile, w):
         "taxable":      "#ed8936",
         "bank":         "#38b2ac",
     }
+    fill_colors = {
+        "tax_deferred": "rgba(43,108,176,0.6)",
+        "roth":         "rgba(128,90,213,0.6)",
+        "taxable":      "rgba(237,137,54,0.6)",
+        "bank":         "rgba(56,178,172,0.6)",
+    }
 
     # Accumulation phase — acc_df has account_type column
     acc_by_type: dict[str, dict[int, float]] = {}
@@ -992,7 +998,7 @@ def _render_balance_breakdown(acc_df, ret_df, profile, w):
             name=type_display[st_key],
             mode="lines",
             line=dict(color=colors[st_key], width=0.5),
-            fillcolor=colors[st_key] + "99",
+            fillcolor=fill_colors[st_key],
             hovertemplate=f"{type_display[st_key]}: ${{y:,.0f}}<extra></extra>",
         ))
 
