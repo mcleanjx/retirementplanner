@@ -2317,9 +2317,9 @@ class TestMathAuditDemoScenario:
     # -----------------------------------------------------------------------
     # Sanity bounds
     # -----------------------------------------------------------------------
-    def test_portfolio_depleted_at_age_86(self):
-        """Demo scenario should deplete at age 86 with current inputs."""
-        assert self.summary["portfolio_depleted_age"] == 86
+    def test_portfolio_depleted_at_age_87(self):
+        """Demo scenario should deplete at age 87 with current inputs."""
+        assert self.summary["portfolio_depleted_age"] == 87
 
     def test_effective_tax_rate_in_bounds(self):
         """Effective tax rate is between 0% and 60% for every simulation year."""

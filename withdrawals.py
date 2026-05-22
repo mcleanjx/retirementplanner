@@ -281,7 +281,10 @@ def simulate_retirement(
         conv_tax_estimate = 0.0
         if roth_conversion_amount > 0:
             rc = roth_conversion or {}
-            conv_rate = rc.get("target_bracket", 0.22) if rc.get("strategy", "fill_to_bracket") == "fill_to_bracket" else prev_eff_rate
+            # Use the higher of the target bracket and last year's effective rate so that
+            # rising rates (e.g. first year conversions start) don't under-fund the tax bill.
+            _rc_bracket = rc.get("target_bracket", 0.22) if rc.get("strategy", "fill_to_bracket") == "fill_to_bracket" else prev_eff_rate
+            conv_rate = max(_rc_bracket, prev_eff_rate)
             conv_tax_estimate = roth_conversion_amount * conv_rate
             total_spending_need += conv_tax_estimate
 
@@ -370,11 +373,15 @@ def simulate_retirement(
         roth_withdrawn = 0.0
         withdrawal_ltcg = 0.0
 
-        # 5_bank. Bank/cash accounts first (no tax cost, low return — drain first)
+        # 5_bank. Bank/cash accounts first (no tax cost, low return — drain first).
+        # Respect per-account bank_buffer: leave that amount untouched during planned
+        # funding so it stays available for the Step-6.5 correction.
         for a in sorted([a for a in accts if a["type"] in BANK_TYPES], key=lambda x: -x["balance"]):
             if remaining_need <= 0:
                 break
-            w, oi, lg = _withdraw_from(a, remaining_need)
+            _buf = a.get("bank_buffer", 0.0)
+            _avail = max(0.0, a["balance"] - _buf)
+            w, oi, lg = _withdraw_from(a, min(remaining_need, _avail))
             remaining_need -= w
             total_discretionary_withdrawn += w
             bank_withdrawn += w
@@ -559,6 +566,59 @@ def simulate_retirement(
                         })
                     break
 
+        # --- Step 6.5: Bank as two-way spending buffer (fixed-net mode only) ---
+        # The gross-up in Step 5 uses prev_eff_rate to estimate taxes; actual taxes
+        # differ because the income mix changes year to year (e.g. bank withdrawals
+        # carry zero taxable income, Roth is tax-free, etc.).  The bank account acts
+        # as a cash float that absorbs these estimation errors so that
+        # actual_after_tax_net always equals net_spending_target.
+        # Since bank is tax-free, adjusting it does not invalidate the computed taxes.
+        #
+        #  delta > 0  (over-provision): excess stays in bank instead of being spent.
+        #    · Reverse the bank withdrawal up to what was taken this step.
+        #    · Any remainder beyond bank_withdrawn is a net deposit (the household
+        #      saves lower-than-expected taxes on other-account withdrawals).
+        #  delta < 0  (under-provision): bank covers the shortfall up to its balance.
+        if fixed_net_mode and net_target_this_year is not None:
+            _spendable = total_cash_received - surplus_reinvested
+            _delta = (_spendable - taxes["total"] - hc_cost) - net_target_this_year
+            _bank_acc = next((a for a in accts if a["type"] in BANK_TYPES), None)
+
+            if _bank_acc and _delta > 1.0:
+                # Over-provision — save excess in bank.
+                # _reverse: portion that genuinely reverses the Step-5 bank withdrawal.
+                # _net_deposit: remainder from lower-than-expected taxes on other accounts.
+                # We route _net_deposit through surplus_reinvested so the row identity
+                # (total_cash - surplus - taxes == after_tax_spending) remains intact.
+                _reverse = min(_delta, bank_withdrawn)
+                _net_deposit = _delta - _reverse
+                _bank_acc["balance"] += _delta
+                withdrawal_detail[_bank_acc["name"]] = (
+                    withdrawal_detail.get(_bank_acc["name"], 0.0) - _reverse
+                )
+                total_cash_received           -= _reverse
+                bank_withdrawn                -= _reverse
+                total_discretionary_withdrawn -= _reverse
+                surplus_reinvested            += _net_deposit
+
+            elif _bank_acc and _delta < -1.0:
+                # Under-provision — draw from bank to cover shortfall.
+                # Do NOT recalculate surplus_reinvested here: surplus was already computed
+                # and deposited before this step. Re-running max(0, cash - need) would
+                # absorb the bank draw into a larger surplus, cancelling the correction.
+                # Note: the buffer restricts planned (Step 5) withdrawals only; the
+                # correction draw may temporarily reduce the bank below the buffer floor,
+                # but over-provisions in subsequent years rebuild it above the floor.
+                _draw = min(abs(_delta), _bank_acc["balance"])
+                if _draw > 0:
+                    _bank_acc["balance"] -= _draw
+                    withdrawal_detail[_bank_acc["name"]] = (
+                        withdrawal_detail.get(_bank_acc["name"], 0.0) + _draw
+                    )
+                    total_cash_received           += _draw
+                    bank_withdrawn                += _draw
+                    total_discretionary_withdrawn += _draw
+
         # --- Step 7: Apply returns, inflate, advance ---
         for a in accts:
             always_own = a["type"] in {"rental_property", "bank"}
@@ -589,7 +649,11 @@ def simulate_retirement(
         actual_after_tax_net = after_tax_spending - hc_cost
 
         # Update effective rate against spendable cash (not total) for next year's gross-up.
-        prev_eff_rate = max(0.05, taxes["total"] / max(1.0, spendable_cash))
+        # Don't let the rate drop more than 20 % per year — a bank-heavy year can
+        # push the blended rate close to 0 %, which then causes large under-provisions
+        # the following year when withdrawals shift back to taxable sources.
+        _computed_rate = max(0.05, taxes["total"] / max(1.0, spendable_cash))
+        prev_eff_rate = max(_computed_rate, prev_eff_rate * 0.80)
         # Update LTCG rate separately so dividend-heavy portfolios aren't over-grossed.
         if ltcg_income > 0:
             prev_ltcg_rate = min(0.25, taxes["federal_ltcg"] / max(1.0, ltcg_income))
