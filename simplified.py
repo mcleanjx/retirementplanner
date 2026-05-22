@@ -950,8 +950,8 @@ def _render_balance_breakdown(acc_df, ret_df, profile, w):
             if simple is None:
                 continue
             age = int(row["age"])
-            acc_by_type.setdefault(simple, {})[age] = \
-                acc_by_type[simple].get(age, 0.0) + float(row["balance"])
+            bucket = acc_by_type.setdefault(simple, {})
+            bucket[age] = bucket.get(age, 0.0) + float(row["balance"])
 
     # Retirement phase — ret_df has bal_{name} columns
     ret_by_type: dict[str, dict[int, float]] = {}
@@ -961,10 +961,10 @@ def _render_balance_breakdown(acc_df, ret_df, profile, w):
             if col not in ret_df.columns:
                 continue
             simple = wa["type_simple"]
+            bucket = ret_by_type.setdefault(simple, {})
             for _, row in ret_df.iterrows():
                 age = int(row["age"])
-                ret_by_type.setdefault(simple, {})[age] = \
-                    ret_by_type[simple].get(age, 0.0) + float(row.get(col, 0))
+                bucket[age] = bucket.get(age, 0.0) + float(row.get(col, 0))
 
     all_types = set(acc_by_type) | set(ret_by_type)
     if not all_types:
