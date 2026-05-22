@@ -45,6 +45,7 @@ the blended return equals port_mean (= ret_return or account's own rate).
 import copy
 import numpy as np
 from constants import RMD_TABLE, RMD_START_AGE
+from taxes import calculate_year_taxes, calculate_ss_taxable_amount
 
 TRADITIONAL_TYPES = {"traditional_401k", "traditional_ira"}
 ROTH_TYPES = {"roth_401k", "roth_ira"}
@@ -111,6 +112,11 @@ def _mc_single_run_v2(
     swr = assumptions.get("safe_withdrawal_rate", 0.04)
     spending_mode = assumptions.get("spending_mode", "swr")
     filing_status = profile["filing_status"]
+    state = profile.get("state", "other")
+    state_rate = profile.get("state_tax_rate", 0.0)
+    bracket_inflation = assumptions.get("bracket_inflation_rate", 0.025)
+    current_age = profile.get("current_age", profile["retirement_age"])
+    current_fs = filing_status
 
     total_start = sum(a["balance"] for a in accts)
     years_to_ret = profile["retirement_age"] - profile["current_age"]
@@ -144,6 +150,7 @@ def _mc_single_run_v2(
 
     for t, age in enumerate(range(retirement_age, life_expectancy + 1)):
         spouse_age = age + spouse_age_offset if filing_status == "married_filing_jointly" else None
+        bracket_factor = (1 + bracket_inflation) ** (age - current_age)
 
         if (
             not survivor_triggered
@@ -152,6 +159,7 @@ def _mc_single_run_v2(
             and spouse_age >= profile.get("life_expectancy", 90)
         ):
             survivor_triggered = True
+            current_fs = "single"
             ss_benefit = max(ss_benefit, spouse_ss)
             spouse_ss = 0.0
             spending *= 1 - survivor_reduction
@@ -168,6 +176,12 @@ def _mc_single_run_v2(
             a.get("net_annual_rental_income", 0.0)
             for a in accts if a["type"] == "rental_property"
         )
+
+        num_medicare = 0
+        if age >= 65:
+            num_medicare += 1
+        if current_fs == "married_filing_jointly" and spouse_age is not None and spouse_age >= 65:
+            num_medicare += 1
 
         # Guyton-Klinger guardrails: adjust discretionary spending before withdrawing.
         # Compare the planned net portfolio draw to the initial retirement withdrawal rate.
@@ -189,14 +203,22 @@ def _mc_single_run_v2(
 
         net_from_portfolio = max(0.0, spending + hc_cost - total_ss - rental)
 
+        # --- Pass 1: RMDs (mandatory) + spending withdrawals ---
+        rmd_total = 0.0
         for a in accts:
             if a["type"] in TRADITIONAL_TYPES and age >= RMD_START_AGE:
                 div = _rmd_divisor(age)
                 rmd = min(a["balance"] / div if div > 0 else 0.0, a["balance"])
                 a["balance"] = max(0.0, a["balance"] - rmd)
                 net_from_portfolio = max(0.0, net_from_portfolio - rmd)
+                rmd_total += rmd
 
         remaining = net_from_portfolio
+        bank_drawn = 0.0
+        taxable_drawn = 0.0
+        traditional_drawn = 0.0
+        roth_drawn = 0.0
+        withdrawal_ltcg = 0.0
         for bucket in [BANK_TYPES, TAXABLE_TYPES, TRADITIONAL_TYPES, ROTH_TYPES]:
             for a in sorted(
                 [a for a in accts if a["type"] in bucket], key=lambda x: -x["balance"]
@@ -206,6 +228,57 @@ def _mc_single_run_v2(
                 w = min(remaining, a["balance"])
                 a["balance"] = max(0.0, a["balance"] - w)
                 remaining -= w
+                if a["type"] in BANK_TYPES:
+                    bank_drawn += w
+                elif a["type"] in TAXABLE_TYPES:
+                    bal_before = a["balance"] + w
+                    basis = a.get("basis", 0.0)
+                    gr = max(0.0, min(1.0, (bal_before - basis) / bal_before)) if bal_before > 0 else 0.0
+                    ltcg = w * gr
+                    withdrawal_ltcg += ltcg
+                    a["basis"] = max(0.0, basis - w * (1.0 - gr))
+                    taxable_drawn += w
+                elif a["type"] in TRADITIONAL_TYPES:
+                    traditional_drawn += w
+                elif a["type"] in ROTH_TYPES:
+                    roth_drawn += w
+
+        # --- Tax computation ---
+        # Ordinary income = RMDs + discretionary traditional + rental + taxable SS portion.
+        # LTCG = realized gains from taxable withdrawals.
+        ordinary_pretax_ss = rmd_total + traditional_drawn + rental
+        provisional = ordinary_pretax_ss + 0.5 * total_ss
+        ss_taxable = calculate_ss_taxable_amount(provisional, total_ss, current_fs)
+        ordinary_income = ordinary_pretax_ss + ss_taxable
+        ltcg_income = withdrawal_ltcg
+
+        taxes_dict = calculate_year_taxes(
+            ordinary_income=ordinary_income,
+            ltcg_income=ltcg_income,
+            filing_status=current_fs,
+            state=state,
+            age=age,
+            spouse_age=None,
+            num_medicare_eligible=num_medicare,
+            ss_income=total_ss,
+            state_tax_rate=state_rate,
+            net_investment_income=withdrawal_ltcg + rental,
+            ss_taxable_amount=ss_taxable,
+            bracket_factor=bracket_factor,
+        )
+        total_taxes = taxes_dict["total"]
+
+        # --- Pass 2: withdraw tax bill from portfolio (same bucket order) ---
+        tax_remaining = total_taxes
+        for bucket in [BANK_TYPES, TAXABLE_TYPES, TRADITIONAL_TYPES, ROTH_TYPES]:
+            for a in sorted(
+                [a for a in accts if a["type"] in bucket], key=lambda x: -x["balance"]
+            ):
+                if tax_remaining <= 0:
+                    break
+                w = min(tax_remaining, a["balance"])
+                a["balance"] = max(0.0, a["balance"] - w)
+                tax_remaining -= w
 
         # Log-normal correlated returns
         for a in accts:
