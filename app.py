@@ -1519,13 +1519,13 @@ def main():
 
         mc_model = st.radio(
             "Return model",
-            ["Standard (Normal)", "CMA Log-Normal (Advanced)"],
+            ["CMA Log-Normal (Advanced)", "Standard (Normal)"],
             horizontal=True,
             key="mc_model",
             help=(
-                "Standard: independent normal draws per account, single volatility parameter. "
                 "CMA Log-Normal: log-normal returns with correlated equity/bond factors, "
-                "stochastic inflation, and CMA-calibrated default volatilities."
+                "stochastic inflation, and CMA-calibrated default volatilities. "
+                "Standard: independent normal draws per account, single volatility parameter."
             ),
         )
         use_v2 = mc_model.startswith("CMA")
@@ -1572,7 +1572,7 @@ def main():
                 ) / 100.0
             with n_col:
                 mc_n = int(st.number_input(
-                    "Trials", min_value=100, max_value=5000, value=1000, step=100, key="mc_n",
+                    "Trials", min_value=100, max_value=10000, value=1000, step=100, key="mc_n",
                 ))
         else:
             vol_col, n_col = st.columns([3, 1])
@@ -1587,7 +1587,7 @@ def main():
                 ) / 100.0
             with n_col:
                 mc_n = int(st.number_input(
-                    "Trials", min_value=100, max_value=5000, value=1000, step=100, key="mc_n",
+                    "Trials", min_value=100, max_value=10000, value=1000, step=100, key="mc_n",
                 ))
 
         mc_stock_pct = st.slider(
