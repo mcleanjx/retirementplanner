@@ -13,6 +13,7 @@ import plotly.graph_objects as go
 import optimizer as _opt
 from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking, get_last_used_scenario, set_last_used_scenario
 from constants import RMD_START_AGE
+from simplified import run_simplified_mode
 
 st.set_page_config(page_title="Retirement Planner", layout="wide")
 
@@ -136,6 +137,8 @@ def _init_state():
         st.session_state.roth_conversion = DEFAULT_ROTH_CONVERSION.copy()
     if "spending_overrides" not in st.session_state:
         st.session_state.spending_overrides = {}
+    if "ui_mode" not in st.session_state:
+        st.session_state.ui_mode = "simple" if not list_scenarios() else "advanced"
     # Set chk_global_* keys from account dicts so the checkbox renders correctly.
     # Uses chk_global_ prefix (not a_*) so these keys are never deleted by
     # _apply_pending_load's deletion loop, avoiding the delete-then-set problem.
@@ -691,38 +694,64 @@ def sidebar_scenarios():
 # ---------------------------------------------------------------------------
 
 def main():
-    st.markdown(
-        """
-        <div style="
-            border-radius: 12px;
-            padding: 1.1rem 1.6rem;
-            margin-bottom: 1rem;
-            background: linear-gradient(135deg, #1a365d 0%, #2b6cb0 60%, #3182ce 100%);
-            box-shadow: 0 4px 16px rgba(49, 130, 206, 0.25);
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-        ">
-            <div style="font-size: 2rem; line-height: 1;">📈</div>
-            <div>
-                <div style="
-                    font-size: 1.55rem;
-                    font-weight: 800;
-                    color: #ffffff;
-                    letter-spacing: -0.01em;
-                    line-height: 1.15;
-                ">Retirement Planner</div>
-                <div style="
-                    font-size: 0.82rem;
-                    color: rgba(255,255,255,0.72);
-                    margin-top: 0.15rem;
-                    letter-spacing: 0.01em;
-                ">Model investment accounts · project growth · optimize tax-efficient withdrawals</div>
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr_left, hdr_right = st.columns([5, 1])
+    with hdr_left:
+        st.markdown(
+            """
+            <div style="
+                border-radius: 12px;
+                padding: 1.1rem 1.6rem;
+                margin-bottom: 1rem;
+                background: linear-gradient(135deg, #1a365d 0%, #2b6cb0 60%, #3182ce 100%);
+                box-shadow: 0 4px 16px rgba(49, 130, 206, 0.25);
+                display: flex;
+                align-items: center;
+                gap: 1rem;
+            ">
+                <div style="font-size: 2rem; line-height: 1;">📈</div>
+                <div>
+                    <div style="
+                        font-size: 1.55rem;
+                        font-weight: 800;
+                        color: #ffffff;
+                        letter-spacing: -0.01em;
+                        line-height: 1.15;
+                    ">Retirement Planner</div>
+                    <div style="
+                        font-size: 0.82rem;
+                        color: rgba(255,255,255,0.72);
+                        margin-top: 0.15rem;
+                        letter-spacing: 0.01em;
+                    ">Model investment accounts · project growth · optimize tax-efficient withdrawals</div>
+                </div>
             </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            """,
+            unsafe_allow_html=True,
+        )
+    with hdr_right:
+        st.write("")  # vertical spacing
+        mode_choice = st.radio(
+            "Mode",
+            ["Simple", "Advanced"],
+            index=0 if st.session_state.ui_mode == "simple" else 1,
+            horizontal=False,
+            key="mode_radio",
+            label_visibility="collapsed",
+        )
+        if mode_choice == "Simple" and st.session_state.ui_mode != "simple":
+            st.session_state.ui_mode = "simple"
+            st.rerun()
+        elif mode_choice == "Advanced" and st.session_state.ui_mode != "advanced":
+            st.session_state.ui_mode = "advanced"
+            st.rerun()
+
+    # ── Simple mode ───────────────────────────────────────────────────────────
+    if st.session_state.ui_mode == "simple":
+        run_simplified_mode()
+        return
+
+    # ── Advanced mode below ────────────────────────────────────────────────────
 
     # First-run onboarding banner — shown when no scenarios have been saved yet
     if not list_scenarios() and not st.session_state.get("onboarding_dismissed"):
