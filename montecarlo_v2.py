@@ -60,6 +60,11 @@ DEFAULT_EQUITY_BOND_CORR = 0.10
 EQUITY_RISK_PREMIUM = 0.030  # equity expected return above bond expected return
 INFLATION_VOL = 0.015        # std dev of annual inflation draws
 
+# CAPE-adjustment constants (Shiller earnings-yield model)
+HISTORICAL_MEDIAN_CAPE = 16.6   # Shiller 1871-2025 median
+REAL_EARNINGS_GROWTH = 0.015    # long-run real EPS growth (historical ~1.5%)
+CAPE_REVERSION_YEARS = 10       # years over which CAPE-implied return reverts to long-run mean
+
 
 def _rmd_divisor(age: int) -> float:
     if age < RMD_START_AGE:
@@ -91,6 +96,27 @@ def _equity_bond_means(stock_pct: float, target_return: float) -> tuple[float, f
     return equity_mean, bond_mean
 
 
+def _cape_adjusted_equity_mean(
+    t: int,
+    base_equity_mean: float,
+    current_cape: float,
+    inflation_mean: float,
+) -> float:
+    """
+    Shiller earnings-yield model: near-term equity expected return =
+      1/CAPE + real_earnings_growth + inflation
+    Linearly reverts to base_equity_mean over CAPE_REVERSION_YEARS.
+    Only applied when CAPE is above its historical median.
+    """
+    if current_cape <= HISTORICAL_MEDIAN_CAPE or t >= CAPE_REVERSION_YEARS:
+        return base_equity_mean
+    cape_implied = 1.0 / current_cape + REAL_EARNINGS_GROWTH + inflation_mean
+    if cape_implied >= base_equity_mean:
+        return base_equity_mean
+    weight = t / CAPE_REVERSION_YEARS
+    return (1.0 - weight) * cape_implied + weight * base_equity_mean
+
+
 def _mc_single_run_v2(
     accts: list[dict],
     profile: dict,
@@ -104,6 +130,8 @@ def _mc_single_run_v2(
     crash_magnitude: float,
     stock_pct: float,
     withdrawal_mode: str = "constant_real",
+    use_cape_adj: bool = False,
+    current_cape: float = 39.6,
 ) -> tuple[list[float], int | None]:
     retirement_age = profile["retirement_age"]
     life_expectancy = profile["life_expectancy"]
@@ -299,6 +327,8 @@ def _mc_single_run_v2(
                     else ret_return
                 )
                 eq_mean, bd_mean = _equity_bond_means(stock_pct, port_mean)
+                if use_cape_adj:
+                    eq_mean = _cape_adjusted_equity_mean(t, eq_mean, current_cape, inflation_mean)
                 eq_log_mu = np.log(max(1e-6, 1.0 + eq_mean)) - 0.5 * equity_vol ** 2
                 bd_log_mu = np.log(max(1e-6, 1.0 + bd_mean)) - 0.5 * bond_vol ** 2
                 eq_r = float(np.exp(eq_log_mu + equity_vol * equity_zs[t]) - 1.0)
@@ -336,6 +366,8 @@ def run_monte_carlo_v2(
     crash_magnitude: float = 0.20,
     stock_pct: float = 0.60,
     withdrawal_mode: str = "constant_real",
+    use_cape_adj: bool = False,
+    current_cape: float = 39.6,
     seed: int | None = None,
 ) -> dict:
     rng = np.random.default_rng(seed)
@@ -368,6 +400,8 @@ def run_monte_carlo_v2(
             equity_vol, bond_vol,
             crash_years, crash_magnitude, stock_pct,
             withdrawal_mode,
+            use_cape_adj=use_cape_adj,
+            current_cape=current_cape,
         )
         all_runs.append(bal_series)
         if dep_age is not None:
@@ -395,4 +429,6 @@ def run_monte_carlo_v2(
         "crash_magnitude": crash_magnitude,
         "stock_pct": stock_pct,
         "withdrawal_mode": withdrawal_mode,
+        "use_cape_adj": use_cape_adj,
+        "current_cape": current_cape if use_cape_adj else None,
     }
