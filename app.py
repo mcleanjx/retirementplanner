@@ -654,6 +654,55 @@ def _do_save(name: str) -> None:
             a["owner"] = s[f"a_owner_{aid}"]
         if f"a_buf_{aid}" in s:
             a["bank_buffer"] = float(s[f"a_buf_{aid}"])
+    # Sync assumption widget keys back to the dict, mirroring the account sync
+    # above. Widgets inside a collapsed expander don't re-execute, so the dict
+    # can lag behind the session_state keys Streamlit preserves across reruns.
+    # The annual_spending_target is especially prone: it only renders when
+    # spending_mode == "fixed", so a collapsed expander leaves it stale.
+    s = st.session_state
+    a = s.assumptions
+    if "a_spend_mode" in s:
+        a["spending_mode"] = s["a_spend_mode"]
+    if "a_spend_target" in s:
+        a["annual_spending_target"] = float(s["a_spend_target"])
+    if "a_swr" in s:
+        a["safe_withdrawal_rate"] = float(s["a_swr"]) / 100.0
+    if "a_inf" in s:
+        a["inflation_rate"] = float(s["a_inf"]) / 100.0
+    if "a_bracket_inf" in s:
+        a["bracket_inflation_rate"] = float(s["a_bracket_inf"]) / 100.0
+    if "a_ret" in s:
+        a["retirement_return_rate"] = float(s["a_ret"]) / 100.0
+    if "a_withdraw_strat" in s:
+        a["withdrawal_strategy"] = s["a_withdraw_strat"]
+    # Same for profile fields that live inside collapsible sections.
+    p = s.profile
+    if "p_age" in s:
+        p["current_age"] = int(s["p_age"])
+    if "p_ret" in s:
+        p["retirement_age"] = int(s["p_ret"])
+    if "p_le" in s:
+        p["life_expectancy"] = int(s["p_le"])
+    if "p_income" in s:
+        p["current_income"] = float(s["p_income"])
+    if "p_ss" in s:
+        p["social_security_benefit"] = float(s["p_ss"])
+    if "p_ss_age" in s:
+        p["social_security_start_age"] = int(s["p_ss_age"])
+    if "p_sp_age" in s:
+        p["spouse_age"] = int(s["p_sp_age"])
+    if "p_sp_ret" in s:
+        p["spouse_retirement_age"] = int(s["p_sp_ret"])
+    if "p_sp_ss" in s:
+        p["spouse_ss_benefit"] = float(s["p_sp_ss"])
+    if "p_sp_ss_age" in s:
+        p["spouse_ss_start_age"] = int(s["p_sp_ss_age"])
+    if "p_hc_pre" in s:
+        p["pre_medicare_healthcare"] = float(s["p_hc_pre"])
+    if "p_hc_post" in s:
+        p["post_medicare_healthcare"] = float(s["p_hc_post"])
+    if "p_surv" in s:
+        p["survivor_spending_reduction"] = float(s["p_surv"]) / 100.0
     save_scenario(
         name,
         st.session_state.profile,
