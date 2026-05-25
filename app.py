@@ -11,7 +11,7 @@ import montecarlo as _mc
 import montecarlo_v2 as _mc2
 import plotly.graph_objects as go
 import optimizer as _opt
-from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking, get_last_used_scenario, set_last_used_scenario
+from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking, get_last_used_scenario, set_last_used_scenario, validate_scenario_name
 from constants import RMD_START_AGE
 
 st.set_page_config(page_title="Retirement Planner", layout="wide")
@@ -716,7 +716,13 @@ def _do_save(name: str) -> None:
 def sidebar_scenarios():
     with st.sidebar.expander("💾 Scenarios", expanded=False):
         name = st.text_input("Scenario Name", "My Scenario", key="sc_name")
-        if st.button("Save", key="sc_save"):
+        try:
+            validate_scenario_name(name)
+            _sc_name_valid = True
+        except ValueError as _ve:
+            _sc_name_valid = False
+            st.caption(f"⚠️ {_ve}")
+        if st.button("Save", key="sc_save", disabled=not _sc_name_valid):
             try:
                 _do_save(name)
                 st.success(f"Saved '{name}'")
@@ -800,12 +806,19 @@ def main():
         f"<div style='font-size:1rem;font-weight:600;margin-bottom:0.75rem;'>{sc_display}</div>",
         unsafe_allow_html=True,
     )
-    if _sb_save_col.button("💾 Save", key="sc_quicksave", help=f"Save '{sc_display}'", use_container_width=True):
+    try:
+        validate_scenario_name(sc_display)
+        _name_valid = True
+    except ValueError:
+        _name_valid = False
+    if _sb_save_col.button("💾 Save", key="sc_quicksave", help=f"Save '{sc_display}'", width='stretch', disabled=not _name_valid):
         try:
             _do_save(sc_display)
             st.sidebar.success("Saved ✓", icon="💾")
         except Exception as e:
             st.sidebar.error(str(e))
+    if not _name_valid:
+        st.sidebar.caption("⚠️ Scenario name contains invalid characters. Use only letters, numbers, spaces, hyphens, and underscores.")
     sidebar_profile()
     sidebar_assumptions()
     sidebar_accounts()
@@ -815,6 +828,31 @@ def main():
     profile = st.session_state.profile
     assumptions = st.session_state.assumptions
     accounts = st.session_state.accounts
+
+    # Sync widget keys → dicts. Widgets inside collapsed expanders don't
+    # re-execute each render, so the dicts can lag behind the session_state
+    # keys Streamlit always preserves. Doing this here (before any
+    # calculations) ensures spending_mode, spending_target, and other
+    # assumptions are always current regardless of expander state.
+    _s = st.session_state
+    if "a_spend_mode" in _s:
+        assumptions["spending_mode"] = _s["a_spend_mode"]
+    if "a_spend_target" in _s:
+        assumptions["annual_spending_target"] = float(_s["a_spend_target"])
+    if "a_swr" in _s:
+        assumptions["safe_withdrawal_rate"] = float(_s["a_swr"]) / 100.0
+    if "a_inf" in _s:
+        assumptions["inflation_rate"] = float(_s["a_inf"]) / 100.0
+    if "a_bracket_inf" in _s:
+        assumptions["bracket_inflation_rate"] = float(_s["a_bracket_inf"]) / 100.0
+    if "a_ret" in _s:
+        assumptions["retirement_return_rate"] = float(_s["a_ret"]) / 100.0
+    if "a_withdraw_strat" in _s:
+        assumptions["withdrawal_strategy"] = _s["a_withdraw_strat"]
+    if "p_hc_pre" in _s:
+        profile["pre_medicare_healthcare"] = float(_s["p_hc_pre"])
+    if "p_hc_post" in _s:
+        profile["post_medicare_healthcare"] = float(_s["p_hc_post"])
     roth_conversion = st.session_state.roth_conversion
 
     spending_overrides = st.session_state.spending_overrides
@@ -1031,7 +1069,7 @@ def main():
                         f"${_cmp_result['lifetime_healthcare']:,.0f}",
                     ],
                 }
-                st.dataframe(pd.DataFrame(_cmp_table), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_cmp_table), width='stretch', hide_index=True)
 
     def _kpi_bar():
         st.markdown(
@@ -1056,10 +1094,10 @@ def main():
         _kpi_bar()
         if profile["retirement_age"] <= profile["current_age"]:
             st.info("Already retired — no accumulation phase. See the Retirement tab for projections.")
-            st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), use_container_width=True)
+            st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), width='stretch')
         else:
-            st.plotly_chart(_charts.chart_accumulation(acc_df), use_container_width=True)
-            st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), use_container_width=True)
+            st.plotly_chart(_charts.chart_accumulation(acc_df), width='stretch')
+            st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), width='stretch')
 
             if acc_df["tax_drag"].sum() > 0:
                 total_drag = acc_df.groupby("age")["tax_drag"].sum().sum()
@@ -1069,10 +1107,10 @@ def main():
         _kpi_bar()
         _cur_age = profile["current_age"]
         _ret_age = profile["retirement_age"]
-        st.plotly_chart(_charts.chart_drawdown(ret_df, accounts_at_retirement, assumptions.get("inflation_rate", 0.03), _cur_age, _ret_age), use_container_width=True)
-        st.plotly_chart(_charts.chart_spending_coverage(ret_df, _cur_age, _ret_age), use_container_width=True)
-        st.plotly_chart(_charts.chart_annual_income(ret_df, assumptions.get("inflation_rate", 0.03), _ret_age, _cur_age), use_container_width=True)
-        st.plotly_chart(_charts.chart_tax_burden(ret_df, _cur_age, _ret_age), use_container_width=True)
+        st.plotly_chart(_charts.chart_drawdown(ret_df, accounts_at_retirement, assumptions.get("inflation_rate", 0.03), _cur_age, _ret_age), width='stretch')
+        st.plotly_chart(_charts.chart_spending_coverage(ret_df, _cur_age, _ret_age), width='stretch')
+        st.plotly_chart(_charts.chart_annual_income(ret_df, assumptions.get("inflation_rate", 0.03), _ret_age, _cur_age), width='stretch')
+        st.plotly_chart(_charts.chart_tax_burden(ret_df, _cur_age, _ret_age), width='stretch')
 
     with tab3:
         fixed_net_mode = assumptions.get("spending_mode") == "fixed"
@@ -1129,7 +1167,7 @@ def main():
         edited = st.data_editor(
             editor_df,
             column_config=col_config,
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             num_rows="fixed",
         )
@@ -1152,10 +1190,13 @@ def main():
 
     with tab4:
         st.subheader("Accumulation Year-by-Year")
-        acc_pivot = acc_df.pivot_table(
-            index="age", columns="account_name", values="balance", aggfunc="sum"
-        ).reset_index()
-        st.dataframe(acc_pivot.style.format("${:,.0f}", subset=acc_pivot.columns[1:]), use_container_width=True)
+        if acc_df.empty:
+            st.info("No accumulation phase — already retired.")
+        else:
+            acc_pivot = acc_df.pivot_table(
+                index="age", columns="account_name", values="balance", aggfunc="sum"
+            ).reset_index()
+            st.dataframe(acc_pivot.style.format("${:,.0f}", subset=acc_pivot.columns[1:]), width='stretch')
 
         st.subheader("Retirement Account Balances")
         bal_cols = ["age"] + [c for c in ret_df.columns if c.startswith("bal_")] + ["total_portfolio"]
@@ -1169,7 +1210,7 @@ def main():
         bal_df = bal_df.rename(columns=col_rename)
         bal_df["Age"] = bal_df["Age"].astype(int)
         dollar_cols = [c for c in bal_df.columns if c != "Age"]
-        st.dataframe(bal_df.style.format("${:,.0f}", subset=dollar_cols), use_container_width=True)
+        st.dataframe(bal_df.style.format("${:,.0f}", subset=dollar_cols), width='stretch')
 
         st.subheader("Retirement Year-by-Year")
         # Withdrawal % = gross spending need / start-of-year portfolio.
@@ -1217,7 +1258,7 @@ def main():
         styled = _display_df[display_cols].style.format(fmt, na_rep="-")
         if "net_spending_delta" in display_cols:
             styled = styled.map(_color_delta, subset=["net_spending_delta"])
-        st.dataframe(styled, use_container_width=True)
+        st.dataframe(styled, width='stretch')
 
     with tab5:
         scenario_name = st.session_state.get("sc_name", "My Scenario")
@@ -1381,7 +1422,7 @@ def main():
             if checkins:
                 st.plotly_chart(
                     _charts.chart_progress_tracking(baseline["projections_by_age"], checkins),
-                    use_container_width=True,
+                    width='stretch',
                 )
 
                 st.subheader("Check-in History")
@@ -1425,7 +1466,7 @@ def main():
                             }
                             st.dataframe(
                                 df_acc.style.format(fmt_acc, na_rep="—"),
-                                use_container_width=True,
+                                width='stretch',
                                 hide_index=True,
                             )
                         elif c["by_account"]:
@@ -1437,7 +1478,7 @@ def main():
                             ]
                             st.dataframe(
                                 pd.DataFrame(rows_ret).style.format({"Actual": "${:,.0f}"}),
-                                use_container_width=True,
+                                width='stretch',
                                 hide_index=True,
                             )
 
@@ -1451,7 +1492,7 @@ def main():
             else:
                 st.plotly_chart(
                     _charts.chart_progress_tracking(baseline["projections_by_age"], []),
-                    use_container_width=True,
+                    width='stretch',
                 )
                 st.info("No check-ins recorded yet. Enter actual balances above to compare against the plan.")
         else:
@@ -1810,7 +1851,7 @@ def main():
                         "Plan needs revision — save more, spend less, or retire later",
                     ],
                 })
-                st.dataframe(bench_df, use_container_width=True, hide_index=True)
+                st.dataframe(bench_df, width='stretch', hide_index=True)
                 st.caption(
                     "**10th percentile portfolio at life expectancy**: if this is above $0, your plan "
                     "survives even unlucky market sequences. A 90%+ success rate *and* a positive 10th "
@@ -1819,10 +1860,10 @@ def main():
 
             st.plotly_chart(
                 _charts.chart_monte_carlo(mc_result, det_portfolio),
-                use_container_width=True,
+                width='stretch',
             )
             if mc_result["n_depleted"] > 0:
-                st.plotly_chart(_charts.chart_mc_depletion(mc_result), use_container_width=True)
+                st.plotly_chart(_charts.chart_mc_depletion(mc_result), width='stretch')
         else:
             st.info("Configure your plan in the sidebar, then click **▶ Run Monte Carlo** to see results.")
 
@@ -1854,7 +1895,7 @@ def main():
             )
             st.plotly_chart(
                 _charts.chart_mc_comparison(mc_v1, mc_v2, det_portfolio),
-                use_container_width=True,
+                width='stretch',
             )
 
     with tab8:
@@ -1968,7 +2009,7 @@ def main():
                     "—",
                 ],
             }
-            st.dataframe(pd.DataFrame(comparison_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(comparison_data), width='stretch', hide_index=True)
 
             # Plain-English explanation of why the optimized strategy wins
             _why_parts = []
@@ -2044,7 +2085,7 @@ def main():
 
                 st.dataframe(
                     actions_df.style.format(act_fmt, na_rep="—").apply(_actions_style, axis=None),
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                 )
 
@@ -2056,7 +2097,7 @@ def main():
             desc_df = pd.DataFrame(
                 [{"Setting": k, "Recommended Value": v} for k, v in desc.items()]
             )
-            st.dataframe(desc_df, use_container_width=True, hide_index=True)
+            st.dataframe(desc_df, width='stretch', hide_index=True)
 
             # --- Account balances by year ---
             st.divider()
@@ -2066,7 +2107,7 @@ def main():
                 dollar_bal_cols = [c for c in bal_df_opt.columns if c != "Age"]
                 st.dataframe(
                     bal_df_opt.style.format("${:,.0f}", subset=dollar_bal_cols),
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                 )
 
@@ -2096,7 +2137,7 @@ def main():
             opt_fmt["withdrawal_pct"] = "{:.2%}"
             st.dataframe(
                 _opt_display[opt_detail_cols].style.format(opt_fmt, na_rep="—"),
-                use_container_width=True,
+                width='stretch',
             )
 
             # --- Score distribution ---
@@ -2124,7 +2165,7 @@ def main():
                     height=300,
                     margin=dict(t=40, b=30),
                 )
-                st.plotly_chart(score_fig, use_container_width=True)
+                st.plotly_chart(score_fig, width='stretch')
                 st.caption(
                     f"Orange dashed = baseline ({base['score']:,.0f}). "
                     f"Green dashed = best found ({best['score']:,.0f}). "
@@ -2197,7 +2238,7 @@ def main():
         _edited_accts = st.data_editor(
             _acct_df,
             column_config=_acct_col_cfg,
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             num_rows="fixed",
             key="acct_table_editor",
