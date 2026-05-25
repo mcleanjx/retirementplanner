@@ -43,11 +43,25 @@ def set_last_used_scenario(name: str) -> None:
     _LAST_USED_FILE.write_text(name, encoding="utf-8")
 
 
+_VALID_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-")
+
+
+def validate_scenario_name(name: str) -> None:
+    """Raise ValueError if name contains characters not allowed in scenario names."""
+    if not name or not name.strip():
+        raise ValueError("Scenario name cannot be empty.")
+    bad = sorted(set(c for c in name if c not in _VALID_NAME_CHARS))
+    if bad:
+        raise ValueError(
+            f"Scenario name contains invalid characters: {' '.join(repr(c) for c in bad)}. "
+            "Use only letters, numbers, spaces, hyphens, and underscores."
+        )
+
+
 def save_scenario(name: str, profile: dict, assumptions: dict, accounts: list[dict], roth_conversion: dict | None = None) -> None:
     _ensure_dir()
-    safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip()
-    if not safe_name:
-        raise ValueError("Scenario name cannot be empty.")
+    validate_scenario_name(name)
+    safe_name = name.strip()
     path = SCENARIOS_DIR / f"{safe_name}.json"
     payload = {
         "scenario_name": name,
@@ -60,7 +74,10 @@ def save_scenario(name: str, profile: dict, assumptions: dict, accounts: list[di
 
 
 def load_scenario(name: str) -> dict:
-    path = SCENARIOS_DIR / f"{name}.json"
+    safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip()
+    path = SCENARIOS_DIR / f"{safe}.json"
+    if not path.exists():
+        path = SCENARIOS_DIR / f"{name}.json"
     if not path.exists():
         raise FileNotFoundError(f"Scenario '{name}' not found.")
     data = json.loads(path.read_text(encoding="utf-8"))

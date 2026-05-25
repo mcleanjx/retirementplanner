@@ -11,7 +11,7 @@ import montecarlo as _mc
 import montecarlo_v2 as _mc2
 import plotly.graph_objects as go
 import optimizer as _opt
-from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking, get_last_used_scenario, set_last_used_scenario
+from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking, get_last_used_scenario, set_last_used_scenario, validate_scenario_name
 from constants import RMD_START_AGE
 
 st.set_page_config(page_title="Retirement Planner", layout="wide")
@@ -57,7 +57,7 @@ DEFAULT_ASSUMPTIONS = {
     "inflation_rate": 0.03,
     "bracket_inflation_rate": 0.025,
     "safe_withdrawal_rate": 0.04,
-    "retirement_return_rate": 0.05,
+    "retirement_return_rate": 0.065,
     "spending_mode": "swr",
     "annual_spending_target": 80000.0,
     "withdrawal_strategy": "tax_efficient",
@@ -180,7 +180,7 @@ def _apply_pending_load():
     _asmp = data["assumptions"]
     st.session_state["a_inf"]          = float(round(_asmp.get("inflation_rate", 0.03) * 100, 1))
     st.session_state["a_bracket_inf"]  = float(round(_asmp.get("bracket_inflation_rate", 0.025) * 100, 1))
-    st.session_state["a_ret"]          = float(round(_asmp.get("retirement_return_rate", 0.05) * 100, 1))
+    st.session_state["a_ret"]          = float(round(_asmp.get("retirement_return_rate", 0.065) * 100, 1))
     st.session_state["a_spend_mode"]   = _asmp.get("spending_mode", "swr")
     st.session_state["a_swr"]          = float(round(_asmp.get("safe_withdrawal_rate", 0.04) * 100, 1))
     st.session_state["a_spend_target"] = int(_asmp.get("annual_spending_target", 80000))
@@ -373,7 +373,12 @@ def sidebar_assumptions():
         ))
         st.caption("Annual rate at which bracket thresholds, standard deduction, NIIT/IRMAA limits, and state brackets grow. SS taxability thresholds are not indexed — bracket creep on SS is intentional.")
         a["retirement_return_rate"] = _dec(st.number_input("Retirement Return Rate — capital appreciation (%)", 0.0, 15.0, _pct(a["retirement_return_rate"]), 0.1, key="a_ret"))
-        st.caption("Applied to accounts set to 'use global rate'. Set this to total return minus dividend yield (e.g. 5% if portfolio returns 6.5% total and pays 1.5% dividends).")
+        st.caption(
+            "Applied to accounts set to 'use global rate'. "
+            "Default 6.5% reflects Shiller historical real equity total return of ~7.1–7.3% (1871–2025) less ~0.5–1% for a blended stock/bond portfolio. "
+            "If your portfolio pays meaningful dividends, reduce this by the yield (e.g. use 5.0% if total return is 6.5% and dividend yield is 1.5%). "
+            "Note: current CAPE (~39) is historically elevated, suggesting forward returns may be below the long-run average."
+        )
 
         st.markdown("**Income Needed in Retirement**")
         a["spending_mode"] = st.radio(
@@ -463,7 +468,7 @@ def sidebar_accounts():
                         key=f"chk_global_{a['id']}",
                     )
                     a["use_global_return_rate"] = use_global
-                    global_ret = st.session_state.assumptions.get("retirement_return_rate", 0.05)
+                    global_ret = st.session_state.assumptions.get("retirement_return_rate", 0.065)
                     if use_global:
                         st.caption(f"Retirement growth: {_pct(global_ret):.1f}% (global rate)")
                     else:
@@ -649,6 +654,55 @@ def _do_save(name: str) -> None:
             a["owner"] = s[f"a_owner_{aid}"]
         if f"a_buf_{aid}" in s:
             a["bank_buffer"] = float(s[f"a_buf_{aid}"])
+    # Sync assumption widget keys back to the dict, mirroring the account sync
+    # above. Widgets inside a collapsed expander don't re-execute, so the dict
+    # can lag behind the session_state keys Streamlit preserves across reruns.
+    # The annual_spending_target is especially prone: it only renders when
+    # spending_mode == "fixed", so a collapsed expander leaves it stale.
+    s = st.session_state
+    a = s.assumptions
+    if "a_spend_mode" in s:
+        a["spending_mode"] = s["a_spend_mode"]
+    if "a_spend_target" in s:
+        a["annual_spending_target"] = float(s["a_spend_target"])
+    if "a_swr" in s:
+        a["safe_withdrawal_rate"] = float(s["a_swr"]) / 100.0
+    if "a_inf" in s:
+        a["inflation_rate"] = float(s["a_inf"]) / 100.0
+    if "a_bracket_inf" in s:
+        a["bracket_inflation_rate"] = float(s["a_bracket_inf"]) / 100.0
+    if "a_ret" in s:
+        a["retirement_return_rate"] = float(s["a_ret"]) / 100.0
+    if "a_withdraw_strat" in s:
+        a["withdrawal_strategy"] = s["a_withdraw_strat"]
+    # Same for profile fields that live inside collapsible sections.
+    p = s.profile
+    if "p_age" in s:
+        p["current_age"] = int(s["p_age"])
+    if "p_ret" in s:
+        p["retirement_age"] = int(s["p_ret"])
+    if "p_le" in s:
+        p["life_expectancy"] = int(s["p_le"])
+    if "p_income" in s:
+        p["current_income"] = float(s["p_income"])
+    if "p_ss" in s:
+        p["social_security_benefit"] = float(s["p_ss"])
+    if "p_ss_age" in s:
+        p["social_security_start_age"] = int(s["p_ss_age"])
+    if "p_sp_age" in s:
+        p["spouse_age"] = int(s["p_sp_age"])
+    if "p_sp_ret" in s:
+        p["spouse_retirement_age"] = int(s["p_sp_ret"])
+    if "p_sp_ss" in s:
+        p["spouse_ss_benefit"] = float(s["p_sp_ss"])
+    if "p_sp_ss_age" in s:
+        p["spouse_ss_start_age"] = int(s["p_sp_ss_age"])
+    if "p_hc_pre" in s:
+        p["pre_medicare_healthcare"] = float(s["p_hc_pre"])
+    if "p_hc_post" in s:
+        p["post_medicare_healthcare"] = float(s["p_hc_post"])
+    if "p_surv" in s:
+        p["survivor_spending_reduction"] = float(s["p_surv"]) / 100.0
     save_scenario(
         name,
         st.session_state.profile,
@@ -662,7 +716,13 @@ def _do_save(name: str) -> None:
 def sidebar_scenarios():
     with st.sidebar.expander("💾 Scenarios", expanded=False):
         name = st.text_input("Scenario Name", "My Scenario", key="sc_name")
-        if st.button("Save", key="sc_save"):
+        try:
+            validate_scenario_name(name)
+            _sc_name_valid = True
+        except ValueError as _ve:
+            _sc_name_valid = False
+            st.caption(f"⚠️ {_ve}")
+        if st.button("Save", key="sc_save", disabled=not _sc_name_valid):
             try:
                 _do_save(name)
                 st.success(f"Saved '{name}'")
@@ -746,12 +806,19 @@ def main():
         f"<div style='font-size:1rem;font-weight:600;margin-bottom:0.75rem;'>{sc_display}</div>",
         unsafe_allow_html=True,
     )
-    if _sb_save_col.button("💾 Save", key="sc_quicksave", help=f"Save '{sc_display}'", use_container_width=True):
+    try:
+        validate_scenario_name(sc_display)
+        _name_valid = True
+    except ValueError:
+        _name_valid = False
+    if _sb_save_col.button("💾 Save", key="sc_quicksave", help=f"Save '{sc_display}'", width='stretch', disabled=not _name_valid):
         try:
             _do_save(sc_display)
             st.sidebar.success("Saved ✓", icon="💾")
         except Exception as e:
             st.sidebar.error(str(e))
+    if not _name_valid:
+        st.sidebar.caption("⚠️ Scenario name contains invalid characters. Use only letters, numbers, spaces, hyphens, and underscores.")
     sidebar_profile()
     sidebar_assumptions()
     sidebar_accounts()
@@ -761,6 +828,31 @@ def main():
     profile = st.session_state.profile
     assumptions = st.session_state.assumptions
     accounts = st.session_state.accounts
+
+    # Sync widget keys → dicts. Widgets inside collapsed expanders don't
+    # re-execute each render, so the dicts can lag behind the session_state
+    # keys Streamlit always preserves. Doing this here (before any
+    # calculations) ensures spending_mode, spending_target, and other
+    # assumptions are always current regardless of expander state.
+    _s = st.session_state
+    if "a_spend_mode" in _s:
+        assumptions["spending_mode"] = _s["a_spend_mode"]
+    if "a_spend_target" in _s:
+        assumptions["annual_spending_target"] = float(_s["a_spend_target"])
+    if "a_swr" in _s:
+        assumptions["safe_withdrawal_rate"] = float(_s["a_swr"]) / 100.0
+    if "a_inf" in _s:
+        assumptions["inflation_rate"] = float(_s["a_inf"]) / 100.0
+    if "a_bracket_inf" in _s:
+        assumptions["bracket_inflation_rate"] = float(_s["a_bracket_inf"]) / 100.0
+    if "a_ret" in _s:
+        assumptions["retirement_return_rate"] = float(_s["a_ret"]) / 100.0
+    if "a_withdraw_strat" in _s:
+        assumptions["withdrawal_strategy"] = _s["a_withdraw_strat"]
+    if "p_hc_pre" in _s:
+        profile["pre_medicare_healthcare"] = float(_s["p_hc_pre"])
+    if "p_hc_post" in _s:
+        profile["post_medicare_healthcare"] = float(_s["p_hc_post"])
     roth_conversion = st.session_state.roth_conversion
 
     spending_overrides = st.session_state.spending_overrides
@@ -977,7 +1069,7 @@ def main():
                         f"${_cmp_result['lifetime_healthcare']:,.0f}",
                     ],
                 }
-                st.dataframe(pd.DataFrame(_cmp_table), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_cmp_table), width='stretch', hide_index=True)
 
     def _kpi_bar():
         st.markdown(
@@ -1002,10 +1094,10 @@ def main():
         _kpi_bar()
         if profile["retirement_age"] <= profile["current_age"]:
             st.info("Already retired — no accumulation phase. See the Retirement tab for projections.")
-            st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), use_container_width=True)
+            st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), width='stretch')
         else:
-            st.plotly_chart(_charts.chart_accumulation(acc_df), use_container_width=True)
-            st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), use_container_width=True)
+            st.plotly_chart(_charts.chart_accumulation(acc_df), width='stretch')
+            st.plotly_chart(_charts.chart_composition_at_retirement(accounts_at_retirement), width='stretch')
 
             if acc_df["tax_drag"].sum() > 0:
                 total_drag = acc_df.groupby("age")["tax_drag"].sum().sum()
@@ -1015,10 +1107,10 @@ def main():
         _kpi_bar()
         _cur_age = profile["current_age"]
         _ret_age = profile["retirement_age"]
-        st.plotly_chart(_charts.chart_drawdown(ret_df, accounts_at_retirement, assumptions.get("inflation_rate", 0.03), _cur_age, _ret_age), use_container_width=True)
-        st.plotly_chart(_charts.chart_spending_coverage(ret_df, _cur_age, _ret_age), use_container_width=True)
-        st.plotly_chart(_charts.chart_annual_income(ret_df, assumptions.get("inflation_rate", 0.03), _ret_age, _cur_age), use_container_width=True)
-        st.plotly_chart(_charts.chart_tax_burden(ret_df, _cur_age, _ret_age), use_container_width=True)
+        st.plotly_chart(_charts.chart_drawdown(ret_df, accounts_at_retirement, assumptions.get("inflation_rate", 0.03), _cur_age, _ret_age), width='stretch')
+        st.plotly_chart(_charts.chart_spending_coverage(ret_df, _cur_age, _ret_age), width='stretch')
+        st.plotly_chart(_charts.chart_annual_income(ret_df, assumptions.get("inflation_rate", 0.03), _ret_age, _cur_age), width='stretch')
+        st.plotly_chart(_charts.chart_tax_burden(ret_df, _cur_age, _ret_age), width='stretch')
 
     with tab3:
         fixed_net_mode = assumptions.get("spending_mode") == "fixed"
@@ -1075,7 +1167,7 @@ def main():
         edited = st.data_editor(
             editor_df,
             column_config=col_config,
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             num_rows="fixed",
         )
@@ -1098,10 +1190,13 @@ def main():
 
     with tab4:
         st.subheader("Accumulation Year-by-Year")
-        acc_pivot = acc_df.pivot_table(
-            index="age", columns="account_name", values="balance", aggfunc="sum"
-        ).reset_index()
-        st.dataframe(acc_pivot.style.format("${:,.0f}", subset=acc_pivot.columns[1:]), use_container_width=True)
+        if acc_df.empty:
+            st.info("No accumulation phase — already retired.")
+        else:
+            acc_pivot = acc_df.pivot_table(
+                index="age", columns="account_name", values="balance", aggfunc="sum"
+            ).reset_index()
+            st.dataframe(acc_pivot.style.format("${:,.0f}", subset=acc_pivot.columns[1:]), width='stretch')
 
         st.subheader("Retirement Account Balances")
         bal_cols = ["age"] + [c for c in ret_df.columns if c.startswith("bal_")] + ["total_portfolio"]
@@ -1115,7 +1210,7 @@ def main():
         bal_df = bal_df.rename(columns=col_rename)
         bal_df["Age"] = bal_df["Age"].astype(int)
         dollar_cols = [c for c in bal_df.columns if c != "Age"]
-        st.dataframe(bal_df.style.format("${:,.0f}", subset=dollar_cols), use_container_width=True)
+        st.dataframe(bal_df.style.format("${:,.0f}", subset=dollar_cols), width='stretch')
 
         st.subheader("Retirement Year-by-Year")
         # Withdrawal % = gross spending need / start-of-year portfolio.
@@ -1163,7 +1258,7 @@ def main():
         styled = _display_df[display_cols].style.format(fmt, na_rep="-")
         if "net_spending_delta" in display_cols:
             styled = styled.map(_color_delta, subset=["net_spending_delta"])
-        st.dataframe(styled, use_container_width=True)
+        st.dataframe(styled, width='stretch')
 
     with tab5:
         scenario_name = st.session_state.get("sc_name", "My Scenario")
@@ -1327,7 +1422,7 @@ def main():
             if checkins:
                 st.plotly_chart(
                     _charts.chart_progress_tracking(baseline["projections_by_age"], checkins),
-                    use_container_width=True,
+                    width='stretch',
                 )
 
                 st.subheader("Check-in History")
@@ -1371,7 +1466,7 @@ def main():
                             }
                             st.dataframe(
                                 df_acc.style.format(fmt_acc, na_rep="—"),
-                                use_container_width=True,
+                                width='stretch',
                                 hide_index=True,
                             )
                         elif c["by_account"]:
@@ -1383,7 +1478,7 @@ def main():
                             ]
                             st.dataframe(
                                 pd.DataFrame(rows_ret).style.format({"Actual": "${:,.0f}"}),
-                                use_container_width=True,
+                                width='stretch',
                                 hide_index=True,
                             )
 
@@ -1397,7 +1492,7 @@ def main():
             else:
                 st.plotly_chart(
                     _charts.chart_progress_tracking(baseline["projections_by_age"], []),
-                    use_container_width=True,
+                    width='stretch',
                 )
                 st.info("No check-ins recorded yet. Enter actual balances above to compare against the plan.")
         else:
@@ -1489,12 +1584,13 @@ def main():
 
         mc_model = st.radio(
             "Return model",
-            ["Standard (Normal)", "CMA Log-Normal (Advanced)"],
+            ["CMA Log-Normal (Advanced)", "Standard (Normal)"],
             horizontal=True,
             key="mc_model",
             help=(
-                "Standard: independent normal draws per account, single volatility parameter. "
                 "CMA Log-Normal: log-normal returns with correlated equity/bond factors, "
+                "stochastic inflation, and CMA-calibrated default volatilities. "
+                "Standard: independent normal draws per account, single volatility parameter. "
                 "stochastic inflation, and CMA-calibrated default volatilities."
             ),
         )
@@ -1519,7 +1615,7 @@ def main():
             )
 
         # --- Parameters ---
-        _ret = assumptions.get("retirement_return_rate", 0.05)
+        _ret = assumptions.get("retirement_return_rate", 0.065)
         if use_v2:
             vol_col1, vol_col2, vol_col3, n_col = st.columns([2, 2, 2, 1])
             with vol_col1:
@@ -1542,7 +1638,7 @@ def main():
                 ) / 100.0
             with n_col:
                 mc_n = int(st.number_input(
-                    "Trials", min_value=100, max_value=5000, value=1000, step=100, key="mc_n",
+                    "Trials", min_value=100, max_value=10000, value=1000, step=100, key="mc_n",
                 ))
         else:
             vol_col, n_col = st.columns([3, 1])
@@ -1557,7 +1653,7 @@ def main():
                 ) / 100.0
             with n_col:
                 mc_n = int(st.number_input(
-                    "Trials", min_value=100, max_value=5000, value=1000, step=100, key="mc_n",
+                    "Trials", min_value=100, max_value=10000, value=1000, step=100, key="mc_n",
                 ))
 
         mc_stock_pct = st.slider(
@@ -1570,7 +1666,10 @@ def main():
         ) / 100.0
 
         if use_v2:
-            from montecarlo_v2 import EQUITY_RISK_PREMIUM
+            from montecarlo_v2 import (
+                EQUITY_RISK_PREMIUM, HISTORICAL_MEDIAN_CAPE,
+                REAL_EARNINGS_GROWTH, CAPE_REVERSION_YEARS,
+            )
             _eq_mean = _ret + (1 - mc_stock_pct) * EQUITY_RISK_PREMIUM
             _bd_mean = _ret - mc_stock_pct * EQUITY_RISK_PREMIUM
             _eff_vol_v2 = mc_stock_pct * mc_equity_vol + (1 - mc_stock_pct) * mc_bond_vol
@@ -1619,6 +1718,44 @@ def main():
             key="mc_crashes",
         )
 
+        if use_v2:
+            cape_col1, cape_col2 = st.columns([2, 1])
+            with cape_col1:
+                mc_use_cape_adj = st.checkbox(
+                    "CAPE-adjusted near-term returns",
+                    value=False,
+                    key="mc_cape_adj",
+                    help=(
+                        "Reduces equity expected returns for the first 10 years using the Shiller "
+                        "earnings-yield model (1/CAPE + real earnings growth + inflation), then "
+                        "reverts linearly to the long-run mean. Historically elevated CAPE values "
+                        "have predicted below-average 10-year forward equity returns."
+                    ),
+                )
+            with cape_col2:
+                mc_current_cape = st.number_input(
+                    "Current CAPE",
+                    min_value=5.0, max_value=100.0, value=39.6, step=0.5,
+                    key="mc_current_cape",
+                    help="Shiller CAPE (cyclically adjusted P/E). Historical median ~16.6. Current ~39.6 (May 2026).",
+                    disabled=not mc_use_cape_adj,
+                )
+            if mc_use_cape_adj:
+                _infl = assumptions.get("inflation_rate", 0.03)
+                _cape_eq = 1.0 / mc_current_cape + REAL_EARNINGS_GROWTH + _infl
+                _base_eq = _ret + (1 - mc_stock_pct) * EQUITY_RISK_PREMIUM
+                _port_drag = mc_stock_pct * max(0.0, _base_eq - _cape_eq)
+                st.caption(
+                    f"CAPE {mc_current_cape:.1f} implies a near-term equity return of **{_cape_eq:.1%}** "
+                    f"vs. long-run mean of **{_base_eq:.1%}** — "
+                    f"a **{_base_eq - _cape_eq:.1%}** equity drag (**{_port_drag:.1%}** on portfolio at {mc_stock_pct:.0%} stocks), "
+                    f"fading linearly to zero by year {CAPE_REVERSION_YEARS}. "
+                    f"Historical median CAPE: {HISTORICAL_MEDIAN_CAPE}."
+                )
+        else:
+            mc_use_cape_adj = False
+            mc_current_cape = 39.6
+
         det_portfolio = ret_df["total_portfolio"].tolist() if not ret_df.empty else []
 
         # --- Run button ---
@@ -1637,6 +1774,8 @@ def main():
                         enable_crashes=mc_crashes,
                         stock_pct=mc_stock_pct,
                         withdrawal_mode=mc_withdrawal_mode_key,
+                        use_cape_adj=mc_use_cape_adj,
+                        current_cape=mc_current_cape,
                     )
                 else:
                     result = _mc.run_monte_carlo(
@@ -1712,7 +1851,7 @@ def main():
                         "Plan needs revision — save more, spend less, or retire later",
                     ],
                 })
-                st.dataframe(bench_df, use_container_width=True, hide_index=True)
+                st.dataframe(bench_df, width='stretch', hide_index=True)
                 st.caption(
                     "**10th percentile portfolio at life expectancy**: if this is above $0, your plan "
                     "survives even unlucky market sequences. A 90%+ success rate *and* a positive 10th "
@@ -1721,10 +1860,10 @@ def main():
 
             st.plotly_chart(
                 _charts.chart_monte_carlo(mc_result, det_portfolio),
-                use_container_width=True,
+                width='stretch',
             )
             if mc_result["n_depleted"] > 0:
-                st.plotly_chart(_charts.chart_mc_depletion(mc_result), use_container_width=True)
+                st.plotly_chart(_charts.chart_mc_depletion(mc_result), width='stretch')
         else:
             st.info("Configure your plan in the sidebar, then click **▶ Run Monte Carlo** to see results.")
 
@@ -1756,7 +1895,7 @@ def main():
             )
             st.plotly_chart(
                 _charts.chart_mc_comparison(mc_v1, mc_v2, det_portfolio),
-                use_container_width=True,
+                width='stretch',
             )
 
     with tab8:
@@ -1870,7 +2009,7 @@ def main():
                     "—",
                 ],
             }
-            st.dataframe(pd.DataFrame(comparison_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(comparison_data), width='stretch', hide_index=True)
 
             # Plain-English explanation of why the optimized strategy wins
             _why_parts = []
@@ -1946,7 +2085,7 @@ def main():
 
                 st.dataframe(
                     actions_df.style.format(act_fmt, na_rep="—").apply(_actions_style, axis=None),
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                 )
 
@@ -1958,7 +2097,7 @@ def main():
             desc_df = pd.DataFrame(
                 [{"Setting": k, "Recommended Value": v} for k, v in desc.items()]
             )
-            st.dataframe(desc_df, use_container_width=True, hide_index=True)
+            st.dataframe(desc_df, width='stretch', hide_index=True)
 
             # --- Account balances by year ---
             st.divider()
@@ -1968,7 +2107,7 @@ def main():
                 dollar_bal_cols = [c for c in bal_df_opt.columns if c != "Age"]
                 st.dataframe(
                     bal_df_opt.style.format("${:,.0f}", subset=dollar_bal_cols),
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                 )
 
@@ -1998,7 +2137,7 @@ def main():
             opt_fmt["withdrawal_pct"] = "{:.2%}"
             st.dataframe(
                 _opt_display[opt_detail_cols].style.format(opt_fmt, na_rep="—"),
-                use_container_width=True,
+                width='stretch',
             )
 
             # --- Score distribution ---
@@ -2026,7 +2165,7 @@ def main():
                     height=300,
                     margin=dict(t=40, b=30),
                 )
-                st.plotly_chart(score_fig, use_container_width=True)
+                st.plotly_chart(score_fig, width='stretch')
                 st.caption(
                     f"Orange dashed = baseline ({base['score']:,.0f}). "
                     f"Green dashed = best found ({best['score']:,.0f}). "
@@ -2099,7 +2238,7 @@ def main():
         _edited_accts = st.data_editor(
             _acct_df,
             column_config=_acct_col_cfg,
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             num_rows="fixed",
             key="acct_table_editor",

@@ -115,7 +115,7 @@ def chart_drawdown(
     current_age: int = 0,
     retirement_age: int = 0,
 ) -> go.Figure:
-    """Stacked area chart of remaining balances during retirement.
+    """Stacked area chart of remaining balances during retirement, grouped by account type.
 
     When inflation and current_age are provided, overlays a dashed line showing
     the total portfolio in today's (current-year) purchasing power.
@@ -127,24 +127,41 @@ def chart_drawdown(
         "taxable": "taxable", "reit": "taxable",
         "rental_property": "real_estate", "bank": "cash",
     }
-    bucket_usage: dict[str, int] = {}
+    bucket_labels = {
+        "pre_tax": "IRA / 401(k)",
+        "roth": "Roth",
+        "taxable": "Taxable",
+        "real_estate": "Real Estate",
+        "cash": "Cash / Bank",
+    }
+    bucket_order = ["pre_tax", "roth", "taxable", "real_estate", "cash"]
+
+    # Collect columns per bucket
+    bucket_cols: dict[str, list[str]] = {b: [] for b in bucket_order}
     for a in accounts_at_retirement:
         col = f"bal_{a['name'].replace(' ', '_')}"
         if col not in ret_df.columns:
             continue
         bucket = type_to_bucket.get(a["type"], "taxable")
-        shade_idx = bucket_usage.get(bucket, 0)
-        shades = TAX_BUCKET_SHADES[bucket]
-        color = shades[shade_idx % len(shades)]
-        bucket_usage[bucket] = shade_idx + 1
+        bucket_cols[bucket].append(col)
+
+    for bucket in bucket_order:
+        cols = bucket_cols[bucket]
+        if not cols:
+            continue
+        grouped = ret_df[cols].sum(axis=1)
+        if grouped.sum() == 0:
+            continue
+        label = bucket_labels[bucket]
+        color = TAX_BUCKET_COLORS[bucket]
         fig.add_trace(go.Scatter(
-            x=ret_df["age"], y=ret_df[col],
-            name=a["name"],
+            x=ret_df["age"], y=grouped,
+            name=label,
             mode="lines",
             stackgroup="one",
             fillcolor=color,
             line=dict(color=color, width=1),
-            hovertemplate=f"<b>{a['name']}</b><br>Age: %{{x}}<br>Balance: %{{y:$,.0f}}<extra></extra>",
+            hovertemplate=f"<b>{label}</b><br>Age: %{{x}}<br>Balance: %{{y:$,.0f}}<extra></extra>",
         ))
     # Real-dollar overlay: deflate nominal portfolio back to today's purchasing power
     if inflation > 0 and current_age > 0 and "total_portfolio" in ret_df.columns:
