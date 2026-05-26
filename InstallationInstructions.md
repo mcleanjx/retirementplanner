@@ -28,7 +28,7 @@ git --version
 
 ### 1. Clone the repository
 
-First, open a terminal and navigate to the folder where you want the app to live (for example, your Documents folder):
+Navigate to whichever folder you'd like the app to live inside — it can be anywhere on your computer (Documents, Desktop, a projects folder, etc.). Cloning will automatically create a `retirementplanner` subfolder there, so you don't need to create one yourself.
 
 **Windows:**
 ```
@@ -40,7 +40,7 @@ cd C:\Users\YourName\Documents
 cd ~/Documents
 ```
 
-Then clone the repository. Git will automatically create a `retirementplanner` folder inside it:
+Then clone the repository:
 ```
 git clone https://github.com/mcleanjx/retirementplanner.git
 cd retirementplanner
