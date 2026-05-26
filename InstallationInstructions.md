@@ -47,7 +47,7 @@ cd retirementplanner
 ```
 
 ### 2. (Optional) Create a virtual environment
-A virtual environment keeps the app's dependencies isolated from other Python projects.
+A virtual environment keeps the app's dependencies isolated from other Python projects. If this is the only Python app you're running, you can skip this step.
 
 **Windows:**
 ```
