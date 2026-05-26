@@ -1,5 +1,7 @@
 # Retirement Planner — User Guide
 
+> **This is a local Python app** — it runs entirely on your computer, not in the cloud. Before using it you will need Python, a few packages, and a terminal. See the [Installation Instructions](InstallationInstructions.md) for a step-by-step setup guide.
+
 ## Table of Contents
 
 1. [What This App Does](#1-what-this-app-does)
@@ -351,7 +353,7 @@ Useful for annual updates when you know your new balances but don't need to chan
 
 **The 0% Capital Gains Zone:** If your ordinary income is low enough, your investment gains (from selling stocks or receiving qualified dividends) are taxed at *zero percent*. For Married Filing Jointly, ordinary income below roughly $98,900 (in 2026) is in the 0% capital gains bracket. The app automatically takes advantage of this by harvesting gains from your taxable account in years when you have space — locking in those gains tax-free and resetting your cost basis higher.
 
-**IRMAA (Medicare Surcharges):** Medicare Part B and Part D premiums go up in steps based on your income from two years prior. In 2026, a married couple with income under $218,000 pays the standard premium. Above that, surcharges kick in — and they're cliffs, meaning going $1 over a threshold can cost $974 more per year per person. The Warnings tab flags when you're near a cliff.
+**IRMAA (Medicare Surcharges):** Medicare Part B and Part D premiums go up in steps based on your income from two years prior. In 2026, a married couple with income under $218,000 pays the standard premium. Above that, surcharges kick in — and they're cliffs, meaning going $1 over a threshold can cost $1,148 more per year per person (combined Part B + Part D surcharge). The Warnings tab flags when you're near a cliff.
 
 **NIIT (Net Investment Income Tax):** A 3.8% surtax on investment income (dividends, gains, rental income) that kicks in when your Modified Adjusted Gross Income exceeds $250,000 (married) or $200,000 (single). It applies to the *lesser* of your investment income or the excess above the threshold.
 
@@ -459,14 +461,14 @@ Net Investment Income includes: qualified dividends, ordinary dividends, capital
 
 Income-Related Monthly Adjustment Amounts are added to Medicare premiums based on MAGI:
 
-| MAGI (MFJ, 2026) | Annual Surcharge Per Person |
-|------------------|-----------------------------|
-| ≤ $218,000 | $0 |
-| $218,001–$274,000 | $974 |
-| $274,001–$342,000 | $2,444 |
-| $342,001–$410,000 | $4,632 |
-| $410,001–$750,000 | $5,880 |
-| > $750,000 | $6,936 |
+| MAGI (MFJ, 2026) | Monthly Part B surcharge | Monthly Part D surcharge | Annual Surcharge Per Person |
+|------------------|--------------------------|--------------------------|------------------------------|
+| ≤ $218,000 | $0 | $0 | $0 |
+| $218,001–$274,000 | +$81.20 | +$14.50 | $1,148 |
+| $274,001–$342,000 | +$203.70 | +$37.60 | $2,896 |
+| $342,001–$410,000 | +$325.20 | +$60.60 | $4,630 |
+| $410,001–$750,000 | +$406.90 | +$83.70 | $5,887 |
+| > $750,000 | +$487.00 | +$91.00 | $6,936 |
 
 For Married couples where both spouses are on Medicare, the surcharge applies *twice*. After one spouse passes, only one Medicare enrollee is counted. Thresholds scale by bracket inflation each year.
 
