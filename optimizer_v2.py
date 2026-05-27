@@ -1,14 +1,28 @@
 """
 optimizer_v2.py — Strategy optimizer v2.
 
-Extends v1 (optimizer.py) with three additional decision variables:
-  1. Social Security start age — primary and spouse sampled independently (62–70)
-  2. Pre-retirement cash buffer — shift 0–3 years of spending from invested accounts
-     into cash before retiring; models the sequence-of-returns shield described by
-     Kitces / Pfau. Cash earns its own account return_rate (typically ~3%) rather
-     than the global retirement return rate.
-  3. Spending smile — real spending declines 0–1.2%/yr in mid-retirement, reflecting
-     Blanchett's empirical finding that retirees spend ~20% less in real terms by 75.
+Extends v1 (optimizer.py) with two additional decision variables that have
+real, deterministic dollar impact:
+
+  1. Social Security start age (62–70) for primary and spouse — unchanged from
+     the first v2 draft; 8%/yr delay credit is fully modeled in simulate_retirement.
+
+  2. IRMAA-aware Roth conversions — for conversion windows that overlap Medicare
+     ages (65+), cap conversions just below the IRMAA Tier-0 income threshold
+     ($218K MFJ / $109K single). Breaching that cliff adds $1,148–$6,936/person/yr
+     in Medicare Part B+D surcharges; the sim already charges these costs, so the
+     optimizer naturally rewards avoiding them.
+
+  3. ACA-aware Roth conversions — for pre-65 retirement windows, cap conversions
+     below the ACA 400% FPL cliff (~$84.6K MFJ / $62.7K single). Staying under
+     saves $10K–$20K/yr in marketplace premiums (the enhanced subsidies expired
+     end of 2025; the cliff is a hard cutoff again in 2026).
+
+What was removed vs. the previous v2 draft:
+  - Cash buffer: sequence-of-returns protection has no value in a deterministic
+    (fixed-return) simulator; the optimizer would always score buffer = 0.
+  - Spending smile: recommending lower spending to improve portfolio score is a
+    circular incentive, not a genuine strategy improvement.
 
 Does NOT modify optimizer.py, withdrawals.py, or any scenario files.
 """
@@ -20,7 +34,7 @@ from typing import Optional
 import pandas as pd
 
 from withdrawals import simulate_retirement
-from constants import RMD_START_AGE
+from constants import RMD_START_AGE, IRMAA_TIERS
 from optimizer import (
     _owner_min_conv_age,
     _score,
@@ -33,146 +47,209 @@ from optimizer import (
     WITHDRAWAL_STRATEGIES,
 )
 
-BANK_TYPES = {"bank"}
-TAXABLE_TYPES = {"taxable", "reit"}
-
-# Cash buffer: years of base spending held in cash/bank at retirement
-CASH_BUFFER_OPTIONS = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
-
-# Spending smile: real decline per year (Blanchett ~1%/yr is the empirical center)
-SPENDING_SMILE_OPTIONS = [0.000, 0.003, 0.005, 0.008, 0.010, 0.012]
-
-# SS start age range to explore (delayed credits: +8%/yr from 62 → 70)
+# SS start age range (delayed retirement credits: +8%/yr from 62 → 70)
 SS_AGE_OPTIONS = list(range(62, 71))
 
+# IRMAA Tier-0 income ceilings (2026) — staying below avoids ALL Medicare surcharges
+IRMAA_CEILING_MFJ    = 218_000
+IRMAA_CEILING_SINGLE = 109_000
+
+# ACA 400% FPL income ceilings (~2026) — staying below preserves Premium Tax Credit
+# Enhanced subsidies expired end-2025; cliff is a hard cutoff again in 2026.
+ACA_CLIFF_MFJ    = 84_600   # ~400% FPL, household of 2
+ACA_CLIFF_SINGLE = 62_700   # ~400% FPL, household of 1
+
 
 # ---------------------------------------------------------------------------
-# Helper: cash buffer (tax-aware)
+# Income estimation helpers
 # ---------------------------------------------------------------------------
 
-def _gain_ratio(account: dict) -> float:
-    """Fraction of account balance that is unrealized capital gain (0–1)."""
-    bal = account.get("balance", 0.0)
-    basis = account.get("basis", bal)
-    if bal <= 0:
-        return 0.0
-    return max(0.0, min(1.0, (bal - basis) / bal))
-
-
-def _apply_cash_buffer(
+def _estimate_nonconv_income(
+    profile: dict,
     accounts: list,
-    annual_spending: float,
-    buffer_years: float,
-    ltcg_rate: float = 0.15,
-) -> tuple[list, float, float]:
+    assumptions: dict,
+    at_age: int,
+    ss_start_override: Optional[int] = None,
+    spouse_ss_start_override: Optional[int] = None,
+) -> float:
     """
-    Build a pre-retirement cash buffer by liquidating invested accounts, applying
-    LTCG taxes on any embedded gains in taxable accounts.
+    Estimate non-Roth-conversion MAGI at `at_age`.
 
-    Source priority (Traditional excluded — income tax + early-withdrawal penalty
-    make it an uneconomical buffer source):
-      1. Taxable brokerage — LTCG taxes applied on embedded gains at ltcg_rate
-      2. Roth — after-tax contributions, no additional tax on withdrawal
+    Includes: Social Security (100% counts for ACA/IRMAA MAGI),
+    taxable investment income (dividends/interest), and rental income.
+    Excludes: Roth conversions (those are what we are trying to limit),
+    Traditional withdrawals, and RMDs (this is called for pre-RMD ages).
 
-    When selling taxable assets, you must sell MORE than the buffer amount to cover
-    the resulting tax bill. For example: building a $300K buffer from an account with
-    a 60% gain ratio at 15% LTCG requires selling $300K / (1 − 0.09) = $330K gross,
-    paying $30K to the IRS, leaving $300K in the bank — a real portfolio cost.
-
-    Returns:
-        (modified_accounts, cash_deposited, ltcg_tax_paid)
+    Uses retirement-date account balances as a proxy for investment income;
+    growth between now and `at_age` is intentionally omitted to keep the
+    estimate conservative (i.e., headroom may be slightly overstated).
     """
-    if buffer_years <= 0:
-        accts = copy.deepcopy(accounts)
-        return accts, 0.0, 0.0
+    inflation = assumptions.get("inflation_rate", 0.03)
+    years_to_ret = profile["retirement_age"] - profile["current_age"]
+    years_from_ret = max(0, at_age - profile["retirement_age"])
+    inflate = (1 + inflation) ** (years_to_ret + years_from_ret)
 
-    accts = copy.deepcopy(accounts)
-    bank_accts = [a for a in accts if a["type"] in BANK_TYPES]
-    if not bank_accts:
-        return accts, 0.0, 0.0
+    filing = profile.get("filing_status", "single")
+    is_mfj = filing == "married_filing_jointly"
 
-    target_bank = max(bank_accts, key=lambda a: a["balance"])
-    cash_needed = buffer_years * annual_spending
-    remaining = cash_needed
-    total_tax_paid = 0.0
-    cash_deposited = 0.0
+    ss_start = ss_start_override or profile.get("social_security_start_age", 67)
+    primary_ss = profile.get("social_security_benefit", 0.0) * inflate if at_age >= ss_start else 0.0
 
-    # Taxable first (LTCG applies), then Roth (no tax)
-    sources = [
-        (TAXABLE_TYPES, ltcg_rate),
-        (ROTH_TYPES,    0.0),
+    spouse_ss = 0.0
+    if is_mfj:
+        sp_ss_start = spouse_ss_start_override or profile.get("spouse_ss_start_age", 67)
+        sp_offset = profile.get("spouse_age", profile.get("current_age", 0)) - profile.get("current_age", 0)
+        if at_age + sp_offset >= sp_ss_start:
+            spouse_ss = profile.get("spouse_ss_benefit", 0.0) * inflate
+
+    # Taxable investment income: dividends + interest at retirement-date balances
+    inv_income = sum(
+        a["balance"] * (a.get("ordinary_income_yield", 0.0) + a.get("qualified_dividend_yield", 0.0))
+        for a in accounts
+        if a.get("type") in {"taxable", "reit"}
+    )
+
+    rental = sum(
+        a.get("net_annual_rental_income", 0.0)
+        for a in accounts
+        if a.get("type") == "rental_property"
+    )
+
+    return primary_ss + spouse_ss + inv_income + rental
+
+
+def _irmaa_headroom(
+    profile: dict,
+    accounts: list,
+    assumptions: dict,
+    ss_start: int,
+    spouse_ss_start: Optional[int] = None,
+) -> float:
+    """
+    Estimated Roth conversion headroom before hitting IRMAA Tier-0 (no surcharge).
+
+    Uses age 68 as the representative Medicare conversion year: post-65,
+    pre-RMD (age 73), likely within the conversion window.
+    Returns 0 if estimated non-conversion income already exceeds the ceiling.
+    """
+    filing = profile.get("filing_status", "single")
+    ceiling = IRMAA_CEILING_MFJ if filing == "married_filing_jointly" else IRMAA_CEILING_SINGLE
+    rep_age = max(65, profile.get("retirement_age", 65))
+    income = _estimate_nonconv_income(profile, accounts, assumptions, rep_age, ss_start, spouse_ss_start)
+    return max(0.0, ceiling - income)
+
+
+def _aca_headroom(
+    profile: dict,
+    accounts: list,
+    assumptions: dict,
+    ss_start: int,
+    spouse_ss_start: Optional[int] = None,
+) -> float:
+    """
+    Estimated Roth conversion headroom before hitting the ACA 400% FPL cliff.
+
+    Uses the retirement age as the representative pre-65 year: this is when
+    marketplace coverage costs are highest (no Medicare yet, no employer plan).
+    Returns 0 if income already exceeds the cliff (no ACA headroom available).
+    """
+    filing = profile.get("filing_status", "single")
+    cliff = ACA_CLIFF_MFJ if filing == "married_filing_jointly" else ACA_CLIFF_SINGLE
+    rep_age = profile.get("retirement_age", 62)
+    income = _estimate_nonconv_income(profile, accounts, assumptions, rep_age, ss_start, spouse_ss_start)
+    return max(0.0, cliff - income)
+
+
+# ---------------------------------------------------------------------------
+# Roth conversion sampler (v2 — cliff-aware)
+# ---------------------------------------------------------------------------
+
+def _sample_roth_conversion(
+    profile: dict,
+    accounts: list,
+    assumptions: dict,
+    rng: random.Random,
+    ss_start: int,
+    spouse_ss_start: Optional[int] = None,
+) -> tuple[dict, Optional[str]]:
+    """
+    Sample a Roth conversion configuration, adding IRMAA-safe and ACA-safe
+    fixed amounts to the standard v1 bracket/amount options.
+
+    Returns (rc_dict, cliff_label) where cliff_label is one of:
+        "irmaa"    — fixed_amount capped at IRMAA Tier-0 headroom
+        "aca"      — fixed_amount capped at ACA 400%-FPL headroom
+        None       — standard v1 fill_to_bracket or arbitrary fixed_amount
+    """
+    life_expectancy = profile.get("life_expectancy", 90)
+
+    trad = [a for a in accounts if a["type"] in TRADITIONAL_TYPES]
+    roth = [a for a in accounts if a["type"] in ROTH_TYPES]
+
+    if not (trad and roth and rng.random() < 0.70):
+        return {"enabled": False}, None
+
+    n_sources = rng.randint(1, len(trad))
+    source_accounts = rng.sample(trad, n_sources)
+    source_ids = [a["id"] for a in source_accounts]
+
+    min_conv_age = max(
+        max(_owner_min_conv_age(a, profile) for a in source_accounts),
+        60,
+    )
+    conv_max_end = max(
+        min_conv_age + 1,
+        min(RMD_START_AGE - 1, ss_start - 1, life_expectancy - 5),
+    )
+    if min_conv_age > conv_max_end:
+        return {"enabled": False}, None
+
+    start_age = rng.randint(min_conv_age, min(min_conv_age + 5, conv_max_end))
+    end_age   = rng.randint(start_age, min(conv_max_end, start_age + 15))
+    dest_id   = rng.choice([a["id"] for a in roth])
+
+    # --- Determine which cliff strategies are relevant for this window ---
+    window_has_pre65   = start_age < 65 and profile.get("retirement_age", 65) < 65
+    window_has_medicare = end_age >= 65
+
+    irmaa_amount = _irmaa_headroom(profile, accounts, assumptions, ss_start, spouse_ss_start)
+    aca_amount   = _aca_headroom(profile, accounts, assumptions, ss_start, spouse_ss_start)
+
+    # Build a weighted strategy menu.
+    # Each entry: (strategy_type, target_bracket_or_None, fixed_amount_or_None, cliff_label)
+    menu = [
+        ("fill_to_bracket", rng.choice(BRACKET_OPTIONS), None, None),
+        ("fill_to_bracket", rng.choice(BRACKET_OPTIONS), None, None),
+        ("fill_to_bracket", rng.choice(BRACKET_OPTIONS), None, None),
+        ("fixed_amount", None, float(rng.choice([5_000, 10_000, 20_000, 30_000, 50_000, 75_000, 100_000])), None),
     ]
+    if window_has_medicare and irmaa_amount > 5_000:
+        menu.append(("fixed_amount", None, round(irmaa_amount, -3), "irmaa"))
+        menu.append(("fixed_amount", None, round(irmaa_amount, -3), "irmaa"))  # 2× weight
+    if window_has_pre65 and aca_amount > 5_000:
+        menu.append(("fixed_amount", None, round(aca_amount, -3), "aca"))
+        menu.append(("fixed_amount", None, round(aca_amount, -3), "aca"))  # 2× weight
 
-    for type_set, rate in sources:
-        if remaining <= 0:
-            break
-        candidates = sorted(
-            [a for a in accts if a["type"] in type_set and a["balance"] > 0],
-            key=lambda a: _gain_ratio(a),  # lowest-gain accounts first (least tax)
-        )
-        for a in candidates:
-            if remaining <= 0:
-                break
+    strat_type, target_bracket, fixed_amount, cliff_label = rng.choice(menu)
 
-            gr = _gain_ratio(a) if rate > 0 else 0.0
-            # tax as a fraction of gross proceeds: gain_ratio × ltcg_rate
-            tax_fraction = gr * rate
-            # To net $1 of cash after taxes, must sell $1 / (1 − tax_fraction) gross
-            # max cash extractable from this account after covering the tax bill
-            max_net_cash = a["balance"] * (1.0 - tax_fraction)
-            net_cash = min(remaining, max_net_cash)
-            gross_sold = net_cash / max(1e-9, 1.0 - tax_fraction)
-            tax_on_sale = gross_sold - net_cash
+    rc: dict = {
+        "enabled": True,
+        "strategy": strat_type,
+        "start_age": int(start_age),
+        "end_age": int(end_age),
+        "source_account_ids": source_ids,
+        "destination_account_id": dest_id,
+    }
+    if strat_type == "fill_to_bracket":
+        rc["target_bracket"] = target_bracket
+    else:
+        rc["fixed_amount"] = fixed_amount
 
-            a["balance"] = max(0.0, a["balance"] - gross_sold)
-            # Reduce basis proportional to the cost-basis portion of what was sold
-            if rate > 0 and a.get("basis") is not None:
-                basis_recovered = gross_sold * (1.0 - gr)
-                a["basis"] = max(0.0, a["basis"] - basis_recovered)
-
-            remaining -= net_cash
-            cash_deposited += net_cash
-            total_tax_paid += tax_on_sale
-
-    target_bank["balance"] += cash_deposited
-    return accts, cash_deposited, total_tax_paid
+    return rc, cliff_label
 
 
 # ---------------------------------------------------------------------------
-# Helper: spending smile
-# ---------------------------------------------------------------------------
-
-def _compute_smile_overrides(
-    retirement_age: int,
-    life_expectancy: int,
-    base_spending: float,
-    smile_rate: float,
-    inflation: float,
-    existing_overrides: dict,
-) -> dict:
-    """
-    Return a spending_overrides dict with a year-by-year nominal spending path
-    that grows at (inflation - smile_rate) instead of full inflation, producing
-    a real spending decline of smile_rate per year.
-
-    Ages already in existing_overrides are left unchanged (user intent respected).
-    """
-    if smile_rate <= 0:
-        return existing_overrides
-
-    overrides = dict(existing_overrides)
-    for age in range(retirement_age, life_expectancy + 1):
-        if age in overrides:
-            continue
-        years_in = age - retirement_age
-        # Nominal growth at (inflation − smile_rate) → real decline of smile_rate/yr
-        nominal_factor = (1.0 + inflation - smile_rate) ** years_in
-        overrides[age] = base_spending * nominal_factor
-    return overrides
-
-
-# ---------------------------------------------------------------------------
-# Strategy sampler (v2)
+# Top-level sampler
 # ---------------------------------------------------------------------------
 
 def _sample_strategy_v2(
@@ -180,80 +257,35 @@ def _sample_strategy_v2(
     accounts: list,
     assumptions: dict,
     rng: random.Random,
-) -> tuple[str, dict, dict, float, float]:
+) -> tuple[str, dict, dict, Optional[str]]:
     """
-    Sample a complete v2 strategy configuration.
+    Sample a complete v2 strategy.
 
     Returns:
         withdrawal_strategy : str
         roth_conversion     : dict
-        profile_overrides   : dict  (keys to merge into profile for this trial)
-        cash_buffer_years   : float
-        smile_rate          : float
+        profile_overrides   : dict
+        cliff_label         : "irmaa" | "aca" | None
     """
-    life_expectancy = profile.get("life_expectancy", 90)
-
     withdrawal_strategy = rng.choice(WITHDRAWAL_STRATEGIES)
 
-    # --- SS start ages ---
     ss_start = rng.choice(SS_AGE_OPTIONS)
     profile_overrides: dict = {"social_security_start_age": ss_start}
 
+    spouse_ss_start = None
     if profile.get("filing_status") == "married_filing_jointly":
-        profile_overrides["spouse_ss_start_age"] = rng.choice(SS_AGE_OPTIONS)
+        spouse_ss_start = rng.choice(SS_AGE_OPTIONS)
+        profile_overrides["spouse_ss_start_age"] = spouse_ss_start
 
-    # --- Roth conversion (same logic as v1; window end adjusts to sampled ss_start) ---
-    trad_accounts = [a for a in accounts if a["type"] in TRADITIONAL_TYPES]
-    roth_accounts = [a for a in accounts if a["type"] in ROTH_TYPES]
+    rc, cliff_label = _sample_roth_conversion(
+        profile, accounts, assumptions, rng, ss_start, spouse_ss_start
+    )
 
-    rc: dict = {"enabled": False}
-    if bool(trad_accounts) and bool(roth_accounts) and rng.random() < 0.70:
-        n_sources = rng.randint(1, len(trad_accounts))
-        source_accounts = rng.sample(trad_accounts, n_sources)
-        source_ids = [a["id"] for a in source_accounts]
-
-        min_conv_age = max(
-            max(_owner_min_conv_age(a, profile) for a in source_accounts),
-            60,
-        )
-        conv_max_end = max(
-            min_conv_age + 1,
-            min(RMD_START_AGE - 1, ss_start - 1, life_expectancy - 5),
-        )
-
-        if min_conv_age <= conv_max_end:
-            start_age = rng.randint(min_conv_age, min(min_conv_age + 5, conv_max_end))
-            end_age = rng.randint(start_age, min(conv_max_end, start_age + 15))
-            strategy = rng.choice(
-                ["fill_to_bracket", "fill_to_bracket", "fill_to_bracket", "fixed_amount"]
-            )
-            target_bracket = rng.choice(BRACKET_OPTIONS)
-            fixed_amount = float(
-                rng.choice([5_000, 10_000, 20_000, 30_000, 50_000, 75_000, 100_000])
-            )
-            dest_id = rng.choice([a["id"] for a in roth_accounts])
-            rc = {
-                "enabled": True,
-                "strategy": strategy,
-                "target_bracket": target_bracket,
-                "fixed_amount": fixed_amount,
-                "start_age": int(start_age),
-                "end_age": int(end_age),
-                "source_account_ids": source_ids,
-                "destination_account_id": dest_id,
-            }
-
-    # --- Cash buffer ---
-    cash_buffer_years = rng.choice(CASH_BUFFER_OPTIONS)
-
-    # --- Spending smile ---
-    smile_rate = rng.choice(SPENDING_SMILE_OPTIONS)
-
-    return withdrawal_strategy, rc, profile_overrides, cash_buffer_years, smile_rate
+    return withdrawal_strategy, rc, profile_overrides, cliff_label
 
 
 # ---------------------------------------------------------------------------
-# Strategy description (v2 adds extra rows for new variables)
+# Strategy description (v2 extends v1 with SS and cliff-aware rows)
 # ---------------------------------------------------------------------------
 
 def describe_strategy_v2(
@@ -261,54 +293,48 @@ def describe_strategy_v2(
     roth_conversion: dict,
     accounts: list,
     profile_overrides: dict,
-    cash_buffer_years: float,
-    smile_rate: float,
     base_profile: dict,
-    buffer_tax_paid: float = 0.0,
-    ltcg_rate: float = 0.15,
+    cliff_label: Optional[str] = None,
+    irmaa_headroom: float = 0.0,
+    aca_headroom: float = 0.0,
 ) -> dict:
     """Human-readable description of a v2 strategy, extending v1's output."""
     desc = _describe_strategy(withdrawal_strategy, roth_conversion, accounts)
 
+    # SS start ages
     orig_ss = base_profile.get("social_security_start_age", 67)
-    new_ss = profile_overrides.get("social_security_start_age", orig_ss)
+    new_ss  = profile_overrides.get("social_security_start_age", orig_ss)
     ss_label = f"Age {new_ss}"
     if new_ss != orig_ss:
         delta_pct = (new_ss - 62) * 8
-        ss_label += f"  (≈ +{delta_pct}% vs. age-62 benefit)"
+        ss_label += f"  (≈ +{delta_pct}% vs. claiming at 62)"
     desc["SS Start Age (primary)"] = ss_label
 
     if base_profile.get("filing_status") == "married_filing_jointly":
-        orig_spouse_ss = base_profile.get("spouse_ss_start_age", 67)
-        new_spouse_ss = profile_overrides.get("spouse_ss_start_age", orig_spouse_ss)
-        spouse_label = f"Age {new_spouse_ss}"
-        if new_spouse_ss != orig_spouse_ss:
-            delta_pct = (new_spouse_ss - 62) * 8
-            spouse_label += f"  (≈ +{delta_pct}% vs. age-62 benefit)"
-        desc["SS Start Age (spouse)"] = spouse_label
+        orig_sp = base_profile.get("spouse_ss_start_age", 67)
+        new_sp  = profile_overrides.get("spouse_ss_start_age", orig_sp)
+        sp_label = f"Age {new_sp}"
+        if new_sp != orig_sp:
+            delta_pct = (new_sp - 62) * 8
+            sp_label += f"  (≈ +{delta_pct}% vs. claiming at 62)"
+        desc["SS Start Age (spouse)"] = sp_label
 
-    if cash_buffer_years > 0:
-        tax_note = (
-            f" — estimated ${buffer_tax_paid:,.0f} LTCG tax to liquidate"
-            f" (assumes {ltcg_rate:.0%} rate on embedded gains)"
-            if buffer_tax_paid > 0
-            else " — sourced from Roth/existing cash (no LTCG tax)"
+    # Cliff awareness
+    if cliff_label == "irmaa" and irmaa_headroom > 0:
+        desc["IRMAA Management"] = (
+            f"Roth conversions capped at ~${irmaa_headroom:,.0f}/yr — "
+            f"keeps MAGI below the ${IRMAA_CEILING_MFJ if base_profile.get('filing_status') == 'married_filing_jointly' else IRMAA_CEILING_SINGLE:,} "
+            f"IRMAA Tier-0 ceiling, avoiding $1,148–$6,936/person/yr in Medicare surcharges."
         )
-        desc["Cash Buffer"] = (
-            f"{cash_buffer_years:.1f} yr of spending held in cash at retirement{tax_note}. "
-            "Earns bank/savings rate; shields against forced stock sales in a down market."
+    elif cliff_label == "aca" and aca_headroom > 0:
+        cliff_val = ACA_CLIFF_MFJ if base_profile.get("filing_status") == "married_filing_jointly" else ACA_CLIFF_SINGLE
+        desc["ACA Subsidy Management"] = (
+            f"Roth conversions capped at ~${aca_headroom:,.0f}/yr — "
+            f"keeps MAGI below the ${cliff_val:,} ACA 400%-FPL cliff, "
+            f"preserving marketplace premium subsidies ($10K–$20K/yr) until Medicare at 65."
         )
     else:
-        desc["Cash Buffer"] = "None (fully invested at retirement)"
-
-    if smile_rate > 0:
-        desc["Spending Smile"] = (
-            f"Real spending declines {smile_rate:.1%}/yr — grows at "
-            f"(inflation − {smile_rate:.1%}) nominally, reflecting Blanchett's "
-            "finding that retirees naturally spend ~20% less in real terms by mid-retirement"
-        )
-    else:
-        desc["Spending Smile"] = "Flat real spending (inflation-adjusted throughout)"
+        desc["Cliff Management"] = "Standard (not constrained by IRMAA or ACA cliff)"
 
     return desc
 
@@ -326,44 +352,36 @@ def run_optimizer_v2(
     n_iterations: int = 500,
     legacy_weight: float = 0.20,
     seed: int = 42,
-    ltcg_rate: float = 0.15,
 ) -> dict:
     """
     Run the v2 strategy optimizer over `n_iterations` random trials.
 
-    Drop-in replacement for optimizer.run_optimizer() — returns the same dict
-    structure with additional keys on each result:
-        ss_start_age       : int | None
-        spouse_ss_start_age: int | None
-        cash_buffer_years  : float
-        buffer_tax_paid    : float  — LTCG taxes incurred to build the buffer
-        smile_rate         : float
-        profile_overrides  : dict
-
-    ltcg_rate: assumed capital gains tax rate for taxable account liquidations
-    when building the cash buffer. Defaults to 15% (typical for early retirees).
-    Traditional accounts are excluded as buffer sources — income tax plus potential
-    early-withdrawal penalties make them uneconomical.
+    Drop-in replacement for optimizer.run_optimizer(). Returns the same dict
+    structure with additional per-result keys:
+        profile_overrides   : dict   — SS age changes applied for this trial
+        ss_start_age        : int | None
+        spouse_ss_start_age : int | None
+        cliff_label         : "irmaa" | "aca" | None
+        irmaa_headroom      : float  — estimated conversion room below IRMAA ceiling
+        aca_headroom        : float  — estimated conversion room below ACA cliff
     """
     rng = random.Random(seed)
     spending_overrides = spending_overrides or {}
-    inflation = assumptions.get("inflation_rate", 0.03)
-    retirement_age = profile["retirement_age"]
-    life_expectancy = profile["life_expectancy"]
 
-    # Compute base spending (mirrors simulate_retirement logic exactly)
-    total_portfolio = sum(a["balance"] for a in accounts_at_retirement)
-    spending_mode = assumptions.get("spending_mode", "swr")
-    if spending_mode == "fixed":
-        years_to_ret = retirement_age - profile["current_age"]
-        base_spending = (
-            assumptions.get("annual_spending_target", total_portfolio * assumptions.get("safe_withdrawal_rate", 0.04))
-            * (1 + inflation) ** years_to_ret
-        )
-    else:
-        base_spending = total_portfolio * assumptions.get("safe_withdrawal_rate", 0.04)
+    # Pre-compute headroom estimates (fixed for all trials; SS start varies per trial
+    # but the representative-age estimate doesn't change dramatically)
+    _irmaa_h = _irmaa_headroom(
+        profile, accounts_at_retirement, assumptions,
+        profile.get("social_security_start_age", 67),
+        profile.get("spouse_ss_start_age"),
+    )
+    _aca_h = _aca_headroom(
+        profile, accounts_at_retirement, assumptions,
+        profile.get("social_security_start_age", 67),
+        profile.get("spouse_ss_start_age"),
+    )
 
-    # --- Baseline (current settings, unmodified) ---
+    # --- Baseline ---
     try:
         base_df, base_summary = simulate_retirement(
             accounts_at_retirement, profile, assumptions,
@@ -383,9 +401,9 @@ def run_optimizer_v2(
         "profile_overrides": {},
         "ss_start_age": profile.get("social_security_start_age"),
         "spouse_ss_start_age": profile.get("spouse_ss_start_age"),
-        "cash_buffer_years": 0.0,
-        "buffer_tax_paid": 0.0,
-        "smile_rate": 0.0,
+        "cliff_label": None,
+        "irmaa_headroom": _irmaa_h,
+        "aca_headroom": _aca_h,
     }
 
     # --- Random search ---
@@ -394,23 +412,16 @@ def run_optimizer_v2(
     n_evaluated = 0
 
     for _ in range(n_iterations):
-        w_strat, rc, prof_overrides, cash_buffer_years, smile_rate = _sample_strategy_v2(
+        w_strat, rc, prof_overrides, cliff_label = _sample_strategy_v2(
             profile, accounts_at_retirement, assumptions, rng
         )
-
-        trial_profile = {**profile, **prof_overrides}
+        trial_profile     = {**profile, **prof_overrides}
         trial_assumptions = {**assumptions, "withdrawal_strategy": w_strat}
-        trial_accounts, cash_deposited, tax_paid = _apply_cash_buffer(
-            accounts_at_retirement, base_spending, cash_buffer_years, ltcg_rate
-        )
-        trial_overrides = _compute_smile_overrides(
-            retirement_age, life_expectancy, base_spending,
-            smile_rate, inflation, spending_overrides,
-        )
 
         try:
             ret_df, sim_summary = simulate_retirement(
-                trial_accounts, trial_profile, trial_assumptions, rc, trial_overrides,
+                accounts_at_retirement, trial_profile, trial_assumptions,
+                rc, spending_overrides,
             )
             sc = _score(ret_df, sim_summary, legacy_weight)
             n_evaluated += 1
@@ -425,10 +436,9 @@ def run_optimizer_v2(
                 "profile_overrides": prof_overrides,
                 "ss_start_age": prof_overrides.get("social_security_start_age"),
                 "spouse_ss_start_age": prof_overrides.get("spouse_ss_start_age"),
-                "cash_buffer_years": cash_buffer_years,
-                "buffer_tax_paid": tax_paid,
-                "smile_rate": smile_rate,
-                "_ltcg_rate": ltcg_rate,
+                "cliff_label": cliff_label,
+                "irmaa_headroom": _irmaa_h,
+                "aca_headroom": _aca_h,
             })
         except Exception:
             continue
