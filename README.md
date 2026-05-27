@@ -10,17 +10,16 @@ A personal retirement planning app built with Python and Streamlit. Model your r
 
 - **Retirement Projections** — Year-by-year accumulation and drawdown modeling across multiple account types (401k, Roth IRA, taxable brokerage, real estate, etc.)
 - **Tax Calculations** — Federal and California state tax, RMDs, Social Security taxability, IRMAA, LTCG, and NIIT
-- **Withdrawal Strategies** — Tax-efficient, Roth-first, traditional-first, and pro-rata strategies
-- **Monte Carlo Simulation** — Probability of success across thousands of simulated market scenarios
-- **Scenario Management** — Save, load, and compare multiple planning scenarios
+- **Withdrawal Strategies** — Tax-efficient, Roth-first, traditional-first, and pro-rata strategies with binary search solver for accuracy
+- **Monte Carlo Simulation** — Probability of success across up to 10,000 simulated market scenarios; supports CMA Log-Normal and CAPE-adjusted return models
+- **Scenario Management** — Save, load, and compare multiple planning scenarios with name validation
 - **Account Management** — Track balances, contributions, employer match, and return rates per account
 - **Progress Tracking** — Check-in system to compare actual vs. projected balances over time
+- **Simplified Mode** — Guided step-by-step wizard for quick planning without advanced configuration
 
 ---
 
 ## Getting Started
-
-See [InstallationInstructions.md](InstallationInstructions.md) for full setup steps including prerequisites, cloning, and running the app.
 
 **Quick start:**
 ```
@@ -37,7 +36,7 @@ streamlit run app.py
 | Package | Version |
 | ------- | ------- |
 | Python | >= 3.10 |
-| streamlit | >= 1.35.0 |
+| streamlit | >= 1.45.0 |
 | plotly | >= 5.22.0 |
 | pandas | >= 2.2.0 |
 | numpy | >= 1.26.0 |
@@ -48,7 +47,8 @@ streamlit run app.py
 
 | File | Purpose |
 | ---- | ------- |
-| `app.py` | Main Streamlit UI |
+| `app.py` | Main Streamlit UI (advanced mode) |
+| `simplified.py` | Guided wizard UI (simplified mode) |
 | `projections.py` | Accumulation phase calculations |
 | `withdrawals.py` | Retirement drawdown simulation |
 | `taxes.py` | Federal and state tax engine |
@@ -66,9 +66,8 @@ Scenario data is stored in `scenarios/` and tracking data in `scenarios/tracking
 
 | Release | Status |
 | ------- | ------ |
+| v1.0 | Latest stable |
 | v0.1 | Stable |
-| v0.2 | Stable |
-| v0.3 | In development |
 
 ---
 

@@ -1,7 +1,6 @@
 import uuid
 from datetime import date
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 
 from projections import project_accumulation
@@ -17,17 +16,16 @@ from constants import RMD_START_AGE
 st.set_page_config(page_title="Retirement Planner", layout="wide")
 
 # Prevent Streamlit's built-in 'C' shortcut (Clear cache) from firing during Ctrl+C (copy).
-components.html(
+st.html(
     """
     <script>
-    window.parent.document.addEventListener('keydown', function(e) {
+    document.addEventListener('keydown', function(e) {
         if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
             e.stopImmediatePropagation();
         }
     }, true);
     </script>
-    """,
-    height=0,
+    """
 )
 
 # ---------------------------------------------------------------------------
@@ -1584,7 +1582,7 @@ def main():
 
         mc_model = st.radio(
             "Return model",
-            ["CMA Log-Normal (Advanced)", "Standard (Normal)"],
+            ["CMA Log-Normal (Recommended)", "Standard (Normal) ⚠ Experimental"],
             horizontal=True,
             key="mc_model",
             help=(
@@ -1594,7 +1592,7 @@ def main():
                 "stochastic inflation, and CMA-calibrated default volatilities."
             ),
         )
-        use_v2 = mc_model.startswith("CMA")
+        use_v2 = "CMA" in mc_model
 
         if use_v2:
             st.caption(
@@ -1612,6 +1610,11 @@ def main():
                 "per account per year. Simple and fast; underestimates left-tail risk slightly "
                 "because it ignores cross-account correlation and uses fixed inflation. "
                 "**Success** = portfolio never hits $0 before your life expectancy."
+            )
+            st.warning(
+                "**Experimental — not recommended.** The Standard model will be deprecated in a future release. "
+                "Use CMA Log-Normal for more realistic results.",
+                icon="⚠️",
             )
 
         # --- Parameters ---

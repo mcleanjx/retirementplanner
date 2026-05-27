@@ -27,13 +27,27 @@ git --version
 ## Installation Steps
 
 ### 1. Clone the repository
+
+Navigate to whichever folder you'd like the app to live inside — it can be anywhere on your computer (Documents, Desktop, a projects folder, etc.). Cloning will automatically create a `retirementplanner` subfolder there, so you don't need to create one yourself.
+
+**Windows:**
+```
+cd C:\Users\YourName\Documents
+```
+
+**Mac/Linux:**
+```
+cd ~/Documents
+```
+
+Then clone the repository:
 ```
 git clone https://github.com/mcleanjx/retirementplanner.git
 cd retirementplanner
 ```
 
 ### 2. (Optional) Create a virtual environment
-A virtual environment keeps the app's dependencies isolated from other Python projects.
+A virtual environment keeps the app's dependencies isolated from other Python projects. If this is the only Python app you're running, you can skip this step.
 
 **Windows:**
 ```
