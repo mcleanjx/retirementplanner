@@ -10,6 +10,7 @@ import montecarlo as _mc
 import montecarlo_v2 as _mc2
 import plotly.graph_objects as go
 import optimizer as _opt
+import optimizer_v2 as _opt_v2
 from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking, get_last_used_scenario, set_last_used_scenario, validate_scenario_name
 from constants import RMD_START_AGE
 
@@ -1911,6 +1912,23 @@ def main():
             "scenario**. Use the results as a guide, then apply changes manually in the sidebar."
         )
 
+        # --- Version selector ---
+        opt_version = st.radio(
+            "Optimizer Version",
+            options=["v1 — Roth conversion + withdrawal strategy",
+                     "v2 — + SS timing, cash buffer, spending smile"],
+            index=0,
+            horizontal=True,
+            key="opt_version",
+            help=(
+                "**v1** optimizes Roth conversion timing and withdrawal order. "
+                "**v2** adds Social Security start age, pre-retirement cash buffer "
+                "(1–3 yrs of spending held in cash to shield against sequence risk), "
+                "and a spending smile (real spending naturally declines ~1%/yr in mid-retirement)."
+            ),
+        )
+        use_v2 = opt_version.startswith("v2")
+
         # --- Controls ---
         opt_c1, opt_c2, opt_c3 = st.columns([2, 2, 2])
         with opt_c1:
@@ -1931,7 +1949,7 @@ def main():
 
         if st.button("▶ Run Optimizer", type="primary", key="opt_run"):
             with st.spinner(f"Evaluating {opt_n:,} strategy combinations…"):
-                _opt_run_result = _opt.run_optimizer(
+                _opt_kwargs = dict(
                     accounts_at_retirement=accounts_at_retirement,
                     profile=profile,
                     assumptions=assumptions,
@@ -1941,6 +1959,11 @@ def main():
                     legacy_weight=opt_legacy,
                     seed=opt_seed,
                 )
+                if use_v2:
+                    _opt_run_result = _opt_v2.run_optimizer_v2(**_opt_kwargs)
+                else:
+                    _opt_run_result = _opt.run_optimizer(**_opt_kwargs)
+                _opt_run_result["_version"] = "v2" if use_v2 else "v1"
             st.session_state["opt_result"] = _opt_run_result
 
         opt_result = st.session_state.get("opt_result")
@@ -2096,7 +2119,19 @@ def main():
             st.divider()
             st.subheader("Recommended Strategy Settings")
             st.caption("Apply these settings in the sidebar to activate the optimized strategy.")
-            desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement)
+            _opt_result_version = opt_result.get("_version", "v1")
+            if _opt_result_version == "v2":
+                desc = _opt_v2.describe_strategy_v2(
+                    withdrawal_strategy=best_ws,
+                    roth_conversion=best_rc,
+                    accounts=accounts_at_retirement,
+                    profile_overrides=best.get("profile_overrides", {}),
+                    cash_buffer_years=best.get("cash_buffer_years", 0.0),
+                    smile_rate=best.get("smile_rate", 0.0),
+                    base_profile=profile,
+                )
+            else:
+                desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement)
             desc_df = pd.DataFrame(
                 [{"Setting": k, "Recommended Value": v} for k, v in desc.items()]
             )
