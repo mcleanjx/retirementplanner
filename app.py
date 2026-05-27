@@ -1947,6 +1947,21 @@ def main():
                 help="Change to explore different random draws with the same iteration count.",
             ))
 
+        if use_v2:
+            opt_ltcg = st.slider(
+                "Assumed LTCG Rate for Buffer (v2)",
+                min_value=0, max_value=24, value=15, step=1,
+                key="opt_ltcg",
+                help=(
+                    "Capital gains tax rate applied when liquidating taxable accounts to build "
+                    "the pre-retirement cash buffer. Use 0% if the buffer comes from salary savings "
+                    "or existing cash; use 15–20% if selling appreciated brokerage holdings. "
+                    "Traditional accounts are excluded as buffer sources (income tax + potential penalty)."
+                ),
+            ) / 100.0
+        else:
+            opt_ltcg = 0.15
+
         if st.button("▶ Run Optimizer", type="primary", key="opt_run"):
             with st.spinner(f"Evaluating {opt_n:,} strategy combinations…"):
                 _opt_kwargs = dict(
@@ -1960,7 +1975,7 @@ def main():
                     seed=opt_seed,
                 )
                 if use_v2:
-                    _opt_run_result = _opt_v2.run_optimizer_v2(**_opt_kwargs)
+                    _opt_run_result = _opt_v2.run_optimizer_v2(**_opt_kwargs, ltcg_rate=opt_ltcg)
                 else:
                     _opt_run_result = _opt.run_optimizer(**_opt_kwargs)
                 _opt_run_result["_version"] = "v2" if use_v2 else "v1"
@@ -2129,6 +2144,8 @@ def main():
                     cash_buffer_years=best.get("cash_buffer_years", 0.0),
                     smile_rate=best.get("smile_rate", 0.0),
                     base_profile=profile,
+                    buffer_tax_paid=best.get("buffer_tax_paid", 0.0),
+                    ltcg_rate=best.get("_ltcg_rate", 0.15),
                 )
             else:
                 desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement)

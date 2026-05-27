@@ -47,49 +47,95 @@ SS_AGE_OPTIONS = list(range(62, 71))
 
 
 # ---------------------------------------------------------------------------
-# Helper: cash buffer
+# Helper: cash buffer (tax-aware)
 # ---------------------------------------------------------------------------
 
-def _apply_cash_buffer(
-    accounts: list, annual_spending: float, buffer_years: float
-) -> list:
-    """
-    Shift `buffer_years × annual_spending` from investable accounts into the
-    largest bank account, simulating a pre-retirement liquidity reserve.
+def _gain_ratio(account: dict) -> float:
+    """Fraction of account balance that is unrealized capital gain (0–1)."""
+    bal = account.get("balance", 0.0)
+    basis = account.get("basis", bal)
+    if bal <= 0:
+        return 0.0
+    return max(0.0, min(1.0, (bal - basis) / bal))
 
-    Draw order: taxable first, then Traditional, then Roth (tax-efficiency order).
-    Never over-draws any account. Returns a deep copy — original is unmodified.
+
+def _apply_cash_buffer(
+    accounts: list,
+    annual_spending: float,
+    buffer_years: float,
+    ltcg_rate: float = 0.15,
+) -> tuple[list, float, float]:
+    """
+    Build a pre-retirement cash buffer by liquidating invested accounts, applying
+    LTCG taxes on any embedded gains in taxable accounts.
+
+    Source priority (Traditional excluded — income tax + early-withdrawal penalty
+    make it an uneconomical buffer source):
+      1. Taxable brokerage — LTCG taxes applied on embedded gains at ltcg_rate
+      2. Roth — after-tax contributions, no additional tax on withdrawal
+
+    When selling taxable assets, you must sell MORE than the buffer amount to cover
+    the resulting tax bill. For example: building a $300K buffer from an account with
+    a 60% gain ratio at 15% LTCG requires selling $300K / (1 − 0.09) = $330K gross,
+    paying $30K to the IRS, leaving $300K in the bank — a real portfolio cost.
+
+    Returns:
+        (modified_accounts, cash_deposited, ltcg_tax_paid)
     """
     if buffer_years <= 0:
-        return copy.deepcopy(accounts)
+        accts = copy.deepcopy(accounts)
+        return accts, 0.0, 0.0
 
     accts = copy.deepcopy(accounts)
-    bank_accounts = [a for a in accts if a["type"] in BANK_TYPES]
-    if not bank_accounts:
-        return accts  # nowhere to put the buffer — skip
+    bank_accts = [a for a in accts if a["type"] in BANK_TYPES]
+    if not bank_accts:
+        return accts, 0.0, 0.0
 
-    target_bank = max(bank_accounts, key=lambda a: a["balance"])
-    total_needed = buffer_years * annual_spending
+    target_bank = max(bank_accts, key=lambda a: a["balance"])
+    cash_needed = buffer_years * annual_spending
+    remaining = cash_needed
+    total_tax_paid = 0.0
+    cash_deposited = 0.0
 
-    source_priority = [TAXABLE_TYPES, TRADITIONAL_TYPES, ROTH_TYPES]
-    remaining = total_needed
+    # Taxable first (LTCG applies), then Roth (no tax)
+    sources = [
+        (TAXABLE_TYPES, ltcg_rate),
+        (ROTH_TYPES,    0.0),
+    ]
 
-    for type_set in source_priority:
+    for type_set, rate in sources:
         if remaining <= 0:
             break
-        candidates = [a for a in accts if a["type"] in type_set and a["balance"] > 0]
-        total_avail = sum(a["balance"] for a in candidates)
-        if total_avail <= 0:
-            continue
-        to_draw = min(remaining, total_avail)
+        candidates = sorted(
+            [a for a in accts if a["type"] in type_set and a["balance"] > 0],
+            key=lambda a: _gain_ratio(a),  # lowest-gain accounts first (least tax)
+        )
         for a in candidates:
-            share = to_draw * (a["balance"] / total_avail)
-            a["balance"] = max(0.0, a["balance"] - share)
-            remaining -= share
+            if remaining <= 0:
+                break
 
-    actual_buffer = total_needed - remaining
-    target_bank["balance"] += actual_buffer
-    return accts
+            gr = _gain_ratio(a) if rate > 0 else 0.0
+            # tax as a fraction of gross proceeds: gain_ratio × ltcg_rate
+            tax_fraction = gr * rate
+            # To net $1 of cash after taxes, must sell $1 / (1 − tax_fraction) gross
+            # max cash extractable from this account after covering the tax bill
+            max_net_cash = a["balance"] * (1.0 - tax_fraction)
+            net_cash = min(remaining, max_net_cash)
+            gross_sold = net_cash / max(1e-9, 1.0 - tax_fraction)
+            tax_on_sale = gross_sold - net_cash
+
+            a["balance"] = max(0.0, a["balance"] - gross_sold)
+            # Reduce basis proportional to the cost-basis portion of what was sold
+            if rate > 0 and a.get("basis") is not None:
+                basis_recovered = gross_sold * (1.0 - gr)
+                a["basis"] = max(0.0, a["basis"] - basis_recovered)
+
+            remaining -= net_cash
+            cash_deposited += net_cash
+            total_tax_paid += tax_on_sale
+
+    target_bank["balance"] += cash_deposited
+    return accts, cash_deposited, total_tax_paid
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +264,8 @@ def describe_strategy_v2(
     cash_buffer_years: float,
     smile_rate: float,
     base_profile: dict,
+    buffer_tax_paid: float = 0.0,
+    ltcg_rate: float = 0.15,
 ) -> dict:
     """Human-readable description of a v2 strategy, extending v1's output."""
     desc = _describe_strategy(withdrawal_strategy, roth_conversion, accounts)
@@ -240,18 +288,24 @@ def describe_strategy_v2(
         desc["SS Start Age (spouse)"] = spouse_label
 
     if cash_buffer_years > 0:
+        tax_note = (
+            f" — estimated ${buffer_tax_paid:,.0f} LTCG tax to liquidate"
+            f" (assumes {ltcg_rate:.0%} rate on embedded gains)"
+            if buffer_tax_paid > 0
+            else " — sourced from Roth/existing cash (no LTCG tax)"
+        )
         desc["Cash Buffer"] = (
-            f"{cash_buffer_years:.1f} yr — shift that amount from invested accounts "
-            "into cash before retiring (earns bank rate, shields against sequence risk)"
+            f"{cash_buffer_years:.1f} yr of spending held in cash at retirement{tax_note}. "
+            "Earns bank/savings rate; shields against forced stock sales in a down market."
         )
     else:
         desc["Cash Buffer"] = "None (fully invested at retirement)"
 
     if smile_rate > 0:
         desc["Spending Smile"] = (
-            f"Real spending declines {smile_rate:.1%}/yr — spending grows at "
+            f"Real spending declines {smile_rate:.1%}/yr — grows at "
             f"(inflation − {smile_rate:.1%}) nominally, reflecting Blanchett's "
-            "finding that retirees naturally spend less in real terms through mid-retirement"
+            "finding that retirees naturally spend ~20% less in real terms by mid-retirement"
         )
     else:
         desc["Spending Smile"] = "Flat real spending (inflation-adjusted throughout)"
@@ -272,6 +326,7 @@ def run_optimizer_v2(
     n_iterations: int = 500,
     legacy_weight: float = 0.20,
     seed: int = 42,
+    ltcg_rate: float = 0.15,
 ) -> dict:
     """
     Run the v2 strategy optimizer over `n_iterations` random trials.
@@ -281,8 +336,14 @@ def run_optimizer_v2(
         ss_start_age       : int | None
         spouse_ss_start_age: int | None
         cash_buffer_years  : float
+        buffer_tax_paid    : float  — LTCG taxes incurred to build the buffer
         smile_rate         : float
         profile_overrides  : dict
+
+    ltcg_rate: assumed capital gains tax rate for taxable account liquidations
+    when building the cash buffer. Defaults to 15% (typical for early retirees).
+    Traditional accounts are excluded as buffer sources — income tax plus potential
+    early-withdrawal penalties make them uneconomical.
     """
     rng = random.Random(seed)
     spending_overrides = spending_overrides or {}
@@ -323,6 +384,7 @@ def run_optimizer_v2(
         "ss_start_age": profile.get("social_security_start_age"),
         "spouse_ss_start_age": profile.get("spouse_ss_start_age"),
         "cash_buffer_years": 0.0,
+        "buffer_tax_paid": 0.0,
         "smile_rate": 0.0,
     }
 
@@ -338,8 +400,8 @@ def run_optimizer_v2(
 
         trial_profile = {**profile, **prof_overrides}
         trial_assumptions = {**assumptions, "withdrawal_strategy": w_strat}
-        trial_accounts = _apply_cash_buffer(
-            accounts_at_retirement, base_spending, cash_buffer_years
+        trial_accounts, cash_deposited, tax_paid = _apply_cash_buffer(
+            accounts_at_retirement, base_spending, cash_buffer_years, ltcg_rate
         )
         trial_overrides = _compute_smile_overrides(
             retirement_age, life_expectancy, base_spending,
@@ -364,7 +426,9 @@ def run_optimizer_v2(
                 "ss_start_age": prof_overrides.get("social_security_start_age"),
                 "spouse_ss_start_age": prof_overrides.get("spouse_ss_start_age"),
                 "cash_buffer_years": cash_buffer_years,
+                "buffer_tax_paid": tax_paid,
                 "smile_rate": smile_rate,
+                "_ltcg_rate": ltcg_rate,
             })
         except Exception:
             continue
