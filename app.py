@@ -713,7 +713,8 @@ def _do_save(name: str) -> None:
 
 def sidebar_scenarios():
     with st.sidebar.expander("💾 Scenarios", expanded=False):
-        name = st.text_input("Scenario Name", "My Scenario", key="sc_name")
+        st.session_state.setdefault("sc_name", "My Scenario")
+        name = st.text_input("Scenario Name", key="sc_name")
         try:
             validate_scenario_name(name)
             _sc_name_valid = True
@@ -1669,10 +1670,7 @@ def main():
         ) / 100.0
 
         if use_v2:
-            from montecarlo_v2 import (
-                EQUITY_RISK_PREMIUM, HISTORICAL_MEDIAN_CAPE,
-                REAL_EARNINGS_GROWTH, CAPE_REVERSION_YEARS,
-            )
+            from montecarlo_v2 import EQUITY_RISK_PREMIUM
             _eq_mean = _ret + (1 - mc_stock_pct) * EQUITY_RISK_PREMIUM
             _bd_mean = _ret - mc_stock_pct * EQUITY_RISK_PREMIUM
             _eff_vol_v2 = mc_stock_pct * mc_equity_vol + (1 - mc_stock_pct) * mc_bond_vol
@@ -1721,44 +1719,6 @@ def main():
             key="mc_crashes",
         )
 
-        if use_v2:
-            cape_col1, cape_col2 = st.columns([2, 1])
-            with cape_col1:
-                mc_use_cape_adj = st.checkbox(
-                    "CAPE-adjusted near-term returns",
-                    value=False,
-                    key="mc_cape_adj",
-                    help=(
-                        "Reduces equity expected returns for the first 10 years using the Shiller "
-                        "earnings-yield model (1/CAPE + real earnings growth + inflation), then "
-                        "reverts linearly to the long-run mean. Historically elevated CAPE values "
-                        "have predicted below-average 10-year forward equity returns."
-                    ),
-                )
-            with cape_col2:
-                mc_current_cape = st.number_input(
-                    "Current CAPE",
-                    min_value=5.0, max_value=100.0, value=39.6, step=0.5,
-                    key="mc_current_cape",
-                    help="Shiller CAPE (cyclically adjusted P/E). Historical median ~16.6. Current ~39.6 (May 2026).",
-                    disabled=not mc_use_cape_adj,
-                )
-            if mc_use_cape_adj:
-                _infl = assumptions.get("inflation_rate", 0.03)
-                _cape_eq = 1.0 / mc_current_cape + REAL_EARNINGS_GROWTH + _infl
-                _base_eq = _ret + (1 - mc_stock_pct) * EQUITY_RISK_PREMIUM
-                _port_drag = mc_stock_pct * max(0.0, _base_eq - _cape_eq)
-                st.caption(
-                    f"CAPE {mc_current_cape:.1f} implies a near-term equity return of **{_cape_eq:.1%}** "
-                    f"vs. long-run mean of **{_base_eq:.1%}** — "
-                    f"a **{_base_eq - _cape_eq:.1%}** equity drag (**{_port_drag:.1%}** on portfolio at {mc_stock_pct:.0%} stocks), "
-                    f"fading linearly to zero by year {CAPE_REVERSION_YEARS}. "
-                    f"Historical median CAPE: {HISTORICAL_MEDIAN_CAPE}."
-                )
-        else:
-            mc_use_cape_adj = False
-            mc_current_cape = 39.6
-
         det_portfolio = ret_df["total_portfolio"].tolist() if not ret_df.empty else []
 
         # --- Run button ---
@@ -1777,8 +1737,6 @@ def main():
                         enable_crashes=mc_crashes,
                         stock_pct=mc_stock_pct,
                         withdrawal_mode=mc_withdrawal_mode_key,
-                        use_cape_adj=mc_use_cape_adj,
-                        current_cape=mc_current_cape,
                     )
                 else:
                     result = _mc.run_monte_carlo(

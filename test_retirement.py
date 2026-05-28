@@ -1185,14 +1185,12 @@ class TestScenarios:
         with pytest.raises(FileNotFoundError):
             load_scenario("nonexistent")
 
-    def test_save_sanitizes_filename(self):
+    def test_save_rejects_invalid_characters(self):
         from scenarios import save_scenario
-        # Special chars in name should be sanitized to underscores
+        # validate_scenario_name raises ValueError for /, <, > — save must not silently succeed
         d = self._scenario_data("My/Scenario<Test>")
-        save_scenario(d["name"], d["profile"], d["assumptions"], d["accounts"])
-        # File exists — load by sanitized name
-        files = list(self._tmp.glob("*.json"))
-        assert len(files) == 1
+        with pytest.raises(ValueError, match="invalid characters"):
+            save_scenario(d["name"], d["profile"], d["assumptions"], d["accounts"])
 
     def test_empty_name_raises(self):
         from scenarios import save_scenario
