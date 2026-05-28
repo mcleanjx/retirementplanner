@@ -713,7 +713,8 @@ def _do_save(name: str) -> None:
 
 def sidebar_scenarios():
     with st.sidebar.expander("💾 Scenarios", expanded=False):
-        name = st.text_input("Scenario Name", "My Scenario", key="sc_name")
+        st.session_state.setdefault("sc_name", "My Scenario")
+        name = st.text_input("Scenario Name", key="sc_name")
         try:
             validate_scenario_name(name)
             _sc_name_valid = True
