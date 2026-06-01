@@ -9,11 +9,13 @@ Living document. Update when decisions are made or new questions arise.
 
 **CAPE adjustment removed (v1.1)** — Shiller earnings-yield model was implemented but disabled and held a hardcoded CAPE of 39.6 that would silently go stale. Removed rather than ship misleading dead code. To re-add properly: expose a "Current CAPE" user input in the UI, wire it to `_equity_bond_means()` output with linear reversion over 10 years, and add a note that the user is responsible for keeping it current.
 
-**Guyton-Klinger guardrails not exposed in UI** — Implemented in `montecarlo_v2.py` lines 214–230 but `simplified.py` hardcodes `withdrawal_mode="constant_real"`. Worth surfacing as a toggle — it meaningfully extends portfolio survival in bad sequences.
+**Guyton-Klinger guardrails not exposed in UI** — Implemented in `montecarlo_v2.py` lines 214–230 but the Monte Carlo tab defaults to `withdrawal_mode="constant_real"`. Worth surfacing as a toggle — it meaningfully extends portfolio survival in bad sequences.
 
 **Accumulation vs. retirement return rate inconsistency** — Accumulation phase (`projections.py:98`) defaults to 7% regardless of the user's global setting; retirement phase uses user-set rate (default 6.5%). Subtle but could mislead users who tune the retirement rate thinking it applies everywhere.
 
 **Spousal Roth conversion bracket coordination** — Per-account ownership flags exist but conversion headroom (`withdrawals.py:425`) applies a single MFJ bracket ceiling without distinguishing whose account is being converted. Could cause bracket collision in edge cases where both spouses convert in the same year.
+
+**Optimizer v2 IRMAA/ACA headroom display uses profile-default SS ages** — The reported IRMAA and ACA headroom shown in the Recommended Strategy Settings table is estimated once using the profile's current SS start ages, not the optimized trial's SS start ages. The optimization itself is correct (headroom is recomputed per trial during the search); only the displayed figure is approximate. Fix: pass the best trial's `ss_start` into `_irmaa_headroom` / `_aca_headroom` before calling `describe_strategy_v2`.
 
 ---
 
