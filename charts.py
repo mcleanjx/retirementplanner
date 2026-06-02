@@ -344,7 +344,11 @@ def chart_spending_coverage(ret_df: pd.DataFrame, current_age: int = 0, retireme
     return fig
 
 
-def chart_progress_tracking(projections_by_age: dict, checkins: list) -> go.Figure:
+def chart_progress_tracking(
+    projections_by_age: dict,
+    checkins: list,
+    mc_median: dict | None = None,
+) -> go.Figure:
     """Dashed baseline projection line with colored scatter dots for actual check-ins."""
     ages = sorted(int(a) for a in projections_by_age)
     totals = [projections_by_age[str(a)]["total"] for a in ages]
@@ -357,6 +361,19 @@ def chart_progress_tracking(projections_by_age: dict, checkins: list) -> go.Figu
         line=dict(color="#4C72B0", width=2, dash="dash"),
         hovertemplate="Age %{x}: %{y:$,.0f}<extra>Projected</extra>",
     ))
+
+    if mc_median:
+        mc_by_age = mc_median.get("by_age", {})
+        mc_ages = sorted(int(a) for a in mc_by_age)
+        mc_vals = [mc_by_age[str(a)] for a in mc_ages]
+        model_label = mc_median.get("model", "MC")
+        fig.add_trace(go.Scatter(
+            x=mc_ages, y=mc_vals,
+            name=f"MC Median ({model_label})",
+            mode="lines",
+            line=dict(color="#E07B00", width=2, dash="dot"),
+            hovertemplate="Age %{x}: %{y:$,.0f}<extra>MC Median</extra>",
+        ))
 
     for c in sorted(checkins, key=lambda x: x["age"]):
         proj_entry = projections_by_age.get(str(c["age"]))

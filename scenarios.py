@@ -91,6 +91,9 @@ def delete_scenario(name: str) -> None:
     path = SCENARIOS_DIR / f"{name}.json"
     if path.exists():
         path.unlink()
+    tracking_path = TRACKING_DIR / f"{_safe_name(name)}_tracking.json"
+    if tracking_path.exists():
+        tracking_path.unlink()
 
 
 def _safe_name(name: str) -> str:

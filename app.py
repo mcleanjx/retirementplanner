@@ -1,3 +1,4 @@
+import copy
 import uuid
 from datetime import date
 import streamlit as st
@@ -67,7 +68,7 @@ DEFAULT_ACCOUNTS = [
         "id": "acc1",
         "name": "401(k)",
         "type": "traditional_401k",
-        "balance": 150000.0,
+        "balance": 0.0,
         "basis": 0.0,
         "annual_contribution": 15000.0,
         "contribution_growth_rate": 0.03,
@@ -82,8 +83,8 @@ DEFAULT_ACCOUNTS = [
         "id": "acc2",
         "name": "Roth IRA",
         "type": "roth_ira",
-        "balance": 40000.0,
-        "basis": 40000.0,
+        "balance": 0.0,
+        "basis": 0.0,
         "annual_contribution": 7000.0,
         "contribution_growth_rate": 0.0,
         "return_rate": 0.07,
@@ -117,7 +118,6 @@ def _init_state():
                 data = load_scenario(recent)
                 st.session_state.profile = data["profile"]
                 st.session_state.assumptions = data["assumptions"]
-                import copy
                 st.session_state.accounts = copy.deepcopy(data["accounts"])
                 st.session_state.roth_conversion = data.get("roth_conversion", DEFAULT_ROTH_CONVERSION.copy())
                 st.session_state.spending_overrides = {}
@@ -129,7 +129,6 @@ def _init_state():
     if "assumptions" not in st.session_state:
         st.session_state.assumptions = DEFAULT_ASSUMPTIONS.copy()
     if "accounts" not in st.session_state:
-        import copy
         st.session_state.accounts = copy.deepcopy(DEFAULT_ACCOUNTS)
     if "roth_conversion" not in st.session_state:
         st.session_state.roth_conversion = DEFAULT_ROTH_CONVERSION.copy()
@@ -156,8 +155,32 @@ def _apply_pending_load():
     set_last_used_scenario(_loaded_name)
 
 
+def _apply_pending_new_scenario():
+    if "_pending_new_scenario" not in st.session_state:
+        return
+    new_name = st.session_state.pop("_pending_new_scenario")
+    st.session_state.profile = DEFAULT_PROFILE.copy()
+    st.session_state.assumptions = DEFAULT_ASSUMPTIONS.copy()
+    st.session_state.accounts = copy.deepcopy(DEFAULT_ACCOUNTS)
+    st.session_state.roth_conversion = DEFAULT_ROTH_CONVERSION.copy()
+    st.session_state.spending_overrides = {}
+    st.session_state.pop("cmp_result", None)
+    st.session_state.pop("mc_result", None)
+    st.session_state.pop("mc_result_v2", None)
+    st.session_state["sc_name"] = new_name
+    save_scenario(
+        new_name,
+        st.session_state.profile,
+        st.session_state.assumptions,
+        st.session_state.accounts,
+        st.session_state.roth_conversion,
+    )
+    set_last_used_scenario(new_name)
+
+
 _init_state()
 _apply_pending_load()
+_apply_pending_new_scenario()
 
 # ---------------------------------------------------------------------------
 # Sidebar helpers
@@ -614,7 +637,7 @@ def main():
 
     # Sidebar
     sc_display = st.session_state.get("sc_name", "My Scenario")
-    _sb_name_col, _sb_save_col = st.sidebar.columns([3, 1])
+    _sb_name_col, _sb_save_col, _sb_new_col = st.sidebar.columns([3, 1, 1])
     _sb_name_col.markdown(
         f"<div style='font-size:0.78rem;color:#888;margin-bottom:0.1rem;'>Scenario</div>"
         f"<div style='font-size:1rem;font-weight:600;margin-bottom:0.75rem;'>{sc_display}</div>",
@@ -631,8 +654,30 @@ def main():
             st.sidebar.success("Saved ✓", icon="💾")
         except Exception as e:
             st.sidebar.error(str(e))
+    if _sb_new_col.button("➕ New", key="sc_new_btn", help="Create a new blank scenario", width='stretch'):
+        st.session_state["new_scenario_form_open"] = True
+        st.rerun()
     if not _name_valid:
         st.sidebar.caption("⚠️ Scenario name contains invalid characters. Use only letters, numbers, spaces, hyphens, and underscores.")
+
+    if st.session_state.get("new_scenario_form_open"):
+        with st.sidebar.form("new_scenario_form", border=True):
+            st.markdown("**New Scenario**")
+            _new_name = st.text_input("Name", value="My Scenario", key="new_sc_name_input")
+            _col_create, _col_cancel = st.columns(2)
+            _submitted = _col_create.form_submit_button("Create", type="primary", use_container_width=True)
+            _cancelled = _col_cancel.form_submit_button("Cancel", use_container_width=True)
+        if _cancelled:
+            st.session_state.pop("new_scenario_form_open", None)
+            st.rerun()
+        if _submitted:
+            try:
+                validate_scenario_name(_new_name)
+                st.session_state.pop("new_scenario_form_open", None)
+                st.session_state["_pending_new_scenario"] = _new_name
+                st.rerun()
+            except ValueError as _ve:
+                st.sidebar.error(str(_ve))
     sidebar_profile()
     sidebar_assumptions()
     sidebar_accounts()
@@ -1196,10 +1241,12 @@ def main():
         st.divider()
 
         # ── Comparison chart & history ─────────────────────────────────────────
+        mc_median = tracking.get("mc_median")
+
         if baseline:
             if checkins:
                 st.plotly_chart(
-                    _charts.chart_progress_tracking(baseline["projections_by_age"], checkins),
+                    _charts.chart_progress_tracking(baseline["projections_by_age"], checkins, mc_median),
                     width='stretch',
                 )
 
@@ -1269,7 +1316,7 @@ def main():
                             st.rerun()
             else:
                 st.plotly_chart(
-                    _charts.chart_progress_tracking(baseline["projections_by_age"], []),
+                    _charts.chart_progress_tracking(baseline["projections_by_age"], [], mc_median),
                     width='stretch',
                 )
                 st.info("No check-ins recorded yet. Enter actual balances above to compare against the plan.")
@@ -1622,6 +1669,21 @@ def main():
                 _charts.chart_monte_carlo(mc_result, det_portfolio),
                 width='stretch',
             )
+
+            mc_sc_name = st.session_state.get("sc_name", "My Scenario")
+            if st.button("📌 Add Median to Progress Chart", key="mc_add_to_progress"):
+                _mc_tracking = load_tracking(mc_sc_name)
+                _mc_tracking["mc_median"] = {
+                    "captured_date": date.today().isoformat(),
+                    "model": "CMA Log-Normal" if use_v2 else "Standard",
+                    "by_age": {
+                        str(age): val
+                        for age, val in zip(mc_result["ages"], mc_result["percentiles"][50])
+                    },
+                }
+                save_tracking(mc_sc_name, _mc_tracking)
+                st.success("MC median saved — visible in the Progress tab.")
+
             if mc_result["n_depleted"] > 0:
                 st.plotly_chart(_charts.chart_mc_depletion(mc_result), width='stretch')
         else:
