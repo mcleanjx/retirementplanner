@@ -134,6 +134,32 @@ CA_ORDINARY_BRACKETS = {
     ],
 }
 
+# ---------------------------------------------------------------------------
+# Montana state income tax — 2026
+# Source: MT DOR HB337 (effective January 1, 2026)
+# Key differences from federal:
+#   - Capital gains taxed as ordinary income (no preferential rate)
+#   - Social Security taxable at same rate as federal (not excluded)
+#   - Standard deduction mirrors federal (MT adopted federal standard deduction)
+# ---------------------------------------------------------------------------
+
+MT_STANDARD_DEDUCTION = {
+    "single": 16100,             # mirrors federal STANDARD_DEDUCTION
+    "married_filing_jointly": 32200,
+}
+
+# Brackets: (upper bound of MT taxable income, marginal rate); None = no upper limit
+MT_ORDINARY_BRACKETS = {
+    "single": [
+        (47500, 0.047),
+        (None,  0.0565),
+    ],
+    "married_filing_jointly": [
+        (95000, 0.047),
+        (None,  0.0565),
+    ],
+}
+
 # Bracket ceiling for each named bracket (taxable income, above standard deduction)
 BRACKET_CEILINGS = {
     "single": {

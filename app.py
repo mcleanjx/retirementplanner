@@ -135,96 +135,22 @@ def _init_state():
         st.session_state.roth_conversion = DEFAULT_ROTH_CONVERSION.copy()
     if "spending_overrides" not in st.session_state:
         st.session_state.spending_overrides = {}
-    # Set chk_global_* keys from account dicts so the checkbox renders correctly.
-    # Uses chk_global_ prefix (not a_*) so these keys are never deleted by
-    # _apply_pending_load's deletion loop, avoiding the delete-then-set problem.
-    for _a in st.session_state.accounts:
-        key = f"chk_global_{_a['id']}"
-        if key not in st.session_state:
-            st.session_state[key] = bool(_a.get("use_global_return_rate", True))
 
 
 def _apply_pending_load():
-    """
-    Apply a scenario load that was queued on the previous render.
-    Must run before any sidebar widgets are created so that deleting
-    widget keys (p_*, a_*, rc_*) actually takes effect — Streamlit
-    won't let you delete a key while the widget is still rendered.
-    """
     if "_pending_load" not in st.session_state:
         return
     data = st.session_state.pop("_pending_load")
-    for k in list(st.session_state.keys()):
-        if k.startswith(("p_", "a_", "rc_")):
-            del st.session_state[k]
     st.session_state.profile = data["profile"]
-    # Explicitly seed widget keys for profile fields.  Streamlit processes the
-    # browser's widget payload before running the script, so a browser-restored
-    # value can survive key deletion.  Setting the keys here ensures the loaded
-    # values win when the widgets are rendered below.
-    _p = data["profile"]
-    st.session_state["p_age"] = int(_p["current_age"])
-    st.session_state["p_ret"] = int(_p["retirement_age"])
-    st.session_state["p_le"] = int(_p["life_expectancy"])
-    st.session_state["p_income"] = int(_p.get("current_income", 0) or 0)
-    st.session_state["p_ss"] = int(_p.get("social_security_benefit", 0))
-    st.session_state["p_ss_age"] = int(_p.get("social_security_start_age", 67))
-    st.session_state["p_sp_age"] = int(_p.get("spouse_age", _p["current_age"]))
-    st.session_state["p_sp_ret"] = int(_p.get("spouse_retirement_age", 65))
-    st.session_state["p_sp_ss"] = int(_p.get("spouse_ss_benefit", 0))
-    st.session_state["p_sp_ss_age"] = int(_p.get("spouse_ss_start_age", 67))
-    st.session_state["p_hc_pre"] = int(_p.get("pre_medicare_healthcare", 15000))
-    st.session_state["p_hc_post"] = int(_p.get("post_medicare_healthcare", 12000))
     st.session_state.assumptions = data["assumptions"]
-    _asmp = data["assumptions"]
-    st.session_state["a_inf"]          = float(round(_asmp.get("inflation_rate", 0.03) * 100, 1))
-    st.session_state["a_bracket_inf"]  = float(round(_asmp.get("bracket_inflation_rate", 0.025) * 100, 1))
-    st.session_state["a_ret"]          = float(round(_asmp.get("retirement_return_rate", 0.065) * 100, 1))
-    st.session_state["a_spend_mode"]   = _asmp.get("spending_mode", "swr")
-    st.session_state["a_swr"]          = float(round(_asmp.get("safe_withdrawal_rate", 0.04) * 100, 1))
-    st.session_state["a_spend_target"] = int(_asmp.get("annual_spending_target", 80000))
-    st.session_state["a_withdraw_strat"] = _asmp.get("withdrawal_strategy", "tax_efficient")
     st.session_state.accounts = data["accounts"]
-    # Explicitly seed all account widget keys so browser-submitted values from
-    # the previous scenario cannot overwrite the freshly loaded data.
-    # Same pattern as the profile p_* keys above.
-    _ACCT_TYPE_LABELS = {
-        "traditional_401k": "Traditional 401(k)",
-        "roth_401k":        "Roth 401(k)",
-        "traditional_ira":  "Traditional IRA",
-        "roth_ira":         "Roth IRA",
-        "taxable":          "Taxable Brokerage",
-        "hsa":              "HSA",
-        "reit":             "REIT (Taxable)",
-        "rental_property":  "Rental Property",
-        "bank":             "Bank Account / Cash",
-    }
-    for _a in st.session_state.accounts:
-        _aid = _a["id"]
-        st.session_state[f"chk_global_{_aid}"] = bool(_a.get("use_global_return_rate", True))
-        st.session_state[f"a_name_{_aid}"] = _a["name"]
-        st.session_state[f"a_type_{_aid}"] = _ACCT_TYPE_LABELS.get(_a["type"], _a["type"])
-        st.session_state[f"a_bal_{_aid}"]  = int(_a["balance"])
-        st.session_state[f"a_ret_{_aid}"]  = round(_a.get("return_rate", 0.07) * 100, 4)
-        st.session_state[f"a_contrib_{_aid}"] = int(_a.get("annual_contribution", 0))
-        st.session_state[f"a_cgr_{_aid}"]  = round(_a.get("contribution_growth_rate", 0.0) * 100, 4)
-        st.session_state[f"a_emp_{_aid}"]  = round(_a.get("employer_match_percent", 0.0) * 100, 4)
-        st.session_state[f"a_empl_{_aid}"] = int(_a.get("employer_match_limit", 0))
-        st.session_state[f"a_basis_{_aid}"] = int(_a.get("basis", 0))
-        st.session_state[f"a_qdy_{_aid}"]  = round(_a.get("qualified_dividend_yield", 0.0) * 100, 4)
-        st.session_state[f"a_oiy_{_aid}"]  = round(_a.get("ordinary_income_yield", 0.0) * 100, 4)
-        st.session_state[f"a_rent_{_aid}"] = int(_a.get("net_annual_rental_income", 0))
-        st.session_state[f"a_wlast_{_aid}"] = _a.get("withdraw_priority", "normal") == "last"
-        st.session_state[f"a_owner_{_aid}"] = _a.get("owner", "self")
-        st.session_state[f"a_buf_{_aid}"] = int(_a.get("bank_buffer", 0))
     rc = data.get("roth_conversion", DEFAULT_ROTH_CONVERSION.copy())
-    # Migrate old single-source format → list format
     if "source_account_id" in rc and "source_account_ids" not in rc:
         old_id = rc.pop("source_account_id", None)
         rc["source_account_ids"] = [old_id] if old_id else []
     st.session_state.roth_conversion = rc
     st.session_state.spending_overrides = {}
-    # Update the scenario name text input to match the loaded scenario
+    st.session_state.pop("cmp_result", None)
     _loaded_name = data.get("scenario_name", "My Scenario")
     st.session_state["sc_name"] = _loaded_name
     set_last_used_scenario(_loaded_name)
@@ -297,13 +223,11 @@ def _dec(pct: float) -> float:
 def sidebar_profile():
     p = st.session_state.profile
     with st.sidebar.expander("1. 👤 Profile", expanded=True):
-        p["current_age"] = st.number_input("Current Age", 18, 100, p["current_age"], key="p_age")
-        p["retirement_age"] = st.number_input("Retirement Age", 18, 100, p["retirement_age"], key="p_ret")
+        p["current_age"] = st.number_input("Current Age", 18, 100, p["current_age"])
+        p["retirement_age"] = st.number_input("Retirement Age", 18, 100, p["retirement_age"])
         _p_le_min = max(p["retirement_age"], p["current_age"]) + 1
         _p_le_val = max(p["life_expectancy"], _p_le_min)
-        if st.session_state.get("p_le", _p_le_val) < _p_le_min:
-            st.session_state["p_le"] = _p_le_min
-        p["life_expectancy"] = st.number_input("Life Expectancy", _p_le_min, 110, _p_le_val, key="p_le")
+        p["life_expectancy"] = st.number_input("Life Expectancy", _p_le_min, 110, _p_le_val)
         if p["retirement_age"] < p["current_age"]:
             st.warning("Retirement age is before current age — the app treats this as already retired.")
         if p["life_expectancy"] <= p["retirement_age"]:
@@ -313,39 +237,43 @@ def sidebar_profile():
             options=list(FILING_STATUS_LABELS.keys()),
             format_func=lambda k: FILING_STATUS_LABELS[k],
             index=list(FILING_STATUS_LABELS.keys()).index(p["filing_status"]),
-            key="p_fs",
         )
-        state_options = {"california": "California (progressive brackets)", "other": "Other state (flat rate)"}
+        state_options = {
+            "california": "California (progressive brackets)",
+            "montana": "Montana (progressive brackets)",
+            "other": "Other state (flat rate)",
+        }
+        _state_keys = list(state_options.keys())
+        _cur_state = p.get("state", "california")
         p["state"] = st.selectbox(
             "State",
-            options=list(state_options.keys()),
+            options=_state_keys,
             format_func=lambda k: state_options[k],
-            index=0 if p.get("state", "california") == "california" else 1,
-            key="p_state",
+            index=_state_keys.index(_cur_state) if _cur_state in _state_keys else _state_keys.index("other"),
         )
         if p["state"] == "other":
-            p["state_tax_rate"] = _dec(st.number_input("State Tax Rate (%)", 0.0, 15.0, _pct(p.get("state_tax_rate", 0.05)), 0.1, key="p_state_rate"))
+            p["state_tax_rate"] = _dec(st.number_input("State Tax Rate (%)", 0.0, 15.0, _pct(p.get("state_tax_rate", 0.05)), 0.1))
         else:
             p["state_tax_rate"] = 0.0
-        p["current_income"] = st.number_input("Current Annual Income ($)", 0, 1000000, int(p.get("current_income", 0) or 0), 1000, key="p_income")
+        p["current_income"] = st.number_input("Current Annual Income ($)", 0, 1000000, int(p.get("current_income", 0) or 0), 1000)
 
         st.markdown("**Social Security**")
-        p["social_security_benefit"] = st.number_input("Your SS Benefit ($/yr today's $)", 0, 60000, int(p.get("social_security_benefit", 0)), 500, key="p_ss")
-        p["social_security_start_age"] = st.number_input("Your SS Start Age", 62, 70, p.get("social_security_start_age", 67), key="p_ss_age")
+        p["social_security_benefit"] = st.number_input("Your SS Benefit ($/yr today's $)", 0, 60000, int(p.get("social_security_benefit", 0)), 500)
+        p["social_security_start_age"] = st.number_input("Your SS Start Age", 62, 70, p.get("social_security_start_age", 67))
         st.caption("Enter your estimated benefit in **today's dollars** (from SSA.gov 'my Social Security'). The simulation inflates to retirement-year nominal dollars and applies annual COLA.")
 
         if p["filing_status"] == "married_filing_jointly":
             st.markdown("**Spouse**")
-            p["spouse_age"] = st.number_input("Spouse Current Age", 18, 80, p.get("spouse_age", p["current_age"]), key="p_sp_age")
-            p["spouse_retirement_age"] = st.number_input("Spouse Retirement Age", 18, 100, p.get("spouse_retirement_age", 65), key="p_sp_ret")
-            p["spouse_ss_benefit"] = st.number_input("Spouse SS Benefit ($/yr today's $)", 0, 60000, int(p.get("spouse_ss_benefit", 0)), 500, key="p_sp_ss")
-            p["spouse_ss_start_age"] = st.number_input("Spouse SS Start Age", 62, 70, p.get("spouse_ss_start_age", 67), key="p_sp_ss_age")
+            p["spouse_age"] = st.number_input("Spouse Current Age", 18, 80, p.get("spouse_age", p["current_age"]))
+            p["spouse_retirement_age"] = st.number_input("Spouse Retirement Age", 18, 100, p.get("spouse_retirement_age", 65))
+            p["spouse_ss_benefit"] = st.number_input("Spouse SS Benefit ($/yr today's $)", 0, 60000, int(p.get("spouse_ss_benefit", 0)), 500)
+            p["spouse_ss_start_age"] = st.number_input("Spouse SS Start Age", 62, 70, p.get("spouse_ss_start_age", 67))
             p["survivor_spending_reduction"] = _dec(st.number_input(
-                "Survivor Spending Reduction (%)", 0.0, 50.0, _pct(p.get("survivor_spending_reduction", 0.25)), 1.0, key="p_surv"))
+                "Survivor Spending Reduction (%)", 0.0, 50.0, _pct(p.get("survivor_spending_reduction", 0.25)), 1.0))
 
         st.markdown("**Healthcare**")
-        p["pre_medicare_healthcare"] = st.number_input("Pre-Medicare Annual Cost ($)", 0, 50000, int(p.get("pre_medicare_healthcare", 15000)), 500, key="p_hc_pre")
-        p["post_medicare_healthcare"] = st.number_input("Post-Medicare Annual Cost ($)", 0, 50000, int(p.get("post_medicare_healthcare", 12000)), 500, key="p_hc_post")
+        p["pre_medicare_healthcare"] = st.number_input("Pre-Medicare Annual Cost ($)", 0, 50000, int(p.get("pre_medicare_healthcare", 15000)), 500)
+        p["post_medicare_healthcare"] = st.number_input("Post-Medicare Annual Cost ($)", 0, 50000, int(p.get("post_medicare_healthcare", 12000)), 500)
         st.markdown(
             "<div style='font-size:0.8rem;color:#888;overflow-wrap:break-word;word-break:break-word;'>"
             "Post-Medicare: include <b>Part B</b> (~$2,435/yr/person), Part D, supplemental (Medigap), "
@@ -364,14 +292,14 @@ def sidebar_profile():
 def sidebar_assumptions():
     a = st.session_state.assumptions
     with st.sidebar.expander("2. 📊 Assumptions", expanded=False):
-        a["inflation_rate"] = _dec(st.number_input("Inflation Rate (%)", 0.0, 15.0, _pct(a["inflation_rate"]), 0.1, key="a_inf"))
+        a["inflation_rate"] = _dec(st.number_input("Inflation Rate (%)", 0.0, 15.0, _pct(a["inflation_rate"]), 0.1))
         a["bracket_inflation_rate"] = _dec(st.number_input(
             "Tax Bracket Inflation Rate (%)", 0.0, 10.0,
             float(round(_pct(a.get("bracket_inflation_rate", 0.025)), 1)),
-            0.1, key="a_bracket_inf",
+            0.1,
         ))
         st.caption("Annual rate at which bracket thresholds, standard deduction, NIIT/IRMAA limits, and state brackets grow. SS taxability thresholds are not indexed — bracket creep on SS is intentional.")
-        a["retirement_return_rate"] = _dec(st.number_input("Retirement Return Rate — capital appreciation (%)", 0.0, 15.0, _pct(a["retirement_return_rate"]), 0.1, key="a_ret"))
+        a["retirement_return_rate"] = _dec(st.number_input("Retirement Return Rate — capital appreciation (%)", 0.0, 15.0, _pct(a["retirement_return_rate"]), 0.1))
         st.caption(
             "Applied to accounts set to 'use global rate'. "
             "Default 6.5% reflects Shiller historical real equity total return of ~7.1–7.3% (1871–2025) less ~0.5–1% for a blended stock/bond portfolio. "
@@ -385,17 +313,16 @@ def sidebar_assumptions():
             ["swr", "fixed"],
             format_func=lambda x: "% of Portfolio (SWR)" if x == "swr" else "Fixed Dollar Amount",
             index=0 if a.get("spending_mode", "swr") == "swr" else 1,
-            key="a_spend_mode",
         )
         if a["spending_mode"] == "swr":
-            a["safe_withdrawal_rate"] = _dec(st.number_input("Safe Withdrawal Rate (%)", 1.0, 10.0, _pct(a.get("safe_withdrawal_rate", 0.04)), 0.1, key="a_swr"))
+            a["safe_withdrawal_rate"] = _dec(st.number_input("Safe Withdrawal Rate (%)", 1.0, 10.0, _pct(a.get("safe_withdrawal_rate", 0.04)), 0.1))
             st.caption("Spending = SWR × portfolio at retirement, inflated annually. Healthcare added on top.")
             if a["safe_withdrawal_rate"] > 0.065:
                 st.warning("Rates above 6.5% have historically high failure rates. Most research supports 3.5–4.5%.")
         else:
             a["annual_spending_target"] = float(st.number_input(
                 "After-Tax Annual Spending (today's $)", 10000, 1000000,
-                int(a.get("annual_spending_target", 80000)), 1000, key="a_spend_target",
+                int(a.get("annual_spending_target", 80000)), 1000,
             ))
             st.caption("Desired after-tax spending in today's dollars, excluding healthcare. Inflated to retirement date then annually. The simulation grosses up withdrawals to cover taxes.")
 
@@ -405,7 +332,6 @@ def sidebar_assumptions():
             ["tax_efficient", "roth_preservation"],
             format_func=lambda x: "Tax-Efficient (default)" if x == "tax_efficient" else "Roth Preservation",
             index=0 if a.get("withdrawal_strategy", "tax_efficient") == "tax_efficient" else 1,
-            key="a_withdraw_strat",
         )
         st.caption(
             "**Tax-Efficient**: fills traditional brackets to 22% before drawing Roth — minimizes current-year taxes. "
@@ -538,14 +464,13 @@ def sidebar_roth_conversion():
     p = st.session_state.profile
     accts = st.session_state.accounts
     with st.sidebar.expander("4. 🔄 Roth Conversion (optional)", expanded=False):
-        rc["enabled"] = st.checkbox("Enable Roth Conversion Strategy", rc.get("enabled", False), key="rc_en")
+        rc["enabled"] = st.checkbox("Enable Roth Conversion Strategy", rc.get("enabled", False))
         if rc["enabled"]:
             rc["strategy"] = st.radio(
                 "Strategy",
                 ["fill_to_bracket", "fixed_amount"],
                 format_func=lambda x: "Fill to Bracket" if x == "fill_to_bracket" else "Fixed Amount",
                 index=0 if rc.get("strategy") == "fill_to_bracket" else 1,
-                key="rc_strat",
             )
             if rc["strategy"] == "fill_to_bracket":
                 bracket_options = {0.10: "10%", 0.12: "12%", 0.22: "22%", 0.24: "24%"}
@@ -554,21 +479,16 @@ def sidebar_roth_conversion():
                     options=list(bracket_options.keys()),
                     format_func=lambda k: bracket_options[k],
                     index=list(bracket_options.keys()).index(rc.get("target_bracket", 0.12)),
-                    key="rc_bracket",
                 )
             else:
-                rc["fixed_amount"] = float(st.number_input("Annual Conversion ($)", 0, 500000, int(rc.get("fixed_amount", 10000)), 1000, key="rc_fixed"))
+                rc["fixed_amount"] = float(st.number_input("Annual Conversion ($)", 0, 500000, int(rc.get("fixed_amount", 10000)), 1000))
 
             _rc_start_min = p["retirement_age"]
             _rc_start_val = max(rc.get("start_age", _rc_start_min), _rc_start_min)
-            if st.session_state.get("rc_start", _rc_start_val) < _rc_start_min:
-                st.session_state["rc_start"] = _rc_start_min
-            rc["start_age"] = st.number_input("Conversion Start Age", _rc_start_min, 80, _rc_start_val, key="rc_start")
+            rc["start_age"] = st.number_input("Conversion Start Age", _rc_start_min, 80, _rc_start_val)
             _rc_end_min = rc["start_age"]
             _rc_end_val = max(rc.get("end_age", _rc_end_min), _rc_end_min)
-            if st.session_state.get("rc_end", _rc_end_val) < _rc_end_min:
-                st.session_state["rc_end"] = _rc_end_min
-            rc["end_age"] = st.number_input("Conversion End Age", _rc_end_min, 85, _rc_end_val, key="rc_end")
+            rc["end_age"] = st.number_input("Conversion End Age", _rc_end_min, 85, _rc_end_val)
 
             trad_accts = [a for a in accts if a["type"] in {"traditional_401k", "traditional_ira"}]
             roth_accts = [a for a in accts if a["type"] in {"roth_401k", "roth_ira"}]
@@ -587,7 +507,7 @@ def sidebar_roth_conversion():
                 dst_names = [a["name"] for a in roth_accts]
                 dst_ids = [a["id"] for a in roth_accts]
                 cur_dst = dst_ids.index(rc.get("destination_account_id", dst_ids[0])) if rc.get("destination_account_id") in dst_ids else 0
-                rc["destination_account_id"] = dst_ids[st.selectbox("Convert Into", range(len(dst_names)), format_func=lambda i: dst_names[i], index=cur_dst, key="rc_dst")]
+                rc["destination_account_id"] = dst_ids[st.selectbox("Convert Into", range(len(dst_names)), format_func=lambda i: dst_names[i], index=cur_dst)]
 
 
 # ---------------------------------------------------------------------------
@@ -595,113 +515,6 @@ def sidebar_roth_conversion():
 # ---------------------------------------------------------------------------
 
 def _do_save(name: str) -> None:
-    """Sync all widget state and persist the current scenario to disk."""
-    # sidebar_roth_conversion() always runs before this handler and
-    # writes widget return values directly into st.session_state.roth_conversion
-    # via "rc[field] = widget()" assignments — that dict is authoritative.
-    # We only need to fix up the two fields that require index→ID translation
-    # (rc_dst stores a list index, not an account ID) and the checkbox-derived
-    # source list (those keys are individually keyed per account).
-    rc = st.session_state.roth_conversion
-    _trad = [a for a in st.session_state.accounts
-             if a["type"] in {"traditional_401k", "traditional_ira"}]
-    if any(f"rc_src_{a['id']}" in st.session_state for a in _trad):
-        rc["source_account_ids"] = [
-            a["id"] for a in _trad
-            if st.session_state.get(f"rc_src_{a['id']}", False)
-        ]
-    _roth = [a for a in st.session_state.accounts
-             if a["type"] in {"roth_401k", "roth_ira"}]
-    if "rc_dst" in st.session_state and _roth:
-        idx = st.session_state["rc_dst"]
-        if 0 <= idx < len(_roth):
-            rc["destination_account_id"] = _roth[idx]["id"]
-    # Sync all account widget values explicitly — widgets inside
-    # collapsed expanders may not have run, so the dict could be stale.
-    for a in st.session_state.accounts:
-        aid = a["id"]
-        s = st.session_state
-        if f"a_name_{aid}" in s:
-            a["name"] = s[f"a_name_{aid}"]
-        if f"a_type_{aid}" in s:
-            a["type"] = ACCOUNT_TYPES.get(s[f"a_type_{aid}"], a["type"])
-        if f"a_bal_{aid}" in s:
-            a["balance"] = float(s[f"a_bal_{aid}"])
-        if f"a_ret_{aid}" in s:
-            a["return_rate"] = _dec(s[f"a_ret_{aid}"])
-        if f"chk_global_{aid}" in s:
-            a["use_global_return_rate"] = bool(s[f"chk_global_{aid}"])
-        if f"a_contrib_{aid}" in s:
-            a["annual_contribution"] = float(s[f"a_contrib_{aid}"])
-        if f"a_cgr_{aid}" in s:
-            a["contribution_growth_rate"] = _dec(s[f"a_cgr_{aid}"])
-        if f"a_emp_{aid}" in s:
-            a["employer_match_percent"] = _dec(s[f"a_emp_{aid}"])
-        if f"a_empl_{aid}" in s:
-            a["employer_match_limit"] = float(s[f"a_empl_{aid}"])
-        if f"a_basis_{aid}" in s:
-            a["basis"] = float(s[f"a_basis_{aid}"])
-        if f"a_qdy_{aid}" in s:
-            a["qualified_dividend_yield"] = _dec(s[f"a_qdy_{aid}"])
-        if f"a_oiy_{aid}" in s:
-            a["ordinary_income_yield"] = _dec(s[f"a_oiy_{aid}"])
-        if f"a_rent_{aid}" in s:
-            a["net_annual_rental_income"] = float(s[f"a_rent_{aid}"])
-        if f"a_wlast_{aid}" in s:
-            a["withdraw_priority"] = "last" if s[f"a_wlast_{aid}"] else "normal"
-        if f"a_owner_{aid}" in s:
-            a["owner"] = s[f"a_owner_{aid}"]
-        if f"a_buf_{aid}" in s:
-            a["bank_buffer"] = float(s[f"a_buf_{aid}"])
-    # Sync assumption widget keys back to the dict, mirroring the account sync
-    # above. Widgets inside a collapsed expander don't re-execute, so the dict
-    # can lag behind the session_state keys Streamlit preserves across reruns.
-    # The annual_spending_target is especially prone: it only renders when
-    # spending_mode == "fixed", so a collapsed expander leaves it stale.
-    s = st.session_state
-    a = s.assumptions
-    if "a_spend_mode" in s:
-        a["spending_mode"] = s["a_spend_mode"]
-    if "a_spend_target" in s:
-        a["annual_spending_target"] = float(s["a_spend_target"])
-    if "a_swr" in s:
-        a["safe_withdrawal_rate"] = float(s["a_swr"]) / 100.0
-    if "a_inf" in s:
-        a["inflation_rate"] = float(s["a_inf"]) / 100.0
-    if "a_bracket_inf" in s:
-        a["bracket_inflation_rate"] = float(s["a_bracket_inf"]) / 100.0
-    if "a_ret" in s:
-        a["retirement_return_rate"] = float(s["a_ret"]) / 100.0
-    if "a_withdraw_strat" in s:
-        a["withdrawal_strategy"] = s["a_withdraw_strat"]
-    # Same for profile fields that live inside collapsible sections.
-    p = s.profile
-    if "p_age" in s:
-        p["current_age"] = int(s["p_age"])
-    if "p_ret" in s:
-        p["retirement_age"] = int(s["p_ret"])
-    if "p_le" in s:
-        p["life_expectancy"] = int(s["p_le"])
-    if "p_income" in s:
-        p["current_income"] = float(s["p_income"])
-    if "p_ss" in s:
-        p["social_security_benefit"] = float(s["p_ss"])
-    if "p_ss_age" in s:
-        p["social_security_start_age"] = int(s["p_ss_age"])
-    if "p_sp_age" in s:
-        p["spouse_age"] = int(s["p_sp_age"])
-    if "p_sp_ret" in s:
-        p["spouse_retirement_age"] = int(s["p_sp_ret"])
-    if "p_sp_ss" in s:
-        p["spouse_ss_benefit"] = float(s["p_sp_ss"])
-    if "p_sp_ss_age" in s:
-        p["spouse_ss_start_age"] = int(s["p_sp_ss_age"])
-    if "p_hc_pre" in s:
-        p["pre_medicare_healthcare"] = float(s["p_hc_pre"])
-    if "p_hc_post" in s:
-        p["post_medicare_healthcare"] = float(s["p_hc_post"])
-    if "p_surv" in s:
-        p["survivor_spending_reduction"] = float(s["p_surv"]) / 100.0
     save_scenario(
         name,
         st.session_state.profile,
@@ -710,6 +523,7 @@ def _do_save(name: str) -> None:
         st.session_state.roth_conversion,
     )
     set_last_used_scenario(name)
+    st.session_state.pop("cmp_result", None)
 
 
 def sidebar_scenarios():
@@ -828,31 +642,6 @@ def main():
     profile = st.session_state.profile
     assumptions = st.session_state.assumptions
     accounts = st.session_state.accounts
-
-    # Sync widget keys → dicts. Widgets inside collapsed expanders don't
-    # re-execute each render, so the dicts can lag behind the session_state
-    # keys Streamlit always preserves. Doing this here (before any
-    # calculations) ensures spending_mode, spending_target, and other
-    # assumptions are always current regardless of expander state.
-    _s = st.session_state
-    if "a_spend_mode" in _s:
-        assumptions["spending_mode"] = _s["a_spend_mode"]
-    if "a_spend_target" in _s:
-        assumptions["annual_spending_target"] = float(_s["a_spend_target"])
-    if "a_swr" in _s:
-        assumptions["safe_withdrawal_rate"] = float(_s["a_swr"]) / 100.0
-    if "a_inf" in _s:
-        assumptions["inflation_rate"] = float(_s["a_inf"]) / 100.0
-    if "a_bracket_inf" in _s:
-        assumptions["bracket_inflation_rate"] = float(_s["a_bracket_inf"]) / 100.0
-    if "a_ret" in _s:
-        assumptions["retirement_return_rate"] = float(_s["a_ret"]) / 100.0
-    if "a_withdraw_strat" in _s:
-        assumptions["withdrawal_strategy"] = _s["a_withdraw_strat"]
-    if "p_hc_pre" in _s:
-        profile["pre_medicare_healthcare"] = float(_s["p_hc_pre"])
-    if "p_hc_post" in _s:
-        profile["post_medicare_healthcare"] = float(_s["p_hc_post"])
     roth_conversion = st.session_state.roth_conversion
 
     spending_overrides = st.session_state.spending_overrides
@@ -934,26 +723,17 @@ def main():
     if compact_view:
         # ── Compact snapshot view ──────────────────────────────────────────────
         today_portfolio = sum(a["balance"] for a in accounts)
-        hc_today = profile.get(
-            "post_medicare_healthcare" if profile["current_age"] >= 65 else "pre_medicare_healthcare", 0.0
-        )
-        current_spend = assumptions.get("annual_spending_target", 0.0) + hc_today
-
-        day1_spend = float(ret_df["after_tax_spending"].iloc[0]) if not ret_df.empty else 0.0
-        le_row = ret_df[ret_df["age"] == le_age] if not ret_df.empty else ret_df.iloc[0:0]
-        eol_spend = float(le_row["after_tax_spending"].iloc[0]) if not le_row.empty else 0.0
+        spending_goal = assumptions.get("annual_spending_target", 0.0)
 
         c_now, c_ret, c_eol = st.columns(3)
         with c_now:
             st.markdown(f"**Today  (Age {profile['current_age']})**")
             st.metric("Portfolio", f"${today_portfolio:,.0f}")
-            st.metric("Annual Spend", f"${current_spend:,.0f}",
-                      help="After-tax spending target + healthcare, in today's dollars")
+            st.metric("Spending Goal", f"${spending_goal:,.0f}",
+                      help="Your after-tax discretionary spending target in retirement (today's dollars, healthcare separate).")
         with c_ret:
             st.markdown(f"**Retirement Day 1  (Age {profile['retirement_age']})**")
             st.metric("Portfolio", f"${total_at_retirement:,.0f}")
-            st.metric("Annual Spend", f"${day1_spend:,.0f}",
-                      help="Actual after-tax spend (taxes already paid), includes healthcare")
         with c_eol:
             st.markdown(f"**End of Life  (Age {le_age})**")
             if portfolio_at_le <= 0:
@@ -966,8 +746,6 @@ def main():
                 )
             else:
                 st.metric("Portfolio", f"${portfolio_at_le:,.0f}")
-            st.metric("Annual Spend", f"${eol_spend:,.0f}",
-                      help="Actual after-tax spend (taxes already paid), includes healthcare")
     else:
         # ── Full summary view ──────────────────────────────────────────────────
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -1699,7 +1477,25 @@ def main():
                 ),
             )
             mc_withdrawal_mode_key = "guardrails" if mc_withdrawal_mode.startswith("Guyton") else "constant_real"
+            if mc_withdrawal_mode_key == "guardrails":
+                mc_spending_floor = st.number_input(
+                    "Spending floor (today's $, 0 = no floor)",
+                    min_value=0,
+                    max_value=500_000,
+                    value=0,
+                    step=1_000,
+                    key="mc_spending_floor",
+                    help=(
+                        "The minimum discretionary living-expense spending allowed, expressed in today's dollars. "
+                        "Guardrail cuts will never reduce spending below this real floor. "
+                        "Healthcare and taxes are always paid on top of this amount. "
+                        "Set to 0 to disable."
+                    ),
+                )
+            else:
+                mc_spending_floor = 0.0
         else:
+            mc_spending_floor = 0.0
             _eff_vol = mc_stock_pct * mc_vol + (1 - mc_stock_pct) * (mc_vol * 0.30)
             st.caption(
                 f"Expected portfolio return: **{_ret:.1%}** (matches Retirement Return Rate). "
@@ -1738,6 +1534,7 @@ def main():
                         enable_crashes=mc_crashes,
                         stock_pct=mc_stock_pct,
                         withdrawal_mode=mc_withdrawal_mode_key,
+                        spending_floor=mc_spending_floor,
                     )
                 else:
                     result = _mc.run_monte_carlo(
@@ -1763,6 +1560,7 @@ def main():
                     or mc_result.get("enable_crashes") != mc_crashes
                     or mc_result.get("stock_pct") != mc_stock_pct
                     or mc_result.get("withdrawal_mode") != mc_withdrawal_mode_key
+                    or mc_result.get("spending_floor", 0.0) != mc_spending_floor
                 )
             else:
                 stale = (
@@ -1956,6 +1754,17 @@ def main():
             base_roth_total = float(base_df["roth_conversion"].sum()) if base_df is not None and not base_df.empty else 0.0
             opt_roth_total = float(best_df["roth_conversion"].sum()) if best_df is not None and not best_df.empty else 0.0
 
+            # Round all dollar totals to integers so Change = Optimized − Baseline exactly
+            # (raw-float arithmetic can produce a ±$1 rounding mismatch vs. individually-rounded cells).
+            _b_spend = round(base_spend)
+            _o_spend = round(opt_spend)
+            _b_tax   = round(base_tax)
+            _o_tax   = round(opt_tax)
+            _b_port  = round(base_port)
+            _o_port  = round(opt_port)
+            _b_roth  = round(base_roth_total)
+            _o_roth  = round(opt_roth_total)
+
             # --- Top-line comparison ---
             st.divider()
             st.subheader("Results: Baseline vs. Optimized")
@@ -1969,26 +1778,26 @@ def main():
                     "Trials Evaluated",
                 ],
                 "Baseline": [
-                    f"${base_spend:,.0f}",
-                    f"${base_tax:,.0f}",
-                    f"${base_port:,.0f}",
-                    f"${base_roth_total:,.0f}",
+                    f"${_b_spend:,}",
+                    f"${_b_tax:,}",
+                    f"${_b_port:,}",
+                    f"${_b_roth:,}",
                     f"Age {base_depl}" if base_depl else "No",
                     "1 (current settings)",
                 ],
                 "Optimized": [
-                    f"${opt_spend:,.0f}",
-                    f"${opt_tax:,.0f}",
-                    f"${opt_port:,.0f}",
-                    f"${opt_roth_total:,.0f}",
+                    f"${_o_spend:,}",
+                    f"${_o_tax:,}",
+                    f"${_o_port:,}",
+                    f"${_o_roth:,}",
                     f"Age {opt_depl}" if opt_depl else "No",
                     f"{opt_result['n_evaluated']:,} of {opt_n:,}",
                 ],
                 "Change": [
-                    f"${opt_spend - base_spend:+,.0f} ({(opt_spend - base_spend) / max(base_spend, 1):.1%})",
-                    f"${opt_tax - base_tax:+,.0f} ({(opt_tax - base_tax) / max(base_tax, 1):.1%})",
-                    f"${opt_port - base_port:+,.0f}",
-                    f"${opt_roth_total - base_roth_total:+,.0f}",
+                    f"${_o_spend - _b_spend:+,} ({(_o_spend - _b_spend) / max(_b_spend, 1):.1%})",
+                    f"${_o_tax - _b_tax:+,} ({(_o_tax - _b_tax) / max(_b_tax, 1):.1%})",
+                    f"${_o_port - _b_port:+,}",
+                    f"${_o_roth - _b_roth:+,}",
                     "—",
                     "—",
                 ],
@@ -1997,17 +1806,17 @@ def main():
 
             # Plain-English explanation of why the optimized strategy wins
             _why_parts = []
-            if opt_spend - base_spend > 1000:
-                _why_parts.append(f"**\\${opt_spend - base_spend:,.0f} more** in lifetime after-tax income")
-            if base_tax - opt_tax > 1000:
-                _why_parts.append(f"**\\${base_tax - opt_tax:,.0f} less** in lifetime taxes")
-            if opt_roth_total - base_roth_total > 1000:
-                _why_parts.append(f"**\\${opt_roth_total - base_roth_total:,.0f} more** converted to Roth (shrinking future RMDs)")
-            if opt_port - base_port > 5000:
-                _why_parts.append(f"**\\${opt_port - base_port:,.0f} more** left at end of plan")
+            if _o_spend - _b_spend > 1000:
+                _why_parts.append(f"**\\${_o_spend - _b_spend:,} more** in lifetime after-tax income")
+            if _b_tax - _o_tax > 1000:
+                _why_parts.append(f"**\\${_b_tax - _o_tax:,} less** in lifetime taxes")
+            if _o_roth - _b_roth > 1000:
+                _why_parts.append(f"**\\${_o_roth - _b_roth:,} more** converted to Roth (shrinking future RMDs)")
+            if _o_port - _b_port > 5000:
+                _why_parts.append(f"**\\${_o_port - _b_port:,} more** left at end of plan")
             if _why_parts:
                 st.info("💡 **Why this strategy wins:** The optimized plan delivers " + ", and ".join(_why_parts) + ". Apply the recommended settings below to activate it.")
-            elif base_spend - opt_spend > 1000:
+            elif _b_spend - _o_spend > 1000:
                 st.info("💡 The optimizer found no significant improvement over your current settings — your plan is already well-configured.")
 
             # --- Year-by-year actions ---
@@ -2187,7 +1996,7 @@ def main():
                 "Name": _a["name"],
                 "Type": ACCOUNT_TYPE_LABELS.get(_a["type"], _a["type"]),
                 "Current Value ($)": _a["balance"],
-                "Current Basis ($)": _a.get("basis", 0.0),
+                "Current Basis ($)": _a.get("basis", 0.0) if _a["type"] in {"taxable", "reit", "rental_property"} else None,
                 "Return Rate (%)": round(_a.get("return_rate", 0.07) * 100, 4),
                 "Use Global Rate": bool(_a.get("use_global_return_rate", True)),
                 "Qual. Div Yield (%)": round(_a.get("qualified_dividend_yield", 0.0) * 100, 4) if _a["type"] in {"taxable", "reit"} else 0.0,
@@ -2206,7 +2015,7 @@ def main():
             "Current Value ($)": st.column_config.NumberColumn(min_value=0, format="$%,.0f"),
             "Current Basis ($)": st.column_config.NumberColumn(
                 min_value=0, format="$%,.0f",
-                help="Cost basis (applies to taxable brokerage, REIT, and rental property accounts)",
+                help="Cost basis — applies to taxable brokerage, REIT, and rental property accounts only. Blank (N/A) for retirement accounts.",
             ),
             "Return Rate (%)": st.column_config.NumberColumn(
                 min_value=0.0, max_value=30.0, format="%.2f%%",
@@ -2248,13 +2057,10 @@ def main():
                 for _i, _a in enumerate(st.session_state.accounts):
                     _row = _edited_accts.iloc[_i]
                     _a["balance"] = float(_row["Current Value ($)"])
-                    _a["basis"] = float(_row["Current Basis ($)"])
+                    if _a["type"] in {"taxable", "reit", "rental_property"}:
+                        _a["basis"] = float(_row["Current Basis ($)"])
                     _a["return_rate"] = _dec(float(_row["Return Rate (%)"]))
-                    _new_global = bool(_row["Use Global Rate"])
-                    _a["use_global_return_rate"] = _new_global
-                    _ck = f"chk_global_{_a['id']}"
-                    if _ck in st.session_state:
-                        del st.session_state[_ck]
+                    _a["use_global_return_rate"] = bool(_row["Use Global Rate"])
                     if _a["type"] in {"taxable", "reit"}:
                         _a["qualified_dividend_yield"] = _dec(float(_row["Qual. Div Yield (%)"]))
                         _a["ordinary_income_yield"] = _dec(float(_row["Ord. Income Yield (%)"]))
@@ -2272,13 +2078,10 @@ def main():
                 for _i, _a in enumerate(st.session_state.accounts):
                     _row = _edited_accts.iloc[_i]
                     _a["balance"] = float(_row["Current Value ($)"])
-                    _a["basis"] = float(_row["Current Basis ($)"])
+                    if _a["type"] in {"taxable", "reit", "rental_property"}:
+                        _a["basis"] = float(_row["Current Basis ($)"])
                     _a["return_rate"] = _dec(float(_row["Return Rate (%)"]))
-                    _new_global = bool(_row["Use Global Rate"])
-                    _a["use_global_return_rate"] = _new_global
-                    _ck = f"chk_global_{_a['id']}"
-                    if _ck in st.session_state:
-                        del st.session_state[_ck]
+                    _a["use_global_return_rate"] = bool(_row["Use Global Rate"])
                     if _a["type"] in {"taxable", "reit"}:
                         _a["qualified_dividend_yield"] = _dec(float(_row["Qual. Div Yield (%)"]))
                         _a["ordinary_income_yield"] = _dec(float(_row["Ord. Income Yield (%)"]))

@@ -104,6 +104,7 @@ def _mc_single_run_v2(
     crash_magnitude: float,
     stock_pct: float,
     withdrawal_mode: str = "constant_real",
+    spending_floor: float = 0.0,
 ) -> tuple[list[float], int | None]:
     retirement_age = profile["retirement_age"]
     life_expectancy = profile["life_expectancy"]
@@ -129,6 +130,8 @@ def _mc_single_run_v2(
         )
     else:
         spending = total_start * swr
+
+    spending_floor_real = spending_floor * (1 + inflation_mean) ** years_to_ret if spending_floor > 0 else 0.0
 
     ss_benefit = profile.get("social_security_benefit", 0.0) * _ss_inflate
     ss_start = profile.get("social_security_start_age", 67)
@@ -200,6 +203,8 @@ def _mc_single_run_v2(
                         spending *= 0.90
                     elif current_rate < _gk_base_rate * 0.80:
                         spending *= 1.10
+                if spending_floor_real > 0:
+                    spending = max(spending, spending_floor_real)
 
         net_from_portfolio = max(0.0, spending + hc_cost - total_ss - rental)
 
@@ -318,6 +323,7 @@ def _mc_single_run_v2(
         # Stochastic inflation — affects spending next year and SS COLA
         infl_this_year = float(max(-0.01, inflation_mean + INFLATION_VOL * infl_zs[t]))
         spending *= 1 + infl_this_year
+        spending_floor_real *= 1 + infl_this_year
         ss_benefit *= 1 + infl_this_year
         spouse_ss *= 1 + infl_this_year
 
@@ -336,6 +342,7 @@ def run_monte_carlo_v2(
     crash_magnitude: float = 0.20,
     stock_pct: float = 0.60,
     withdrawal_mode: str = "constant_real",
+    spending_floor: float = 0.0,
     seed: int | None = None,
 ) -> dict:
     rng = np.random.default_rng(seed)
@@ -367,7 +374,7 @@ def run_monte_carlo_v2(
             equity_zs_all[i], bond_zs_all[i], infl_zs_all[i],
             equity_vol, bond_vol,
             crash_years, crash_magnitude, stock_pct,
-            withdrawal_mode,
+            withdrawal_mode, spending_floor,
         )
         all_runs.append(bal_series)
         if dep_age is not None:
@@ -395,4 +402,5 @@ def run_monte_carlo_v2(
         "crash_magnitude": crash_magnitude,
         "stock_pct": stock_pct,
         "withdrawal_mode": withdrawal_mode,
+        "spending_floor": spending_floor,
     }

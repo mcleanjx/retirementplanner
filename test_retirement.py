@@ -2356,9 +2356,14 @@ _SCENARIO_PATHS = [
     "scenarios/Josh and Connie.json",
     "scenarios/Josh and Connie expected large spend.json",
     # New scenarios added for broader coverage
-    "scenarios/test_small_single.json",       # small portfolio, single filer, depletes age ~81
-    "scenarios/test_large_roth_heavy.json",   # large Roth-heavy portfolio, roth_preservation strategy
-    "scenarios/test_swr_mode.json",           # SWR mode (different code path, no fixed-net target)
+    "scenarios/test_small_single.json",              # small portfolio, single filer, depletes age ~81
+    "scenarios/test_large_roth_heavy.json",           # large Roth-heavy portfolio, roth_preservation strategy
+    "scenarios/test_swr_mode.json",                   # SWR mode (different code path, no fixed-net target)
+    "scenarios/test_median_couple.json",              # median US household, MFJ, SS-dependent, Texas (no state tax)
+    "scenarios/test_fire_single.json",                # FIRE retiree, single, 50-year horizon, taxable+Roth, SWR mode
+    "scenarios/test_trad_heavy_conversions.json",     # large traditional 401k, Roth conversion ladder, Florida
+    "scenarios/test_rental_income.json",              # rental property passive income, MFJ, California progressive tax
+    "scenarios/test_ss_dependent.json",               # low-income single, SS-heavy, portfolio depletes mid-retirement
 ]
 
 _SCENARIO_IDS = [

@@ -5,14 +5,13 @@
 ## Table of Contents
 
 1. [What This App Does](#1-what-this-app-does)
-2. [Quick Start: Simplified Mode](#2-quick-start-simplified-mode)
-3. [The Sidebar: Setting Up Your Plan](#3-the-sidebar-setting-up-your-plan)
+2. [The Sidebar: Setting Up Your Plan](#2-the-sidebar-setting-up-your-plan)
    - [Profile](#profile)
    - [Assumptions](#assumptions)
    - [Accounts](#accounts)
    - [Roth Conversion](#roth-conversion)
    - [Scenarios: Saving and Loading Plans](#scenarios-saving-and-loading-plans)
-4. [The Main Tabs](#4-the-main-tabs)
+3. [The Main Tabs](#3-the-main-tabs)
    - [Accumulation](#-accumulation)
    - [Retirement](#-retirement)
    - [Custom Spending](#-custom-spending)
@@ -22,8 +21,8 @@
    - [Monte Carlo](#-monte-carlo)
    - [Optimizer](#-optimizer)
    - [Accounts](#-accounts)
-5. [Key Concepts Explained Simply](#5-key-concepts-explained-simply)
-6. [Technical Reference: How the Math Works](#6-technical-reference-how-the-math-works)
+4. [Key Concepts Explained Simply](#4-key-concepts-explained-simply)
+5. [Technical Reference: How the Math Works](#5-technical-reference-how-the-math-works)
    - [How Taxes Are Calculated](#how-taxes-are-calculated)
    - [How Withdrawals Are Sequenced](#how-withdrawals-are-sequenced)
    - [How the Monte Carlo Simulation Works](#how-the-monte-carlo-simulation-works)
@@ -41,46 +40,15 @@ It does this by:
 - **Simulating retirement withdrawals** year by year, pulling money from your accounts in the most tax-efficient order possible
 - **Modeling taxes in detail** — federal brackets, capital gains rates, Social Security taxation, Medicare surcharges, and state taxes — so your projections reflect what you'll actually keep, not just what's in your accounts
 - **Stress-testing your plan** with thousands of simulated market sequences to show what happens when returns are bad early in retirement (sequence-of-returns risk)
-- **Finding a better strategy** automatically, searching for the combination of withdrawal order and Roth conversions that leaves you the most money after taxes
+- **Finding a better strategy** automatically, searching for the combination of Social Security timing, withdrawal order, and Roth conversions that leaves you the most money after taxes
 
 The app is not a substitute for professional financial advice, but it is one of the most realistic retirement projection tools available, modeling the same tax complexity that fee-only financial planners use.
 
 ---
 
-## 2. Quick Start: Simplified Mode
+## 2. The Sidebar: Setting Up Your Plan
 
-When you first open the app, you'll see a **Simplified Mode** — a 5-step wizard designed to get you up and running in a few minutes without being overwhelmed by options.
-
-**Step 1 — Who are you?**
-Enter your age, your planned retirement age, and whether you file taxes as Single or Married Filing Jointly.
-
-**Step 2 — What do you have?**
-Add your accounts in simplified categories:
-- **Tax-Deferred** (401k, Traditional IRA)
-- **Roth** (Roth 401k, Roth IRA, HSA)
-- **Taxable Brokerage**
-- **Bank / Cash**
-
-For each, enter your current balance and annual contribution amount.
-
-**Step 3 — Social Security**
-Enter your estimated annual Social Security benefit in today's dollars (find this at ssa.gov → "my Social Security"). Enter the age you plan to start collecting it.
-
-**Step 4 — Spending**
-Choose how to express your retirement spending target: as a percentage of your portfolio (the classic "4% rule") or as a fixed annual dollar amount in today's money.
-
-**Step 5 — Investment style**
-Pick Conservative (5% return), Moderate (7%), or Aggressive (9%). These are average annual returns on your portfolio during retirement.
-
-After completing the wizard, you'll see four panels: a scenario summary, projected account balances, spending over time, and a Monte Carlo success rate.
-
-When you're ready to dig deeper, click **"Go to Advanced Mode"** — your simplified plan carries over automatically.
-
----
-
-## 3. The Sidebar: Setting Up Your Plan
-
-In Advanced Mode, the left sidebar contains all your inputs organized into collapsible sections.
+The left sidebar contains all your inputs organized into collapsible sections.
 
 ### Profile
 
@@ -92,7 +60,7 @@ Your personal information that shapes the entire projection.
 | **Retirement Age** | When you plan to stop working |
 | **Life Expectancy** | How long to plan for. Choosing a higher number (e.g., 95) is more conservative |
 | **Filing Status** | Single or Married Filing Jointly — affects tax brackets and standard deduction |
-| **State** | California uses progressive state tax brackets. All other states use a flat rate you specify |
+| **State** | California and Montana use progressive state tax brackets. All other states use a flat rate you specify |
 | **Current Annual Income** | Your pre-tax salary — used to estimate your current tax bracket during the savings phase |
 | **Social Security Benefit** | Your estimated annual benefit in *today's* dollars (as shown on ssa.gov) |
 | **SS Start Age** | When you'll begin collecting. Ages 62–70 are valid; delaying increases the monthly benefit |
@@ -197,7 +165,7 @@ Scenario files are stored locally on your computer and never leave your machine.
 
 ---
 
-## 4. The Main Tabs
+## 3. The Main Tabs
 
 ### 📈 Accumulation
 
@@ -309,8 +277,10 @@ The most important tab for understanding *risk* (as opposed to the Retirement ta
 | **Equity Volatility** | How volatile stocks are. Default 16% is calibrated to historical US equities. |
 | **Bond Volatility** | How volatile bonds are. Default 6%. |
 | **Number of Trials** | 1,000 is fast. 5,000–10,000 gives more stable percentiles. |
-| **CAPE-Adjusted Returns** | Check this box if you're concerned about current market valuations. Uses current Shiller P/E to reduce near-term equity return expectations. |
 | **Withdrawal Rule** | *Constant Real*: you spend the same inflation-adjusted amount every year. *Guyton-Klinger Guardrails*: you cut spending 10% when the market is bad and raise it 10% when things are going well — this improves success rates significantly. |
+| **Spending Floor** | Only available with Guyton-Klinger. A minimum annual discretionary spend in today's dollars that guardrail cuts can never breach. Healthcare and taxes are always paid on top. Set to 0 to disable. |
+
+> The app displays a note when current market valuations (CAPE) are historically elevated, suggesting forward returns may be below the long-run average.
 
 ---
 
@@ -318,7 +288,7 @@ The most important tab for understanding *risk* (as opposed to the Retirement ta
 
 The Optimizer tries to find a *better* retirement strategy than whatever you've currently configured.
 
-**What it searches:** Hundreds of combinations of (1) Tax-Efficient vs. Roth Preservation withdrawal strategy and (2) whether to do Roth conversions, and if so, at what bracket level and over what years.
+**What it searches:** Hundreds of combinations of (1) Social Security start ages, (2) Tax-Efficient vs. Roth Preservation withdrawal strategy, and (3) whether to do Roth conversions — and if so, at what bracket level and over what years. Conversions are automatically constrained to stay below IRMAA or ACA income cliffs where applicable.
 
 **How to use it:**
 1. Leave your current settings as-is (this becomes the "baseline" to beat)
@@ -329,7 +299,7 @@ The Optimizer tries to find a *better* retirement strategy than whatever you've 
 
 **What the output shows:**
 - **Comparison table:** How much lifetime spending, lifetime taxes, and final portfolio value differ between your current strategy and the optimizer's best find
-- **Recommended Strategy:** Plain-language description of what to do differently
+- **Recommended Strategy:** Plain-language description of what to do differently, including the recommended Social Security start ages and whether to stay below the IRMAA or ACA income cliff
 - **Year-by-year actions table:** Color-coded cash flows. Red = money leaving an account (withdrawals). Green = Roth conversion receipts. Amber = taxes/healthcare. Blue = passive income (Social Security, dividends, rental). Bold green = your total after-tax spending
 - **Score distribution:** A histogram of all strategies tested, with your baseline and the best result marked. The wider the spread, the more room there is for improvement.
 
@@ -347,7 +317,7 @@ Useful for annual updates when you know your new balances but don't need to chan
 
 ---
 
-## 5. Key Concepts Explained Simply
+## 4. Key Concepts Explained Simply
 
 **Required Minimum Distributions (RMDs):** The IRS requires you to start withdrawing from Traditional 401(k) and IRA accounts at age 73, whether you want to or not. The minimum is calculated as your account balance divided by a life-expectancy factor from an IRS table (roughly your remaining life expectancy). RMDs count as ordinary income — they can push you into higher tax brackets and increase your Medicare costs. Roth accounts have no RMDs.
 
@@ -365,7 +335,7 @@ Useful for annual updates when you know your new balances but don't need to chan
 
 ---
 
-## 6. Technical Reference: How the Math Works
+## 5. Technical Reference: How the Math Works
 
 This section describes the calculations in precise terms for users who want to understand the methodology.
 
@@ -476,7 +446,9 @@ For Married couples where both spouses are on Medicare, the surcharge applies *t
 
 **California:** Progressive brackets from 1% to 13.3%. Social Security is *fully excluded* from California taxable income. Capital gains are taxed as ordinary income (no preferential rate).
 
-**Other States:** A flat rate applied to ordinary income and capital gains. California residents also pay their state rate on top of the federal LTCG tax on capital gains (since CA treats gains as ordinary income).
+**Montana:** Progressive brackets from 1% to 6.75%. Social Security is taxable at the same federal rate (up to 85%). Capital gains are taxed as ordinary income (no preferential rate).
+
+**Other States:** A flat rate applied to ordinary income and capital gains.
 
 #### Total Tax Summary
 
@@ -557,18 +529,6 @@ The mean parameters (μ) are calibrated so that the portfolio's expected return 
 
 **Stochastic inflation:** Inflation is also randomized each year, drawn from a normal distribution centered on your assumed inflation rate with a 1.5% standard deviation. Your spending target inflates by the *drawn* inflation each year, not a fixed rate.
 
-#### CAPE Adjustment (Optional)
-
-When enabled, the equity expected return for the first 10 years is reduced based on the current Shiller CAPE ratio:
-
-```
-CAPE-implied return = (1 / CAPE) + 1.5% real earnings growth + inflation
-```
-
-If CAPE is elevated (as it is currently, around 39.6 in May 2026), the implied near-term return is below the long-run average. The difference is applied as a drag on equity returns in years 1–10, fading linearly back to the base assumption by year 10.
-
-At CAPE 39.6: earnings yield = 1/39.6 ≈ 2.5%. Adding 1.5% growth and 3% inflation gives ~7%. If the base equity return assumption is 9.5%, the CAPE drag is 9.5% − 7% = 2.5% per year in year 1, declining to zero by year 10. At a 60% stock allocation, this reduces the portfolio drag by about 1.5% per year in year 1.
-
 #### Guyton-Klinger Guardrails (Optional)
 
 Instead of spending a constant inflation-adjusted amount each year, you can adopt a rule that adjusts spending based on how the portfolio is performing:
@@ -577,6 +537,8 @@ Instead of spending a constant inflation-adjusted amount each year, you can adop
 - **Prosperity Rule:** If your withdrawal rate falls below 80% of your initial rate (portfolio grew faster than expected), increase spending by 10%
 
 This flexibility significantly improves success rates because you're not rigidly committed to a spending level when the market has been bad.
+
+**Spending Floor:** You can optionally set a minimum discretionary spending level in today's dollars. Guardrail cuts will never push your spending below this floor — it is inflated forward with the drawn inflation each year, so it preserves its real purchasing power throughout the simulation. Healthcare costs and taxes are always paid in addition to the floor.
 
 #### Interpreting Results
 
@@ -594,8 +556,13 @@ The Optimizer is a random search over the space of possible retirement strategie
 
 For each of N trials (you set N, default 500), the optimizer randomly picks:
 
-1. **Withdrawal strategy:** Tax-Efficient or Roth Preservation
-2. **Roth conversion:** Enabled or disabled. If enabled: randomly selects the bracket level (10%, 12%, 22%, or 24%), the conversion amount method (fill-to-bracket or fixed amount), the start age, end age, source accounts, and destination Roth account
+1. **Social Security start ages:** Both your age and your spouse's (if applicable) are varied independently across the valid range (62–70). Later claiming increases the monthly benefit but delays the income stream; the optimizer searches for the combination that maximizes your score.
+
+2. **Withdrawal strategy:** Tax-Efficient or Roth Preservation
+
+3. **Roth conversion:** Enabled or disabled. If enabled: randomly selects the bracket level (10%, 12%, 22%, or 24%), the conversion amount method (fill-to-bracket, fixed amount, IRMAA-safe, or ACA-safe), the start age, end age, source accounts, and destination Roth account.
+   - **IRMAA-safe conversions:** When the conversion window overlaps Medicare ages (65+), the optimizer tries a mode that caps conversions just below the IRMAA Tier-0 income ceiling ($218,000 MFJ / $109,000 single), avoiding $1,148–$6,936/person/year in Medicare surcharges.
+   - **ACA-safe conversions:** When retiring before 65, the optimizer tries a mode that caps conversions below the ACA 400%-FPL cliff (~$84,600 MFJ / $62,700 single), preserving marketplace premium subsidies until Medicare begins.
 
 Each combination is evaluated by running the complete retirement simulation with those settings.
 
@@ -626,4 +593,4 @@ The optimizer reports:
 
 ---
 
-*This guide reflects the app as of May 2026. Tax brackets and Medicare thresholds are for 2026 and are scaled forward in the simulation by the Tax Bracket Inflation Rate.*
+*This guide reflects the app as of June 2026. Tax brackets and Medicare thresholds are for 2026 and are scaled forward in the simulation by the Tax Bracket Inflation Rate.*
