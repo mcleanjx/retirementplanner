@@ -1,4 +1,5 @@
-scenarios/
+scenarios/*
+!scenarios/test_*.json
 __pycache__/
 *.pyc
 .venv/
