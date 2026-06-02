@@ -163,6 +163,8 @@ The Scenarios section lets you save your current plan to a named file and load i
 
 Scenario files are stored locally on your computer and never leave your machine.
 
+> **Note:** The app ships with several scenarios named `test_*` (e.g., `test_median_couple`, `test_fire_single`). These exist solely to verify the app is working correctly and can be safely deleted from the Load dropdown once you've created your own plan.
+
 ---
 
 ## 3. The Main Tabs
