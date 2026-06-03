@@ -9,8 +9,6 @@ Living document. Update when decisions are made or new questions arise.
 
 **CAPE adjustment removed (v1.1)** — Shiller earnings-yield model was implemented but disabled and held a hardcoded CAPE of 39.6 that would silently go stale. Removed rather than ship misleading dead code. To re-add properly: expose a "Current CAPE" user input in the UI, wire it to `_equity_bond_means()` output with linear reversion over 10 years, and add a note that the user is responsible for keeping it current.
 
-**Guyton-Klinger guardrails not exposed in UI** — ~~Resolved.~~ Exposed as a radio toggle in the Monte Carlo tab; spending floor (today's $) also available when GK is active.
-
 **Accumulation vs. retirement return rate inconsistency** — Accumulation phase (`projections.py:98`) defaults to 7% regardless of the user's global setting; retirement phase uses user-set rate (default 6.5%). Subtle but could mislead users who tune the retirement rate thinking it applies everywhere.
 
 **Spousal Roth conversion bracket coordination** — Per-account ownership flags exist but conversion headroom (`withdrawals.py:425`) applies a single MFJ bracket ceiling without distinguishing whose account is being converted. Could cause bracket collision in edge cases where both spouses convert in the same year.
@@ -48,3 +46,5 @@ Living document. Update when decisions are made or new questions arise.
 **Pro-rata rule not modeled for Roth conversions** — Conversions assume 100% of the converted amount is ordinary income. If the IRA contains after-tax basis, the actual taxable portion is lower. Users with nondeductible IRA contributions will see overstated conversion tax costs.
 
 **State tax: CA, MT, or flat-rate only** — No multi-state scenarios, no relocation modeling, no state-specific treatment of RMDs. Some states exempt SS or pension income; only CA's SS exclusion is currently modeled. MT taxes SS at the federal rate.
+
+**No one-time income events** — There is no way to model a discrete future event (business sale, inheritance, lawsuit settlement, property sale) as a taxed income event in a specific year. Workaround: estimate after-tax proceeds externally and add them as a Taxable Brokerage account balance. To implement properly: a one-time event would need a trigger year/age, gross amount, tax treatment (LTCG, ordinary income, or user-specified after-tax), and a destination account; the amount would flow into `simulate_retirement` as extra income in the matching year and be passed through `calculate_year_taxes`.
