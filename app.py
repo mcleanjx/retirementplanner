@@ -732,7 +732,7 @@ def main():
         for _, row in ret_df.iterrows():
             age_str = str(int(row["age"]))
             entry = projected_by_age.get(age_str, {})
-            entry["total"] = float(row["total_portfolio"])
+            entry["total"] = float(row["start_portfolio"])
             projected_by_age[age_str] = entry
 
     # ---------------------------------------------------------------------------
@@ -1888,7 +1888,7 @@ def main():
                 "🔴 **Red** — action required: sell / withdraw / convert out of this account. &nbsp;"
                 "🟢 **Green** — money arriving (Roth conversion receipt). &nbsp;"
                 "🟡 **Amber** — expense (taxes, healthcare). &nbsp;"
-                "🔵 **Blue** — passive income offsetting the portfolio draw (SS, dividends, rental). &nbsp;"
+                "🔵 **Blue** — income columns: SS & Passive Income offsets the portfolio draw; Ordinary Income is total taxable ordinary income driving your bracket. &nbsp;"
                 "💚 **Bold green** — **Total Spend**: what you actually have to live on after all costs. "
                 "Check: |Portfolio Draw| + SS & Passive Income − |Taxes| − |Healthcare| = Total Spend."
             )
@@ -1902,7 +1902,7 @@ def main():
 
                 _acct_cols    = {a["name"] for a in accounts_at_retirement}
                 _expense_cols = {"Taxes", "Healthcare"}
-                _income_cols  = {"SS & Passive Income"}
+                _income_cols  = {"SS & Passive Income", "Ordinary Income"}
                 _draw_cols    = {"Portfolio Draw"}
                 _spend_cols   = {"Total Spend"}
 
@@ -1959,9 +1959,10 @@ def main():
                     cliff_label=best.get("cliff_label"),
                     irmaa_headroom=best.get("irmaa_headroom", 0.0),
                     aca_headroom=best.get("aca_headroom", 0.0),
+                    annual_rebalance_gain=best.get("annual_rebalance_gain", 0.0),
                 )
             else:
-                desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement)
+                desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement, best.get("annual_rebalance_gain", 0.0))
             desc_df = pd.DataFrame(
                 [{"Setting": k, "Recommended Value": v} for k, v in desc.items()]
             )

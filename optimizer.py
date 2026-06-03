@@ -18,8 +18,10 @@ from constants import RMD_START_AGE
 
 TRADITIONAL_TYPES = {"traditional_401k", "traditional_ira"}
 ROTH_TYPES = {"roth_401k", "roth_ira"}
+TAXABLE_TYPES = {"taxable", "reit"}
 BRACKET_OPTIONS = [0.10, 0.12, 0.22, 0.24]
 WITHDRAWAL_STRATEGIES = ["tax_efficient", "roth_preservation"]
+REBALANCE_OPTIONS = [0, 0, 0, 10_000, 25_000, 50_000, 75_000, 100_000, 150_000, 200_000]
 
 # 401(k) accounts require separation from service before the funds can be moved at all.
 # Traditional IRAs have no such restriction and can be converted at any age.
@@ -65,7 +67,7 @@ def _owner_min_conv_age(account: dict, profile: dict) -> int:
     return int(owner_ret_as_primary_age)
 
 
-def _sample_strategy(profile: dict, accounts: list, rng: random.Random) -> tuple[str, dict]:
+def _sample_strategy(profile: dict, accounts: list, rng: random.Random) -> tuple[str, dict, float]:
     """Randomly sample a complete retirement strategy configuration."""
     life_expectancy = profile.get("life_expectancy", 90)
     ss_start = profile.get("social_security_start_age", 67)
@@ -89,6 +91,7 @@ def _sample_strategy(profile: dict, accounts: list, rng: random.Random) -> tuple
         # but never before 60 (Roth 5-year seasoning and practical planning floor).
         min_conv_age = max(
             max(_owner_min_conv_age(a, profile) for a in source_accounts),
+            profile.get("current_age", 60),
             60,
         )
 
@@ -122,7 +125,11 @@ def _sample_strategy(profile: dict, accounts: list, rng: random.Random) -> tuple
             "destination_account_id": dest_id,
         }
 
-    return withdrawal_strategy, rc
+    taxable_accounts = [a for a in accounts if a["type"] in TAXABLE_TYPES]
+    has_gains = any(a["balance"] > a.get("basis", a["balance"]) for a in taxable_accounts)
+    annual_rebalance_gain = float(rng.choice(REBALANCE_OPTIONS)) if has_gains else 0.0
+
+    return withdrawal_strategy, rc, annual_rebalance_gain
 
 
 def _score(ret_df: pd.DataFrame, summary: dict, legacy_weight: float) -> float:
@@ -149,14 +156,17 @@ def _score(ret_df: pd.DataFrame, summary: dict, legacy_weight: float) -> float:
     )
 
 
-def _describe_strategy(withdrawal_strategy: str, rc: dict, accounts: list) -> dict:
+def _describe_strategy(withdrawal_strategy: str, rc: dict, accounts: list, annual_rebalance_gain: float = 0.0) -> dict:
     """Build a human-readable description of a strategy configuration."""
     ws_label = "Tax Efficient" if withdrawal_strategy == "tax_efficient" else "Roth Preservation"
+
+    rebalance_label = f"${annual_rebalance_gain:,.0f}/yr (sell-and-rebuy taxable positions)" if annual_rebalance_gain > 0 else "Disabled"
 
     if not rc.get("enabled"):
         return {
             "Withdrawal Strategy": ws_label,
             "Roth Conversion": "Disabled",
+            "Taxable Rebalancing": rebalance_label,
         }
 
     strat = rc.get("strategy", "fill_to_bracket")
@@ -198,6 +208,7 @@ def _describe_strategy(withdrawal_strategy: str, rc: dict, accounts: list) -> di
         "Convert Into": dest_name,
         "Conversion Ages (primary person)": f"{start_age} – {rc.get('end_age', '?')}",
         "Eligibility Notes": " | ".join(eligibility_notes),
+        "Taxable Rebalancing": rebalance_label,
     }
 
 
@@ -244,6 +255,13 @@ def build_actions_table(ret_df: pd.DataFrame, rc: dict, accounts: list) -> pd.Da
         rental  = float(row.get("rental_income",     0.0))
         inv     = float(row.get("investment_income", 0.0))
         rec["SS & Passive Income"] = ss + rental + inv
+
+        rec["Ordinary Income"]  = float(row.get("ordinary_income",   0.0))
+        rec["Realized Gains"]   = (float(row.get("withdrawal_ltcg",  0.0))
+                                   + float(row.get("harvest_ltcg",   0.0))
+                                   + float(row.get("rebalance_ltcg", 0.0)))
+        rec["Gain Harvest"]     = float(row.get("harvest_ltcg",      0.0))
+        rec["Rebalance Gain"]   = float(row.get("rebalance_ltcg",    0.0))
 
         # Expense breakdown (informational — funded by account withdrawals above)
         rec["Taxes"]       = -float(row.get("total_tax",            0.0))
@@ -310,6 +328,7 @@ def run_optimizer(
         "score": base_score,
         "withdrawal_strategy": assumptions.get("withdrawal_strategy", "tax_efficient"),
         "roth_conversion": copy.deepcopy(roth_conversion_baseline) or {"enabled": False},
+        "annual_rebalance_gain": assumptions.get("annual_rebalance_gain", 0.0),
         "ret_df": base_df,
         "summary": base_summary,
         "label": "Baseline (Current Settings)",
@@ -321,8 +340,8 @@ def run_optimizer(
     n_evaluated = 0
 
     for _ in range(n_iterations):
-        w_strat, rc = _sample_strategy(profile, accounts_at_retirement, rng)
-        trial_assumptions = {**assumptions, "withdrawal_strategy": w_strat}
+        w_strat, rc, annual_rebalance_gain = _sample_strategy(profile, accounts_at_retirement, rng)
+        trial_assumptions = {**assumptions, "withdrawal_strategy": w_strat, "annual_rebalance_gain": annual_rebalance_gain}
 
         try:
             ret_df, sim_summary = simulate_retirement(
@@ -335,6 +354,7 @@ def run_optimizer(
                 "score": sc,
                 "withdrawal_strategy": w_strat,
                 "roth_conversion": rc,
+                "annual_rebalance_gain": annual_rebalance_gain,
                 "ret_df": ret_df,
                 "summary": sim_summary,
                 "label": "Optimized",

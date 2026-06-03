@@ -285,7 +285,7 @@ def simulate_retirement(
     total_portfolio = sum(a["balance"] for a in accts)
     spending_mode = assumptions.get("spending_mode", "swr")
     if spending_mode == "fixed":
-        years_to_retirement = profile["retirement_age"] - profile["current_age"]
+        years_to_retirement = max(0, profile["retirement_age"] - profile["current_age"])
         base_spending = assumptions.get("annual_spending_target", total_portfolio * swr) * (1 + inflation) ** years_to_retirement
     else:
         base_spending = total_portfolio * swr
@@ -321,7 +321,7 @@ def simulate_retirement(
     lifetime_passive_income = 0.0
     portfolio_depleted_age = None
 
-    for age in range(retirement_age, life_expectancy + 1):
+    for age in range(max(retirement_age, current_age), life_expectancy + 1):
         spouse_age = age + spouse_age_offset if filing_status == "married_filing_jointly" else None
         bracket_factor = (1 + bracket_inflation) ** (age - current_age)
         start_portfolio = sum(a["balance"] for a in accts)
@@ -529,6 +529,29 @@ def simulate_retirement(
         # so IRMAA and NIIT thresholds are correctly triggered.
         harvest_ltcg = harvest_total
         ltcg_income += harvest_ltcg
+
+        # --- Step 4b: Planned rebalancing (sell-and-rebuy beyond 0%-bracket headroom) ---
+        # Realizes gains up to a target amount even if it pushes into the 15% bracket.
+        # Like the harvest above, this is sell-and-rebuy: no cash is generated, but basis
+        # steps up, permanently reducing the future taxable gain embedded in the portfolio.
+        rebalance_ltcg = 0.0
+        _annual_rebalance = assumptions.get("annual_rebalance_gain", 0.0)
+        if _annual_rebalance > 0:
+            _rebalance_needed = max(0.0, _annual_rebalance - harvest_ltcg)
+            for a in accts:
+                if _rebalance_needed <= 0:
+                    break
+                if a["type"] not in TAXABLE_TYPES:
+                    continue
+                gr = _gain_ratio(a)
+                if gr <= 0:
+                    continue
+                _avail = a["balance"] * gr
+                _realize = min(_rebalance_needed, _avail)
+                a["basis"] = a.get("basis", a["balance"]) + _realize
+                ltcg_income += _realize
+                rebalance_ltcg += _realize
+                _rebalance_needed -= _realize
 
         # num_medicare needed here for binary search tax calls (also used in Step 6)
         num_medicare = 0
@@ -842,6 +865,7 @@ def simulate_retirement(
             "withdrawal_ltcg": withdrawal_ltcg,
             "ordinary_income": ordinary_income,
             "ltcg_income": ltcg_income,
+            "rebalance_ltcg": rebalance_ltcg,
             "magi": taxes["magi"],
             "federal_ordinary_tax": taxes["federal_ordinary"],
             "federal_ltcg_tax": taxes["federal_ltcg"],
