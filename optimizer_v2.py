@@ -43,8 +43,10 @@ from optimizer import (
     build_balances_table,
     TRADITIONAL_TYPES,
     ROTH_TYPES,
+    TAXABLE_TYPES,
     BRACKET_OPTIONS,
     WITHDRAWAL_STRATEGIES,
+    REBALANCE_OPTIONS,
 )
 
 # SS start age range (delayed retirement credits: +8%/yr from 62 → 70)
@@ -155,7 +157,7 @@ def _aca_headroom(
     """
     filing = profile.get("filing_status", "single")
     cliff = ACA_CLIFF_MFJ if filing == "married_filing_jointly" else ACA_CLIFF_SINGLE
-    rep_age = profile.get("retirement_age", 62)
+    rep_age = max(profile.get("retirement_age", 62), profile.get("current_age", 62))
     income = _estimate_nonconv_income(profile, accounts, assumptions, rep_age, ss_start, spouse_ss_start)
     return max(0.0, cliff - income)
 
@@ -195,6 +197,7 @@ def _sample_roth_conversion(
 
     min_conv_age = max(
         max(_owner_min_conv_age(a, profile) for a in source_accounts),
+        profile.get("current_age", 60),
         60,
     )
     conv_max_end = max(
@@ -257,15 +260,16 @@ def _sample_strategy_v2(
     accounts: list,
     assumptions: dict,
     rng: random.Random,
-) -> tuple[str, dict, dict, Optional[str]]:
+) -> tuple[str, dict, dict, Optional[str], float]:
     """
     Sample a complete v2 strategy.
 
     Returns:
-        withdrawal_strategy : str
-        roth_conversion     : dict
-        profile_overrides   : dict
-        cliff_label         : "irmaa" | "aca" | None
+        withdrawal_strategy  : str
+        roth_conversion      : dict
+        profile_overrides    : dict
+        cliff_label          : "irmaa" | "aca" | None
+        annual_rebalance_gain: float
     """
     withdrawal_strategy = rng.choice(WITHDRAWAL_STRATEGIES)
 
@@ -281,7 +285,13 @@ def _sample_strategy_v2(
         profile, accounts, assumptions, rng, ss_start, spouse_ss_start
     )
 
-    return withdrawal_strategy, rc, profile_overrides, cliff_label
+    has_gains = any(
+        a["balance"] > a.get("basis", a["balance"])
+        for a in accounts if a["type"] in TAXABLE_TYPES
+    )
+    annual_rebalance_gain = float(rng.choice(REBALANCE_OPTIONS)) if has_gains else 0.0
+
+    return withdrawal_strategy, rc, profile_overrides, cliff_label, annual_rebalance_gain
 
 
 # ---------------------------------------------------------------------------
@@ -297,9 +307,10 @@ def describe_strategy_v2(
     cliff_label: Optional[str] = None,
     irmaa_headroom: float = 0.0,
     aca_headroom: float = 0.0,
+    annual_rebalance_gain: float = 0.0,
 ) -> dict:
     """Human-readable description of a v2 strategy, extending v1's output."""
-    desc = _describe_strategy(withdrawal_strategy, roth_conversion, accounts)
+    desc = _describe_strategy(withdrawal_strategy, roth_conversion, accounts, annual_rebalance_gain)
 
     # SS start ages
     orig_ss = base_profile.get("social_security_start_age", 67)
@@ -395,6 +406,7 @@ def run_optimizer_v2(
         "score": base_score,
         "withdrawal_strategy": assumptions.get("withdrawal_strategy", "tax_efficient"),
         "roth_conversion": copy.deepcopy(roth_conversion_baseline) or {"enabled": False},
+        "annual_rebalance_gain": assumptions.get("annual_rebalance_gain", 0.0),
         "ret_df": base_df,
         "summary": base_summary,
         "label": "Baseline (Current Settings)",
@@ -412,11 +424,11 @@ def run_optimizer_v2(
     n_evaluated = 0
 
     for _ in range(n_iterations):
-        w_strat, rc, prof_overrides, cliff_label = _sample_strategy_v2(
+        w_strat, rc, prof_overrides, cliff_label, annual_rebalance_gain = _sample_strategy_v2(
             profile, accounts_at_retirement, assumptions, rng
         )
         trial_profile     = {**profile, **prof_overrides}
-        trial_assumptions = {**assumptions, "withdrawal_strategy": w_strat}
+        trial_assumptions = {**assumptions, "withdrawal_strategy": w_strat, "annual_rebalance_gain": annual_rebalance_gain}
 
         try:
             ret_df, sim_summary = simulate_retirement(
@@ -430,6 +442,7 @@ def run_optimizer_v2(
                 "score": sc,
                 "withdrawal_strategy": w_strat,
                 "roth_conversion": rc,
+                "annual_rebalance_gain": annual_rebalance_gain,
                 "ret_df": ret_df,
                 "summary": sim_summary,
                 "label": "Optimized",
