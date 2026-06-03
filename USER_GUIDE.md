@@ -22,7 +22,8 @@
    - [Optimizer](#-optimizer)
    - [Accounts](#-accounts)
 4. [Key Concepts Explained Simply](#4-key-concepts-explained-simply)
-5. [Technical Reference: How the Math Works](#5-technical-reference-how-the-math-works)
+5. [What This Tool Does Not Cover](#5-what-this-tool-does-not-cover)
+6. [Technical Reference: How the Math Works](#6-technical-reference-how-the-math-works)
    - [How Taxes Are Calculated](#how-taxes-are-calculated)
    - [How Withdrawals Are Sequenced](#how-withdrawals-are-sequenced)
    - [How the Monte Carlo Simulation Works](#how-the-monte-carlo-simulation-works)
@@ -337,7 +338,38 @@ Useful for annual updates when you know your new balances but don't need to chan
 
 ---
 
-## 5. Technical Reference: How the Math Works
+## 5. What This Tool Does Not Cover
+
+This app models retirement cash flows and taxes in depth, but it is **not a total wealth calculator**. Understanding what is excluded helps you use it correctly and seek additional guidance where needed.
+
+**Real estate and physical assets**
+- Your primary home value is not included. There are no calculations for downsizing, reverse mortgages, or the proceeds from selling a home. If you plan to tap home equity in retirement, you would need to manually model that as an account or income source.
+- Personal property (vehicles, collectibles, jewelry) is not tracked or liquidated in any scenario.
+
+**Inheritances and gifts**
+- Expected inheritances are not modeled — neither receipt nor bequest. If you anticipate a significant inheritance, add it as a one-time custom spending credit in the year you expect it. Charitable giving, donor-advised funds, and estate planning strategies (trusts, stepped-up basis at death) are outside scope.
+
+**Late-life and long-term care**
+- Healthcare costs are modeled as a fixed annual amount that grows with inflation. The app does not simulate nursing home costs ($5,000–$15,000/month), assisted living, memory care, or the Medicaid asset-spend-down rules that govern how LTC costs interact with savings. If long-term care is a concern, model a manual spending override in the Custom Spending tab for those years.
+
+**Portfolio allocation and investment strategy**
+- The app takes your expected return rate as a given — it does not recommend or optimize asset allocation (stocks vs. bonds vs. alternatives), rebalancing schedules, or glide paths. It also does not model tax-loss harvesting beyond simple basis tracking, individual security selection, or alternatives like private equity and commodities.
+
+**Insurance and liabilities**
+- Life insurance proceeds, disability insurance income, and long-term care insurance benefits are not modeled. Debt (mortgage balance, car loans, student loans) is not tracked; if you have significant outstanding debt, it will affect your actual spending need in ways the app cannot see.
+
+**Pensions and annuities**
+- Defined-benefit pensions can be approximated by entering the annual payment as custom income in the Retirement tab, but the app does not model lump-sum vs. annuity trade-offs, survivor annuity options, or inflation-adjusted pension COLAs separately from the general inflation rate. True annuity products (variable, fixed-index) are not modeled.
+
+**Business interests**
+- Equity in a private business, partnership, or S-corp is not tracked. Business sale proceeds would need to be added manually as a one-time event.
+
+**Multi-state and international scenarios**
+- State taxes are modeled for California and Montana only; all other states use a flat rate. There is no multi-state scenario (e.g., planning a mid-retirement relocation), no state-specific treatment of pension or RMD income, and no foreign tax credits or expatriate scenarios.
+
+---
+
+## 6. Technical Reference: How the Math Works
 
 This section describes the calculations in precise terms for users who want to understand the methodology.
 

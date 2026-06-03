@@ -801,7 +801,12 @@ def main():
         c5.metric("Portfolio Longevity", longevity_str)
 
         c6, c7, c8, c9, c10 = st.columns(5)
-        c6.metric(annual_withdrawal_label, f"${annual_withdrawal:,.0f}")
+        _infl_pct = assumptions.get("inflation_rate", 0.03) * 100
+        c6.metric(
+            annual_withdrawal_label,
+            f"${annual_withdrawal:,.0f}",
+            help=f"Your spending target ({_infl_pct:.1f}% inflation applied from today's dollars to retirement year 1)." if fixed_net_mode else None,
+        )
         c7.metric("Lifetime Taxes", f"${summary['lifetime_taxes']:,.0f}")
         c8.metric("Lifetime Healthcare", f"${summary['lifetime_healthcare']:,.0f}")
         c9.metric("Lifetime Passive Income", f"${summary['lifetime_passive_income']:,.0f}")
