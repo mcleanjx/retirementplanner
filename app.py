@@ -327,7 +327,8 @@ def sidebar_assumptions():
             "Applied to accounts set to 'use global rate'. "
             "Default 6.5% reflects Shiller historical real equity total return of ~7.1–7.3% (1871–2025) less ~0.5–1% for a blended stock/bond portfolio. "
             "If your portfolio pays meaningful dividends, reduce this by the yield (e.g. use 5.0% if total return is 6.5% and dividend yield is 1.5%). "
-            "Note: current CAPE (~39) is historically elevated, suggesting forward returns may be below the long-run average."
+            "Note: as of early 2026, U.S. equity valuations (Shiller CAPE) are historically elevated, "
+            "which has tended to precede below-average forward returns — you may want a more conservative rate."
         )
 
         st.markdown("**Income Needed in Retirement**")
@@ -768,14 +769,23 @@ def main():
     if compact_view:
         # ── Compact snapshot view ──────────────────────────────────────────────
         today_portfolio = sum(a["balance"] for a in accounts)
-        spending_goal = assumptions.get("annual_spending_target", 0.0)
+        # Mode-aware: in fixed mode show the after-tax target (today's $); in SWR mode
+        # annual_spending_target is unused/stale, so show the SWR-implied year-1 withdrawal.
+        if fixed_net_mode:
+            spending_label = "Spending Goal"
+            spending_goal = assumptions.get("annual_spending_target", 0.0)
+            spending_help = "Your after-tax discretionary spending target in retirement (today's dollars, healthcare separate)."
+        else:
+            _swr = assumptions.get("safe_withdrawal_rate", 0.04)
+            spending_label = "Withdrawal (yr 1)"
+            spending_goal = total_at_retirement * _swr
+            spending_help = f"SWR mode: {_swr:.1%} × portfolio at retirement (gross, retirement-year dollars; taxes and healthcare come out of this)."
 
         c_now, c_ret, c_eol = st.columns(3)
         with c_now:
             st.markdown(f"**Today  (Age {profile['current_age']})**")
             st.metric("Portfolio", f"${today_portfolio:,.0f}")
-            st.metric("Spending Goal", f"${spending_goal:,.0f}",
-                      help="Your after-tax discretionary spending target in retirement (today's dollars, healthcare separate).")
+            st.metric(spending_label, f"${spending_goal:,.0f}", help=spending_help)
         with c_ret:
             st.markdown(f"**Retirement Day 1  (Age {profile['retirement_age']})**")
             st.metric("Portfolio", f"${total_at_retirement:,.0f}")
@@ -1452,6 +1462,32 @@ def main():
         # --- Parameters ---
         _ret = assumptions.get("retirement_return_rate", 0.065)
         if use_v2:
+            # CMA preset selector — when not "User-defined", overrides equity/bond
+            # vol+mean for global-rate accounts using a published 2026 CMA set.
+            from montecarlo_v2 import CMA_PRESETS as _CMA_PRESETS
+            _cma_options = ["User-defined"] + [v["label"] for v in _CMA_PRESETS.values()]
+            _cma_keys = [None] + list(_CMA_PRESETS.keys())
+            _cma_label = st.selectbox(
+                "Capital market assumptions",
+                _cma_options,
+                index=0,
+                key="mc_cma_preset",
+                help=(
+                    "User-defined uses the Retirement Return Rate ± 3pp equity risk premium "
+                    "and the vol sliders below. Presets override both with published forward-looking "
+                    "10-year CMAs from major asset managers. Per-account override rates "
+                    "(use_global_return_rate=False) are unaffected by presets."
+                ),
+            )
+            mc_cma_preset = _cma_keys[_cma_options.index(_cma_label)]
+            if mc_cma_preset is not None:
+                _p = _CMA_PRESETS[mc_cma_preset]
+                st.caption(
+                    f"**{_p['label']}** — equity mean **{_p['equity_mean']:.1%}** "
+                    f"({_p['equity_vol']:.1%} vol), bond mean **{_p['bond_mean']:.1%}** "
+                    f"({_p['bond_vol']:.1%} vol). {_p['description']} "
+                    f"_Overrides the vol sliders below._"
+                )
             vol_col1, vol_col2, vol_col3, n_col = st.columns([2, 2, 2, 1])
             with vol_col1:
                 mc_equity_vol = st.slider(
@@ -1568,10 +1604,43 @@ def main():
             key="mc_crashes",
         )
 
+        if use_v2:
+            with st.expander("Variance reduction (advanced)", expanded=False):
+                mc_quasi = st.checkbox(
+                    "Sobol quasi-random draws (recommended)",
+                    value=True,
+                    key="mc_quasi",
+                    help=(
+                        "Replaces pseudorandom Mersenne Twister draws with a scrambled Sobol "
+                        "sequence — the sample space fills more uniformly so success-rate and "
+                        "percentile estimates converge faster. Falls back to pseudorandom if scipy "
+                        "is unavailable."
+                    ),
+                )
+                mc_antithetic = st.checkbox(
+                    "Antithetic variates",
+                    value=True,
+                    key="mc_antithetic",
+                    help=(
+                        "Each random draw is paired with its negation, cutting standard error for "
+                        "statistics that depend monotonically on returns. Cheap, composes with Sobol."
+                    ),
+                )
+        else:
+            mc_quasi = True
+            mc_antithetic = True
+
         det_portfolio = ret_df["total_portfolio"].tolist() if not ret_df.empty else []
 
         # --- Run button ---
         run_key = "mc_result_v2" if use_v2 else "mc_result"
+        # Signature of the underlying plan inputs (not the MC knobs). If any of these change
+        # after a run — spending, balances, ages, conversions, overrides — the cached MC fan
+        # and metrics are stale relative to the freshly-recomputed deterministic baseline,
+        # which is exactly what makes the chart and the numbers disagree. Captured at run time
+        # and compared on display so such changes also trip the staleness guard below.
+        _mc_plan_sig = repr((profile, accounts_at_retirement, assumptions,
+                             roth_conversion, spending_overrides))
         if st.button("▶ Run Monte Carlo", type="primary", key="mc_run"):
             with st.spinner(f"Running {mc_n:,} simulations…"):
                 if use_v2:
@@ -1587,6 +1656,11 @@ def main():
                         stock_pct=mc_stock_pct,
                         withdrawal_mode=mc_withdrawal_mode_key,
                         spending_floor=mc_spending_floor,
+                        roth_conversion=roth_conversion,
+                        spending_overrides=spending_overrides,
+                        cma_preset=mc_cma_preset,
+                        quasi_random=mc_quasi,
+                        antithetic=mc_antithetic,
                     )
                 else:
                     result = _mc.run_monte_carlo(
@@ -1597,38 +1671,106 @@ def main():
                         volatility=mc_vol,
                         enable_crashes=mc_crashes,
                         stock_pct=mc_stock_pct,
+                        roth_conversion=roth_conversion,
+                        spending_overrides=spending_overrides,
                     )
+            result["plan_sig"] = _mc_plan_sig
             st.session_state[run_key] = result
 
         # --- Results for selected model ---
         mc_result = st.session_state.get(run_key)
-        if mc_result:
-            if use_v2:
-                stale = (
-                    mc_result.get("equity_vol") != mc_equity_vol
-                    or mc_result.get("bond_vol") != mc_bond_vol
-                    or mc_result.get("equity_bond_corr") != mc_eq_bond_corr
-                    or mc_result.get("n_runs") != mc_n
-                    or mc_result.get("enable_crashes") != mc_crashes
-                    or mc_result.get("stock_pct") != mc_stock_pct
-                    or mc_result.get("withdrawal_mode") != mc_withdrawal_mode_key
-                    or mc_result.get("spending_floor", 0.0) != mc_spending_floor
-                )
-            else:
-                stale = (
-                    mc_result.get("volatility") != mc_vol
-                    or mc_result.get("n_runs") != mc_n
-                    or mc_result.get("enable_crashes") != mc_crashes
-                    or mc_result.get("stock_pct") != mc_stock_pct
-                )
-            if stale:
-                st.info("Settings changed — click **▶ Run Monte Carlo** to refresh results.")
+        if mc_result and use_v2:
+            # When a preset is selected the engine ignores the vol sliders, so excluding
+            # those from the staleness signature avoids spurious re-run prompts after the
+            # user slides them while a preset is active.
+            _vol_stale = mc_cma_preset is None and (
+                mc_result.get("equity_vol") != mc_equity_vol
+                or mc_result.get("bond_vol") != mc_bond_vol
+            )
+            stale = (
+                _vol_stale
+                or mc_result.get("equity_bond_corr") != mc_eq_bond_corr
+                or mc_result.get("n_runs") != mc_n
+                or mc_result.get("enable_crashes") != mc_crashes
+                or mc_result.get("stock_pct") != mc_stock_pct
+                or mc_result.get("withdrawal_mode") != mc_withdrawal_mode_key
+                or mc_result.get("spending_floor", 0.0) != mc_spending_floor
+                or mc_result.get("cma_preset") != mc_cma_preset
+                or mc_result.get("quasi_random", True) != mc_quasi
+                or mc_result.get("antithetic", True) != mc_antithetic
+                or mc_result.get("plan_sig") != _mc_plan_sig
+            )
+        elif mc_result:
+            stale = (
+                mc_result.get("volatility") != mc_vol
+                or mc_result.get("n_runs") != mc_n
+                or mc_result.get("enable_crashes") != mc_crashes
+                or mc_result.get("stock_pct") != mc_stock_pct
+                or mc_result.get("plan_sig") != _mc_plan_sig
+            )
+        else:
+            stale = False
 
+        # Suppress stale results entirely rather than merely flagging them: otherwise a
+        # prior run's metrics (e.g. a ~100% Guyton-Klinger guardrails success rate) keep
+        # showing next to changed-but-unrun settings — making it look like, say, Constant
+        # Real itself returned 100%. Show only the refresh prompt until the user re-runs.
+        if mc_result and stale:
+            st.info("Settings changed — click **▶ Run Monte Carlo** to refresh results.")
+        elif mc_result:
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Success Rate", f"{mc_result['success_rate']:.1%}")
             m2.metric("Median at Life Expectancy", f"${mc_result['percentiles'][50][-1]:,.0f}")
             m3.metric("10th Percentile at Life Expectancy", f"${mc_result['percentiles'][10][-1]:,.0f}")
             m4.metric("Trials Depleted", f"{mc_result['n_depleted']:,} / {mc_result['n_runs']:,}")
+
+            # Echo back exactly which withdrawal rule this result was computed under, so the
+            # displayed numbers can never be mistaken for a different mode than was run.
+            _ran_mode = mc_result.get("withdrawal_mode", "constant_real")
+            if _ran_mode == "guardrails":
+                _floor = mc_result.get("spending_floor", 0.0)
+                _floor_txt = f" with a ${_floor:,.0f} spending floor" if _floor else " (no spending floor — spending can be cut without limit, which inflates the success rate)"
+                st.caption(f"↳ Computed with **Guyton-Klinger Guardrails**{_floor_txt}.")
+            else:
+                st.caption("↳ Computed with **Constant Real** spending (no guardrail flexing).")
+
+            # Adjustment metrics — Kitces-style reframing of pure success rate. Under
+            # guardrails "failure" usually means a spending cut, not running dry; these
+            # numbers surface how often and how much the retiree's real spending flexed.
+            _adj = mc_result.get("adjustment_metrics") or {}
+            if _ran_mode == "guardrails" and _adj:
+                st.markdown("**Adjustment Profile** — how often guardrails fire & how far spending flexes")
+                a1, a2, a3, a4 = st.columns(4)
+                a1.metric(
+                    "Any Cut",
+                    f"{_adj.get('prob_any_cut', 0.0):.0%}",
+                    help="Share of trials with ≥1 capital-preservation cut (−10% spending).",
+                )
+                a2.metric(
+                    "Any Raise",
+                    f"{_adj.get('prob_any_raise', 0.0):.0%}",
+                    help="Share of trials with ≥1 prosperity-rule raise (+10% spending).",
+                )
+                a3.metric(
+                    "Hit Floor",
+                    f"{_adj.get('prob_any_floor_hit', 0.0):.0%}",
+                    help="Share of trials that ever hit the spending floor (where guardrails could have cut further).",
+                )
+                a4.metric(
+                    "Median Worst Real Spend",
+                    f"{_adj.get('min_real_ratio_p50', 1.0):.0%}",
+                    help=(
+                        "Median across trials of the lowest real-spending year, "
+                        "expressed as % of starting real baseline. 80% = a typical trial's "
+                        "worst year saw spending drop to 80% of baseline purchasing power."
+                    ),
+                )
+                st.caption(
+                    f"Avg cuts per trial: **{_adj.get('avg_cuts_per_trial', 0.0):.1f}** · "
+                    f"Avg raises per trial: **{_adj.get('avg_raises_per_trial', 0.0):.1f}** · "
+                    f"Avg floor years per trial: **{_adj.get('avg_floor_years_per_trial', 0.0):.1f}** · "
+                    f"10th-pctile worst real spend: **{_adj.get('min_real_ratio_p10', 1.0):.0%}** of baseline"
+                )
 
             _mc_failed = mc_result["n_depleted"]
             _mc_total = mc_result["n_runs"]
@@ -1694,9 +1836,15 @@ def main():
         else:
             st.info("Configure your plan in the sidebar, then click **▶ Run Monte Carlo** to see results.")
 
-        # --- Model comparison (shown when both have been run) ---
+        # --- Model comparison (shown when both have been run against the current plan) ---
         mc_v1 = st.session_state.get("mc_result")
         mc_v2 = st.session_state.get("mc_result_v2")
+        # Only compare results computed against the current plan inputs; otherwise one model
+        # could reflect an older spending/balance set than the other (or the baseline).
+        if mc_v1 and mc_v1.get("plan_sig") != _mc_plan_sig:
+            mc_v1 = None
+        if mc_v2 and mc_v2.get("plan_sig") != _mc_plan_sig:
+            mc_v2 = None
         if mc_v1 and mc_v2:
             st.divider()
             st.subheader("Model Comparison")

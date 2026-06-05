@@ -1,6 +1,24 @@
-import copy
+"""
+montecarlo.py — Standard (normal-returns) Monte Carlo engine.
+
+Like montecarlo_v2, this generates stochastic per-year, per-account returns and then
+runs the full deterministic plan for each trial via ``withdrawals.simulate_retirement``,
+so every trial models the same strategy as the Retirement tab and Optimizer — Roth
+conversions, 0%-bracket gain harvesting, planned rebalancing, the tax-efficient
+fill-to-bracket withdrawal order, SS taxability, IRMAA/NIIT, RMDs and the survivor
+transition.
+
+It differs from v2 (CMA log-normal) only in the RETURN DISTRIBUTION:
+  - returns are drawn from a normal distribution (not log-normal),
+  - each account is drawn independently (no shared equity/bond correlation factor),
+  - inflation is deterministic (the assumption rate, not stochastic).
+
+This is the simpler, more optimistic "Standard" model retained for comparison; the
+v2 engine is recommended for serious planning.
+"""
+
 import numpy as np
-from constants import RMD_TABLE, RMD_START_AGE
+from withdrawals import simulate_retirement
 
 TRADITIONAL_TYPES = {"traditional_401k", "traditional_ira"}
 ROTH_TYPES = {"roth_401k", "roth_ira"}
@@ -10,12 +28,6 @@ BANK_TYPES = {"bank"}
 # Account types whose market value falls during a stock crash
 # Bank and rental property are intentionally excluded (cash / real estate)
 CRASH_AFFECTED_TYPES = TRADITIONAL_TYPES | ROTH_TYPES | TAXABLE_TYPES | {"hsa"}
-
-
-def _rmd_divisor(age: int) -> float:
-    if age < RMD_START_AGE:
-        return 0.0
-    return RMD_TABLE.get(age, RMD_TABLE.get(min(age, max(RMD_TABLE.keys())), 6.4))
 
 
 def _generate_crash_years(rng, retirement_age: int, life_expectancy: int) -> set[int]:
@@ -31,151 +43,81 @@ def _generate_crash_years(rng, retirement_age: int, life_expectancy: int) -> set
     return crash_years
 
 
-def _mc_single_run(
+def _build_market_returns(
     accts: list[dict],
-    profile: dict,
-    assumptions: dict,
+    ages: list[int],
     rng,
     volatility: float,
+    stock_pct: float,
+    ret_return: float,
     crash_years: set[int],
     crash_magnitude: float,
-    stock_pct: float,
-) -> tuple[list[float], int | None]:
+) -> list[dict]:
     """
-    One Monte Carlo trial. Returns (portfolio_balance_by_age, depletion_age_or_None).
-    accts must already be deep-copied by the caller.
+    Per-simulation-year, per-account normal returns, returned as
+    ``[{account_id: return_rate}, ...]`` aligned with ``ages`` for simulate_retirement's
+    ``market_returns`` hook. Each account is drawn independently (the v1 simplification);
+    crash shocks are baked in. Returns are floored at -60% to avoid absurd tail draws.
     """
-    retirement_age = profile["retirement_age"]
-    life_expectancy = profile["life_expectancy"]
-    inflation = assumptions.get("inflation_rate", 0.03)
-    ret_return = assumptions.get("retirement_return_rate", 0.05)
-    swr = assumptions.get("safe_withdrawal_rate", 0.04)
-    spending_mode = assumptions.get("spending_mode", "swr")
-    filing_status = profile["filing_status"]
-
-    total_start = sum(a["balance"] for a in accts)
-    years_to_ret = profile["retirement_age"] - profile["current_age"]
-    if spending_mode == "fixed":
-        spending = (
-            assumptions.get("annual_spending_target", total_start * swr)
-            * (1 + inflation) ** years_to_ret
-        )
-    else:
-        spending = total_start * swr
-
-    _ss_inflate = (1 + inflation) ** max(0, years_to_ret)
-    ss_benefit = profile.get("social_security_benefit", 0.0) * _ss_inflate
-    ss_start = profile.get("social_security_start_age", 67)
-    spouse_ss = profile.get("spouse_ss_benefit", 0.0) * _ss_inflate
-    spouse_ss_start = profile.get("spouse_ss_start_age", 67)
-    spouse_age_offset = (
-        profile.get("spouse_age", profile.get("current_age", 0))
-        - profile.get("current_age", 0)
-    )
-    survivor_reduction = profile.get("survivor_spending_reduction", 0.25)
-    pre_hc = profile.get("pre_medicare_healthcare", 0.0)
-    post_hc = profile.get("post_medicare_healthcare", 0.0)
-
-    survivor_triggered = False
-    depleted_age = None
-    portfolio_by_age = []
-
-    # Pre-compute volatility constants (fixed for the trial)
     bond_pct = 1.0 - stock_pct
-    bond_vol = volatility * 0.30
-    portfolio_vol = stock_pct * volatility + bond_pct * bond_vol
-
-    for age in range(retirement_age, life_expectancy + 1):
-        spouse_age = age + spouse_age_offset if filing_status == "married_filing_jointly" else None
-
-        # Survivor transition
-        if (
-            not survivor_triggered
-            and filing_status == "married_filing_jointly"
-            and spouse_age is not None
-            and spouse_age >= profile.get("life_expectancy", 90)
-        ):
-            survivor_triggered = True
-            ss_benefit = max(ss_benefit, spouse_ss)
-            spouse_ss = 0.0
-            spending *= 1 - survivor_reduction
-
-        years_in = age - retirement_age
-        hc_cost = (post_hc if age >= 65 else pre_hc) * (1 + inflation) ** years_in
-
-        # Passive income that offsets portfolio drawdown
-        total_ss = 0.0
-        if age >= ss_start:
-            total_ss += ss_benefit
-        if spouse_age is not None and spouse_age >= spouse_ss_start:
-            total_ss += spouse_ss
-        rental = sum(
-            a.get("net_annual_rental_income", 0.0)
-            for a in accts
-            if a["type"] == "rental_property"
-        )
-
-        net_from_portfolio = max(0.0, spending + hc_cost - total_ss - rental)
-
-        # RMDs (mandatory; reduce net_from_portfolio if they cover spending)
+    portfolio_vol = stock_pct * volatility + bond_pct * (volatility * 0.30)
+    out: list[dict] = []
+    for age in ages:
+        year: dict = {}
         for a in accts:
-            if a["type"] in TRADITIONAL_TYPES and age >= RMD_START_AGE:
-                div = _rmd_divisor(age)
-                rmd = min(a["balance"] / div if div > 0 else 0.0, a["balance"])
-                a["balance"] = max(0.0, a["balance"] - rmd)
-                net_from_portfolio = max(0.0, net_from_portfolio - rmd)
-
-        # Discretionary withdrawals: bank → taxable → traditional → roth
-        remaining = net_from_portfolio
-        for bucket in [BANK_TYPES, TAXABLE_TYPES, TRADITIONAL_TYPES, ROTH_TYPES]:
-            for a in sorted(
-                [a for a in accts if a["type"] in bucket], key=lambda x: -x["balance"]
-            ):
-                if remaining <= 0:
-                    break
-                w = min(remaining, a["balance"])
-                a["balance"] = max(0.0, a["balance"] - w)
-                remaining -= w
-
-        # Randomized returns (applied after withdrawals, same timing as deterministic sim)
-        for a in accts:
-            if a["type"] == "bank":
-                # Cash: near-deterministic, tiny vol
+            atype = a["type"]
+            if atype == "bank":
                 base = a.get("return_rate", 0.04)
                 r = float(rng.normal(base, volatility * 0.10))
-            elif a["type"] == "rental_property":
-                # Real estate: lower vol than equities, not split by stock/bond
+            elif atype == "rental_property":
                 base = a.get("return_rate", 0.04)
                 r = float(rng.normal(base, volatility * 0.40))
             else:
-                # Investment accounts: portfolio expected return = ret_return (or
-                # account's own rate).  Stock allocation scales volatility only.
                 port_mean = (
                     a.get("return_rate", ret_return)
                     if not a.get("use_global_return_rate", True)
                     else ret_return
                 )
                 r = float(rng.normal(port_mean, portfolio_vol))
+            r = max(-0.6, r)
+            if age in crash_years and atype in CRASH_AFFECTED_TYPES:
+                r = (1.0 + r) * (1.0 - stock_pct * crash_magnitude) - 1.0
+            year[a["id"]] = r
+        out.append(year)
+    return out
 
-            # Floor at -60% to avoid absurd tail draws
-            a["balance"] = max(0.0, a["balance"] * (1 + max(-0.6, r)))
 
-            # Crash shock: only equity accounts, scaled by stock allocation
-            # (a 60/40 portfolio absorbs 60% of the crash, bonds are unaffected)
-            if age in crash_years and a["type"] in CRASH_AFFECTED_TYPES:
-                a["balance"] *= (1 - stock_pct * crash_magnitude)
+def _mc_single_run(
+    accts: list[dict],
+    profile: dict,
+    assumptions: dict,
+    roth_conversion: dict | None,
+    spending_overrides: dict | None,
+    rng,
+    volatility: float,
+    crash_years: set[int],
+    crash_magnitude: float,
+    stock_pct: float,
+) -> tuple[list[float], int | None]:
+    """One Monte Carlo trial: build the normal return paths and run the full plan."""
+    retirement_age = profile["retirement_age"]
+    life_expectancy = profile["life_expectancy"]
+    current_age = profile.get("current_age", retirement_age)
+    sim_start_age = max(retirement_age, current_age)
+    ages = list(range(sim_start_age, life_expectancy + 1))
+    ret_return = assumptions.get("retirement_return_rate", 0.05)
 
-        total_bal = sum(a["balance"] for a in accts)
-        if total_bal <= 0 and depleted_age is None:
-            depleted_age = age
+    market_returns = _build_market_returns(
+        accts, ages, rng, volatility, stock_pct, ret_return, crash_years, crash_magnitude,
+    )
 
-        portfolio_by_age.append(total_bal)
-
-        spending *= 1 + inflation
-        ss_benefit *= 1 + inflation
-        spouse_ss *= 1 + inflation  # 0 after survivor transition; harmless
-
-    return portfolio_by_age, depleted_age
+    # Inflation is deterministic in v1 (inflation_sequence=None → assumption rate).
+    df, summary = simulate_retirement(
+        accts, profile, assumptions, roth_conversion, spending_overrides,
+        market_returns=market_returns,
+    )
+    portfolio_by_age = df["total_portfolio"].tolist() if not df.empty else [0.0] * len(ages)
+    return portfolio_by_age, summary.get("portfolio_depleted_age")
 
 
 def run_monte_carlo(
@@ -187,47 +129,53 @@ def run_monte_carlo(
     enable_crashes: bool = False,
     crash_magnitude: float = 0.20,
     stock_pct: float = 0.60,
+    roth_conversion: dict | None = None,
+    spending_overrides: dict | None = None,
     seed: int | None = None,
 ) -> dict:
     """
-    Run N Monte Carlo trials with per-year, per-account randomized returns.
+    Run N Monte Carlo trials with per-year, per-account normal returns, each trial
+    running the full deterministic plan via simulate_retirement.
 
     The expected return for each account matches the deterministic simulation
     (ret_return from assumptions, or the account's own rate).  The stock/bond
     allocation controls volatility only: higher stock_pct → more volatile path.
     Bond volatility is fixed at 30% of equity volatility.
 
-    When enable_crashes=True, each trial independently schedules market crashes
-    at random 10–20 year intervals. In a crash year, equity accounts take an
-    additional crash_magnitude drop on top of that year's normal return draw.
+    When enable_crashes=True, each trial independently schedules market crashes at
+    random 10–20 year intervals; in a crash year equity accounts take an additional
+    crash_magnitude drop on top of that year's normal return draw.
 
     Returns:
-        ages: list of retirement ages simulated
+        ages: list of simulated ages (max(retirement_age, current_age) → life_expectancy)
         percentiles: {10, 25, 50, 75, 90} → list of portfolio values by age
-        success_rate: fraction of runs where portfolio never hit $0
-        n_runs: number of trials
-        n_depleted: number of trials that depleted
-        depletion_ages: list of ages at which each failed run depleted
+        success_rate: fraction of runs where the portfolio never hit $0
+        n_runs / n_depleted / depletion_ages
         volatility / stock_pct / enable_crashes / crash_magnitude: params used
     """
     rng = np.random.default_rng(seed)
     retirement_age = profile["retirement_age"]
     life_expectancy = profile["life_expectancy"]
-    ages = list(range(retirement_age, life_expectancy + 1))
+    # Already-retired support: start at current_age when it exceeds retirement_age so the
+    # MC horizon matches simulate_retirement and the deterministic baseline overlay aligns.
+    sim_start_age = max(retirement_age, profile.get("current_age", retirement_age))
+    ages = list(range(sim_start_age, life_expectancy + 1))
 
     all_runs: list[list[float]] = []
     depletion_ages: list[int] = []
 
     for _ in range(n_runs):
-        accts = copy.deepcopy(accounts_at_retirement)
+        # simulate_retirement deep-copies accounts internally and _build_market_returns
+        # only reads metadata, so the shared list is safe to pass without a per-trial copy.
         crash_years = (
             _generate_crash_years(rng, retirement_age, life_expectancy)
             if enable_crashes
             else set()
         )
         bal_series, dep_age = _mc_single_run(
-            accts, profile, assumptions, rng, volatility,
-            crash_years, crash_magnitude, stock_pct,
+            accounts_at_retirement, profile, assumptions,
+            roth_conversion, spending_overrides,
+            rng, volatility, crash_years, crash_magnitude, stock_pct,
         )
         all_runs.append(bal_series)
         if dep_age is not None:

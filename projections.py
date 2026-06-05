@@ -95,7 +95,15 @@ def project_accumulation(accounts: list[dict], profile: dict, assumptions: dict)
             # Grow balance only during accumulation years; retirement_age row shows
             # start-of-retirement balances and accts retains those values for simulate_retirement.
             if age < retirement_age:
-                rate = a.get("return_rate", 0.07)
+                # Honor the per-account "use global rate" flag during accumulation too,
+                # matching the retirement engine (withdrawals.py Step 7). Bank and rental
+                # always use their own rate. Previously accumulation always used the
+                # account's own return_rate (default 7%), silently diverging from the
+                # retirement phase whenever an account's own rate differed from the global.
+                if atype in {"rental_property", "bank"} or not a.get("use_global_return_rate", True):
+                    rate = a.get("return_rate", 0.07)
+                else:
+                    rate = assumptions.get("retirement_return_rate", 0.07)
                 bal *= (1 + rate)
 
                 if atype not in {"rental_property", "reit"}:
