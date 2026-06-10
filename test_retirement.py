@@ -3070,5 +3070,132 @@ class TestScenarioInvariants:
         )
 
 
+class TestMonteCarloV2DeterministicFirstYear:
+    """run_monte_carlo_v2(deterministic_first_year=True) must pin year 0 of every
+    trial to the deterministic plan, so the near-term recommendation is a single
+    concrete figure rather than a distribution — while later years stay stochastic."""
+
+    def _accts(self):
+        return [_trad_account(800_000), _roth_account(50_000), _taxable_account(150_000, 90_000)]
+
+    def _profile(self):
+        return _base_profile(current_age=65, retirement_age=65, life_expectancy=90)
+
+    def test_first_year_portfolio_is_deterministic_across_trials(self):
+        """Year-0 terminal portfolio is identical across all trials (no MC spread)."""
+        import numpy as np
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._accts(), self._profile(), _base_assumptions()
+        mc = run_monte_carlo_v2(
+            accts, p, a, n_runs=120, seed=7, equity_vol=0.18, bond_vol=0.07,
+            deterministic_first_year=True,
+        )
+        # First entry of every percentile band must coincide → zero year-0 spread.
+        first_year_vals = [mc["percentiles"][pp][0] for pp in (10, 25, 50, 75, 90)]
+        spread = max(first_year_vals) - min(first_year_vals)
+        assert spread < 1.0, f"year-0 portfolio varied by ${spread:,.2f} across percentiles"
+
+    def test_first_year_matches_deterministic_run(self):
+        """The pinned year-0 portfolio equals the plain deterministic projection's."""
+        import copy
+        from withdrawals import simulate_retirement
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._accts(), self._profile(), _base_assumptions()
+        det, _ = simulate_retirement(copy.deepcopy(accts), p, a)
+        det_year0 = det["total_portfolio"].iloc[0]
+        mc = run_monte_carlo_v2(
+            accts, p, a, n_runs=80, seed=3, deterministic_first_year=True,
+        )
+        assert abs(mc["percentiles"][50][0] - det_year0) < 1.0
+
+    def test_later_years_still_stochastic(self):
+        """Pinning year 0 must not freeze the rest of the horizon."""
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._accts(), self._profile(), _base_assumptions()
+        mc = run_monte_carlo_v2(
+            accts, p, a, n_runs=200, seed=11, equity_vol=0.18, bond_vol=0.07,
+            deterministic_first_year=True,
+        )
+        assert mc["percentiles"][90][-1] > mc["percentiles"][10][-1]
+
+    def test_spend_and_final_percentiles_present(self):
+        """New cross-trial distributions for optimizer scoring are surfaced."""
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._accts(), self._profile(), _base_assumptions()
+        mc = run_monte_carlo_v2(accts, p, a, n_runs=60, seed=1)
+        for key in ("final_percentiles", "spend_percentiles"):
+            assert key in mc
+            for pp in (10, 25, 50, 75, 90):
+                assert pp in mc[key]
+        # Spend and final percentiles are monotone non-decreasing in p.
+        for key in ("final_percentiles", "spend_percentiles"):
+            vals = [mc[key][pp] for pp in (10, 25, 50, 75, 90)]
+            assert vals == sorted(vals)
+
+
+class TestOptimizerV3:
+    """MC-aware receding-horizon optimizer: scores candidates against the MC
+    distribution, screens cheap then re-scores survivors, and emits a concrete
+    deterministic first-year action plus a serializable recommendation."""
+
+    def _accts(self):
+        return [_trad_account(900_000), _roth_account(60_000), _taxable_account(200_000, 120_000)]
+
+    def _profile(self):
+        return _base_profile(current_age=62, retirement_age=65, life_expectancy=88)
+
+    def _run(self, **kw):
+        from optimizer_v3 import run_optimizer_v3
+        accts, p, a = self._accts(), self._profile(), _base_assumptions()
+        params = dict(
+            accounts_at_retirement=accts, profile=p, assumptions=a,
+            roth_conversion_baseline={"enabled": False}, spending_overrides={},
+            n_iterations=12, mc_runs_screen=40, mc_runs_final=80,
+            survivors=4, seed=42,
+        )
+        params.update(kw)
+        return run_optimizer_v3(**params)
+
+    def test_returns_expected_structure(self):
+        res = self._run()
+        for key in ("baseline_result", "best_result", "top_results", "n_evaluated", "all_scores"):
+            assert key in res
+        assert res["n_evaluated"] > 0
+
+    def test_best_carries_first_year_action_and_recommendation(self):
+        res = self._run()
+        best = res["best_result"]
+        assert "first_year_action" in best
+        rec = best.get("recommendation", {})
+        # Serializable snapshot suitable for persisting alongside a check-in.
+        import json
+        json.dumps(rec)
+        for key in ("anchor_age", "mc_success_rate", "mc_p25_legacy", "mc_median_spend"):
+            assert key in rec
+        assert 0.0 <= rec["mc_success_rate"] <= 1.0
+
+    def test_crn_makes_search_reproducible(self):
+        """Same seed → same best score (deterministic search under Common Random Numbers)."""
+        r1 = self._run(seed=99)
+        r2 = self._run(seed=99)
+        assert r1["best_result"]["score"] == r2["best_result"]["score"]
+
+    def test_score_prefers_higher_success(self):
+        """_score_mc is success-dominated: a higher success rate outranks a richer
+        but riskier plan even with lower legacy/spend."""
+        from optimizer_v3 import _score_mc
+        safe = {
+            "n_runs": 100, "success_rate": 0.98,
+            "final_percentiles": {25: 100_000}, "spend_percentiles": {50: 1_000_000},
+            "adjustment_metrics": {"avg_cuts_per_trial": 0.0},
+        }
+        risky = {
+            "n_runs": 100, "success_rate": 0.80,
+            "final_percentiles": {25: 800_000}, "spend_percentiles": {50: 1_500_000},
+            "adjustment_metrics": {"avg_cuts_per_trial": 0.0},
+        }
+        assert _score_mc(safe, 0.20) > _score_mc(risky, 0.20)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -121,6 +121,24 @@ def _first_year_crash(sim_start_age: int) -> set[int]:
     return {sim_start_age}
 
 
+def _deterministic_year_returns(accts: list[dict], ret_return: float) -> dict:
+    """
+    Per-account return dict matching what the *deterministic* simulate_retirement
+    would apply in a year (withdrawals.py Step 7 else-branch): rental/bank and
+    per-account-override accounts use their own rate; everything else uses the
+    global retirement return. Used to pin the first simulated year so the
+    near-term recommendation is a concrete figure, not an MC draw.
+    """
+    out: dict = {}
+    for a in accts:
+        always_own = a["type"] in {"rental_property", "bank"}
+        if always_own or not a.get("use_global_return_rate", True):
+            out[a["id"]] = a.get("return_rate", 0.05)
+        else:
+            out[a["id"]] = ret_return
+    return out
+
+
 def _equity_bond_means(stock_pct: float, target_return: float) -> tuple[float, float]:
     """
     Scale equity and bond expected returns so their weighted average equals
@@ -269,10 +287,17 @@ def _mc_single_run_v2(
     spending_floor: float = 0.0,
     eq_mean_override: float | None = None,
     bd_mean_override: float | None = None,
+    deterministic_first_year: bool = False,
 ) -> tuple[list[float], dict]:
     """One trial: build the stochastic return/inflation paths and run the full plan.
     Returns (portfolio_by_age, trial_summary) where trial_summary carries depletion
-    age and the GK adjustment counters surfaced via simulate_retirement."""
+    age, lifetime after-tax spend, and the GK adjustment counters surfaced via
+    simulate_retirement.
+
+    When deterministic_first_year is set, the first simulated year's per-account
+    returns and inflation are pinned to their deterministic values (the rest of the
+    horizon stays stochastic). This makes the near-term, actionable recommendation
+    reproducible from known balances while long-horizon risk is still MC-driven."""
     retirement_age = profile["retirement_age"]
     life_expectancy = profile["life_expectancy"]
     current_age = profile.get("current_age", retirement_age)
@@ -292,6 +317,12 @@ def _mc_single_run_v2(
         for t in range(len(ages))
     ]
 
+    if deterministic_first_year and market_returns:
+        # Pin year 0 to the deterministic plan: known balances → concrete near-term
+        # action. Any first-year crash shock is intentionally not applied here.
+        market_returns[0] = _deterministic_year_returns(accts, ret_return)
+        inflation_sequence[0] = inflation_mean
+
     trial_assumptions = {
         **assumptions,
         "withdrawal_mode": withdrawal_mode,
@@ -304,8 +335,10 @@ def _mc_single_run_v2(
     )
 
     portfolio_by_age = df["total_portfolio"].tolist() if not df.empty else [0.0] * len(ages)
+    lifetime_spend = float(df["actual_after_tax_net"].sum()) if not df.empty else 0.0
     trial_summary = {
         "portfolio_depleted_age": summary.get("portfolio_depleted_age"),
+        "lifetime_spend": lifetime_spend,
         "gk_cuts": summary.get("gk_cuts", 0),
         "gk_raises": summary.get("gk_raises", 0),
         "gk_floor_clamps": summary.get("gk_floor_clamps", 0),
@@ -333,6 +366,7 @@ def run_monte_carlo_v2(
     cma_preset: str | None = None,
     quasi_random: bool = True,
     antithetic: bool = True,
+    deterministic_first_year: bool = False,
 ) -> dict:
     rng = np.random.default_rng(seed)
     retirement_age = profile["retirement_age"]
@@ -366,6 +400,7 @@ def run_monte_carlo_v2(
 
     all_runs: list[list[float]] = []
     depletion_ages: list[int] = []
+    spend_per_trial: list[float] = []
     gk_cuts_per_trial: list[int] = []
     gk_raises_per_trial: list[int] = []
     gk_floor_per_trial: list[int] = []
@@ -383,8 +418,10 @@ def run_monte_carlo_v2(
             crash_years, crash_magnitude, stock_pct,
             withdrawal_mode, spending_floor,
             eq_mean_override, bd_mean_override,
+            deterministic_first_year,
         )
         all_runs.append(bal_series)
+        spend_per_trial.append(trial_summary["lifetime_spend"])
         if trial_summary["portfolio_depleted_age"] is not None:
             depletion_ages.append(trial_summary["portfolio_depleted_age"])
         gk_cuts_per_trial.append(trial_summary["gk_cuts"])
@@ -398,6 +435,15 @@ def run_monte_carlo_v2(
         p: np.percentile(arr, p, axis=0).tolist()
         for p in [10, 25, 50, 75, 90]
     }
+
+    # Cross-trial distributions for strategy scoring (optimizer_v3): final-year
+    # legacy and full-horizon lifetime after-tax spend. final_percentiles[p] is the
+    # p-th percentile of the terminal portfolio; spend_percentiles[p] the p-th
+    # percentile of summed real-dollar spending across the horizon.
+    final_arr = arr[:, -1] if arr.size else np.zeros(n_runs)
+    spend_arr = np.array(spend_per_trial) if spend_per_trial else np.zeros(n_runs)
+    final_percentiles = {p: float(np.percentile(final_arr, p)) for p in [10, 25, 50, 75, 90]}
+    spend_percentiles = {p: float(np.percentile(spend_arr, p)) for p in [10, 25, 50, 75, 90]}
 
     # Adjustment metrics — Kitces' reframing of pure success rate. In constant_real
     # mode these stay zero (no GK firings, real ratio == 1.0); they only carry
@@ -421,10 +467,13 @@ def run_monte_carlo_v2(
     return {
         "ages": ages,
         "percentiles": percentiles,
+        "final_percentiles": final_percentiles,
+        "spend_percentiles": spend_percentiles,
         "success_rate": success_rate,
         "n_runs": n_runs,
         "n_depleted": len(depletion_ages),
         "depletion_ages": depletion_ages,
+        "deterministic_first_year": deterministic_first_year,
         "volatility": equity_vol,      # compat key for chart_monte_carlo()
         "equity_vol": equity_vol,
         "bond_vol": bond_vol,
