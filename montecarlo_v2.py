@@ -111,13 +111,14 @@ CMA_PRESETS: dict[str, dict] = {
 }
 
 
-def _generate_crash_years(rng, retirement_age: int, life_expectancy: int) -> set[int]:
-    crash_years: set[int] = set()
-    next_crash = retirement_age + int(rng.integers(10, 21))
-    while next_crash <= life_expectancy:
-        crash_years.add(next_crash)
-        next_crash += int(rng.integers(10, 21))
-    return crash_years
+def _first_year_crash(sim_start_age: int) -> set[int]:
+    """
+    Model sequence-of-returns risk: a single market crash in the first year of
+    retirement (the simulation's first year). Returned as a one-element set so it
+    feeds the same crash-application path as before. Deterministic across trials —
+    the same first-year shock is applied to every trial, on top of its random draw.
+    """
+    return {sim_start_age}
 
 
 def _equity_bond_means(stock_pct: float, target_return: float) -> tuple[float, float]:
@@ -373,11 +374,7 @@ def run_monte_carlo_v2(
     for i in range(n_runs):
         # simulate_retirement deep-copies accounts internally, and _build_market_returns
         # only reads metadata, so the shared list is safe to pass without a per-trial copy.
-        crash_years = (
-            _generate_crash_years(rng, retirement_age, life_expectancy)
-            if enable_crashes
-            else set()
-        )
+        crash_years = _first_year_crash(sim_start_age) if enable_crashes else set()
         bal_series, trial_summary = _mc_single_run_v2(
             accounts_at_retirement, profile, assumptions,
             roth_conversion, spending_overrides,

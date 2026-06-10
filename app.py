@@ -865,11 +865,18 @@ def main():
                         _cmp_le = _cmp_data["profile"]["life_expectancy"]
                         _cmp_depl = _cmp_sum.get("portfolio_depleted_age")
                         _cmp_le_row = _cmp_ret_df[_cmp_ret_df["age"] == _cmp_le] if not _cmp_ret_df.empty else _cmp_ret_df.iloc[0:0]
+                        # Mirror the current-scenario year-1 spend logic (lines ~750-756): in
+                        # fixed-net mode report the after-tax target, otherwise the gross
+                        # withdrawal. Using gross unconditionally made two fixed-net scenarios
+                        # with identical after-tax targets but different tax (e.g. MT vs no state
+                        # tax) appear to have different year-1 spend.
+                        _cmp_fixed_net = _cmp_data["assumptions"].get("spending_mode") == "fixed"
+                        _cmp_spend_col = "net_spending_target" if _cmp_fixed_net else "spending_target"
                         st.session_state["cmp_result"] = {
                             "name": _cmp_sel,
                             "total_at_retirement": sum(a["balance"] for a in _cmp_accts_ret),
                             "longevity": f"Age {_cmp_depl}" if _cmp_depl else f"Lasts to {_cmp_le}+",
-                            "spend_yr1": float(_cmp_ret_df["spending_target"].iloc[0]) if not _cmp_ret_df.empty else 0.0,
+                            "spend_yr1": float(_cmp_ret_df[_cmp_spend_col].iloc[0]) if not _cmp_ret_df.empty else 0.0,
                             "portfolio_at_le": float(_cmp_le_row["total_portfolio"].iloc[0]) if not _cmp_le_row.empty else 0.0,
                             "lifetime_taxes": _cmp_sum.get("lifetime_taxes", 0),
                             "lifetime_healthcare": _cmp_sum.get("lifetime_healthcare", 0),
@@ -1594,12 +1601,12 @@ def main():
             )
 
         mc_crashes = st.checkbox(
-            "Include market crash events (−20% equity shock every 10–20 years)",
+            "Include a market crash in the first year of retirement (−20% equity shock)",
             value=False,
             help=(
-                "Each trial independently schedules crashes spaced 10–20 years apart. "
-                "In a crash year equity accounts take an additional −20% drop. "
-                "Bank accounts and rental property are unaffected."
+                "Stress-tests sequence-of-returns risk: in every trial, equity accounts take "
+                "an additional −20% drop in the first year of retirement, on top of that year's "
+                "normal return draw. Bank accounts and rental property are unaffected."
             ),
             key="mc_crashes",
         )

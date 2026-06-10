@@ -24,6 +24,8 @@ Living document. Update when decisions are made or new questions arise.
 
 **Annual simulation granularity** — Year-by-year simulation means no intra-year rebalancing, sequence-of-returns within a year, or monthly budget tracking. Acceptable for long-horizon planning; would mislead if used for near-term cash flow.
 
+**Market crash stress test = first-year shock only** — The "Include a market crash" MC option (`enable_crashes`) now applies a single −20% equity shock in the first year of retirement, in every trial, stacked on top of that year's random return draw (`_first_year_crash` in both MC engines). It previously scheduled random −20% crashes at 10–20 year intervals across retirement. The first-year framing directly targets sequence-of-returns risk — the worst-case timing for a retiree — and is deterministic across trials, so it's a clean A/B stress test rather than added noise. Tradeoff: it no longer models recurring mid-retirement crashes; combined with the random return draws (which already produce bad multi-year stretches anywhere in the horizon), a separate recurring-crash schedule was redundant. The shock scales by `stock_pct` (a 70/30 portfolio drops ~14%, not 20%), consistent with the equity-sleeve crash mechanic. To revert to recurring crashes, restore the interval-scheduling helper.
+
 **Survivor spending reduction hardcoded at 25%** — Default is configurable per profile but there's no guidance to users. Health & Retirement Study data suggests the right number varies widely by income level and housing situation.
 
 ---
@@ -53,6 +55,8 @@ Living document. Update when decisions are made or new questions arise.
 
 ## Resolved
 *Decisions made / bugs fixed — kept for institutional memory*
+
+**Montana capital gains taxed at preferential rates** — `calculate_mt_state_tax` previously lumped long-term capital gains into ordinary income and ran the combined total through Montana's ordinary brackets (4.7% / 5.65%), overstating state tax on gains by 1.55–1.7 pp. Montana (HB337, 2026) taxes net long-term capital gains at preferential rates of 3.0% (lower bracket) and 4.1% (upper bracket), with thresholds matching the ordinary ranges. Added `MT_LTCG_BRACKETS` in `constants.py` and gave Montana its own LTCG stacking calc (mirrors the federal `calculate_ltcg_tax`: LTCG stacks on top of MT ordinary taxable income to set the rate, and the standard deduction shelters LTCG when ordinary income is below it). Ordinary brackets, standard deduction (mirrors federal), and SS taxability (same as federal) were already correct.
 
 **Accumulation now honors `use_global_return_rate`** — Previously the accumulation phase always grew each account at its own `return_rate` (default 7%), ignoring the per-account "use global rate" flag and the global Retirement Return Rate, while the retirement phase honored both. `projections.py` now uses the global rate during accumulation when the flag is set (bank/rental always use their own rate), matching `withdrawals.py`.
 

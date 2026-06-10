@@ -325,6 +325,35 @@ class TestCaStateTax:
         assert tax_mfj < tax_single
 
 
+class TestMtStateTax:
+    def test_zero_income(self):
+        from taxes import calculate_mt_state_tax
+        assert calculate_mt_state_tax(0.0, 0.0, "married_filing_jointly") == 0.0
+
+    def test_ltcg_preferential_rate(self):
+        from taxes import calculate_mt_state_tax
+        # MT taxes LTCG at 3.0% (lower bracket), not the 4.7% ordinary rate.
+        # MFJ std ded = 32,200. Ordinary 60K + LTCG 40K:
+        #   ordinary_taxable = 27,800 @ 4.7% = 1,306.60
+        #   LTCG 40K stacks at 27,800..67,800 (all < 95K) @ 3.0% = 1,200
+        tax = calculate_mt_state_tax(60_000, 40_000, "married_filing_jointly")
+        assert abs(tax - 2_506.60) < 0.01
+
+    def test_ltcg_cheaper_than_ordinary(self):
+        from taxes import calculate_mt_state_tax
+        # Same gross income, but as LTCG it should be taxed less than as ordinary.
+        as_ltcg = calculate_mt_state_tax(60_000, 40_000, "married_filing_jointly")
+        as_ordinary = calculate_mt_state_tax(100_000, 0.0, "married_filing_jointly")
+        assert as_ltcg < as_ordinary
+
+    def test_ltcg_straddles_bracket(self):
+        from taxes import calculate_mt_state_tax
+        # Ordinary 90K + LTCG 40K, MFJ. ordinary_taxable = 57,800 @ 4.7% = 2,716.60.
+        # LTCG stacks 57,800..97,800: 37,200 @ 3.0% + 2,800 @ 4.1% = 1,116 + 114.80 = 1,230.80
+        tax = calculate_mt_state_tax(90_000, 40_000, "married_filing_jointly")
+        assert abs(tax - 3_947.40) < 0.01
+
+
 class TestCalculateYearTaxes:
     def test_returns_required_keys(self):
         from taxes import calculate_year_taxes

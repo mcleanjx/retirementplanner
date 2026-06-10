@@ -30,17 +30,14 @@ BANK_TYPES = {"bank"}
 CRASH_AFFECTED_TYPES = TRADITIONAL_TYPES | ROTH_TYPES | TAXABLE_TYPES | {"hsa"}
 
 
-def _generate_crash_years(rng, retirement_age: int, life_expectancy: int) -> set[int]:
+def _first_year_crash(sim_start_age: int) -> set[int]:
     """
-    Schedule market crashes at random 10–20 year intervals throughout retirement.
-    Each trial gets its own independently drawn crash schedule.
+    Model sequence-of-returns risk: a single market crash in the first year of
+    retirement (the simulation's first year). Returned as a one-element set so it
+    feeds the same crash-application path as before. Deterministic across trials —
+    the same first-year shock is applied to every trial, on top of its random draw.
     """
-    crash_years: set[int] = set()
-    next_crash = retirement_age + int(rng.integers(10, 21))  # first crash in years 10–20
-    while next_crash <= life_expectancy:
-        crash_years.add(next_crash)
-        next_crash += int(rng.integers(10, 21))
-    return crash_years
+    return {sim_start_age}
 
 
 def _build_market_returns(
@@ -142,9 +139,9 @@ def run_monte_carlo(
     allocation controls volatility only: higher stock_pct → more volatile path.
     Bond volatility is fixed at 30% of equity volatility.
 
-    When enable_crashes=True, each trial independently schedules market crashes at
-    random 10–20 year intervals; in a crash year equity accounts take an additional
-    crash_magnitude drop on top of that year's normal return draw.
+    When enable_crashes=True, a single market crash hits the first year of retirement
+    (sequence-of-returns risk): equity accounts take an additional crash_magnitude
+    drop on top of that first year's normal return draw, in every trial.
 
     Returns:
         ages: list of simulated ages (max(retirement_age, current_age) → life_expectancy)
@@ -167,11 +164,7 @@ def run_monte_carlo(
     for _ in range(n_runs):
         # simulate_retirement deep-copies accounts internally and _build_market_returns
         # only reads metadata, so the shared list is safe to pass without a per-trial copy.
-        crash_years = (
-            _generate_crash_years(rng, retirement_age, life_expectancy)
-            if enable_crashes
-            else set()
-        )
+        crash_years = _first_year_crash(sim_start_age) if enable_crashes else set()
         bal_series, dep_age = _mc_single_run(
             accounts_at_retirement, profile, assumptions,
             roth_conversion, spending_overrides,

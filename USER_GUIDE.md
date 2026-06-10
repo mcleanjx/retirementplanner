@@ -282,6 +282,7 @@ The most important tab for understanding *risk* (as opposed to the Retirement ta
 | **Number of Trials** | 1,000 is fast. 5,000–10,000 gives more stable percentiles. |
 | **Withdrawal Rule** | *Constant Real*: you spend the same inflation-adjusted amount every year. *Guyton-Klinger Guardrails*: you cut spending 10% when the market is bad and raise it 10% when things are going well — this improves success rates significantly. |
 | **Spending Floor** | Only available with Guyton-Klinger. A minimum annual discretionary spend in today's dollars that guardrail cuts can never breach. Healthcare and taxes are always paid on top. Set to 0 to disable. |
+| **First-year market crash** | Optional stress test for sequence-of-returns risk: applies an extra −20% equity shock in the first year of retirement (on top of that year's random return) in every trial. Bank and rental accounts are unaffected. |
 
 > Note: the **Retirement Return Rate** setting (under Assumptions) carries a fixed reminder that, as of 2026, equity valuations (Shiller CAPE) are historically elevated — which has historically preceded below-average forward returns. The app does **not** measure CAPE dynamically; if you want to stress-test a lower-return regime, reduce the Retirement Return Rate yourself before running the simulation.
 
@@ -480,7 +481,7 @@ For Married couples where both spouses are on Medicare, the surcharge applies *t
 
 **California:** Progressive brackets from 1% to 13.3%. Social Security is *fully excluded* from California taxable income. Capital gains are taxed as ordinary income (no preferential rate).
 
-**Montana:** Two-bracket system under the 2026 HB337 reform — 4.7% on taxable income up to $47,500 (single) / $95,000 (MFJ), and 5.65% above — using a standard deduction that mirrors the federal one. Social Security is taxable at the same federal rate (up to 85%). Capital gains are taxed as ordinary income (no preferential rate).
+**Montana:** Two-bracket system under the 2026 HB337 reform — 4.7% on taxable income up to $47,500 (single) / $95,000 (MFJ), and 5.65% above — using a standard deduction that mirrors the federal one. Social Security is taxable at the same federal rate (up to 85%). Long-term capital gains get Montana's preferential rates of 3.0% (lower bracket) and 4.1% (upper bracket), stacked on top of ordinary income to determine the rate.
 
 **Other States:** A flat rate applied to ordinary income and capital gains.
 
