@@ -325,6 +325,35 @@ class TestCaStateTax:
         assert tax_mfj < tax_single
 
 
+class TestMtStateTax:
+    def test_zero_income(self):
+        from taxes import calculate_mt_state_tax
+        assert calculate_mt_state_tax(0.0, 0.0, "married_filing_jointly") == 0.0
+
+    def test_ltcg_preferential_rate(self):
+        from taxes import calculate_mt_state_tax
+        # MT taxes LTCG at 3.0% (lower bracket), not the 4.7% ordinary rate.
+        # MFJ std ded = 32,200. Ordinary 60K + LTCG 40K:
+        #   ordinary_taxable = 27,800 @ 4.7% = 1,306.60
+        #   LTCG 40K stacks at 27,800..67,800 (all < 95K) @ 3.0% = 1,200
+        tax = calculate_mt_state_tax(60_000, 40_000, "married_filing_jointly")
+        assert abs(tax - 2_506.60) < 0.01
+
+    def test_ltcg_cheaper_than_ordinary(self):
+        from taxes import calculate_mt_state_tax
+        # Same gross income, but as LTCG it should be taxed less than as ordinary.
+        as_ltcg = calculate_mt_state_tax(60_000, 40_000, "married_filing_jointly")
+        as_ordinary = calculate_mt_state_tax(100_000, 0.0, "married_filing_jointly")
+        assert as_ltcg < as_ordinary
+
+    def test_ltcg_straddles_bracket(self):
+        from taxes import calculate_mt_state_tax
+        # Ordinary 90K + LTCG 40K, MFJ. ordinary_taxable = 57,800 @ 4.7% = 2,716.60.
+        # LTCG stacks 57,800..97,800: 37,200 @ 3.0% + 2,800 @ 4.1% = 1,116 + 114.80 = 1,230.80
+        tax = calculate_mt_state_tax(90_000, 40_000, "married_filing_jointly")
+        assert abs(tax - 3_947.40) < 0.01
+
+
 class TestCalculateYearTaxes:
     def test_returns_required_keys(self):
         from taxes import calculate_year_taxes
@@ -994,6 +1023,441 @@ class TestMonteCarloV2:
         # Weighted blend should equal target
         blended = 0.60 * eq + 0.40 * bd
         assert abs(blended - 0.05) < 1e-9
+
+
+# ===========================================================================
+# 6b. MONTE CARLO ↔ deterministic STRATEGY PARITY (regression guard for #5)
+# ===========================================================================
+
+class TestMonteCarloStrategyParity:
+    """Both MC engines must run the *same* plan as simulate_retirement — Roth
+    conversions, 0%-bracket gain harvesting, rebalancing, the tax-efficient
+    withdrawal order, and full taxes — rather than a simplified withdrawal loop.
+    These guard against the engines silently diverging from the plan again."""
+
+    def _accts(self):
+        # traditional-heavy so conversions, RMDs and taxes all matter
+        return [_trad_account(800_000), _roth_account(50_000), _taxable_account(150_000, 90_000)]
+
+    def _profile(self):
+        return _base_profile(current_age=60, retirement_age=65, life_expectancy=90)
+
+    def _conversion(self):
+        return {
+            "enabled": True,
+            "strategy": "fill_to_bracket",
+            "target_bracket": 0.12,
+            "start_age": 65,
+            "end_age": 72,
+            "source_account_ids": ["trad1"],
+            "destination_account_id": "roth1",
+        }
+
+    def test_injection_reproduces_deterministic(self):
+        """simulate_retirement with injected *deterministic* returns + constant inflation
+        reproduces the plain deterministic run exactly — proving the MC return/inflation
+        hooks are faithful, so the MC engines really do run the deterministic plan."""
+        import copy
+        import numpy as np
+        from withdrawals import simulate_retirement
+        accts, p, a, rc = self._accts(), self._profile(), _base_assumptions(), self._conversion()
+        df_det, _ = simulate_retirement(copy.deepcopy(accts), p, a, rc)
+        start = max(p["retirement_age"], p["current_age"])
+        n = p["life_expectancy"] - start + 1
+        ret = a["retirement_return_rate"]
+
+        def _rate(acc):
+            if acc["type"] in {"rental_property", "bank"} or not acc.get("use_global_return_rate", True):
+                return acc.get("return_rate", 0.05)
+            return ret
+
+        mr = [{acc["id"]: _rate(acc) for acc in accts} for _ in range(n)]
+        df_inj, _ = simulate_retirement(
+            copy.deepcopy(accts), p, a, rc,
+            market_returns=mr, inflation_sequence=[a["inflation_rate"]] * n,
+        )
+        diff = np.abs(np.array(df_det["total_portfolio"]) - np.array(df_inj["total_portfolio"]))
+        assert diff.max() < 1e-6, f"injection diverged from deterministic by ${diff.max():,.4f}"
+        assert df_det["roth_conversion"].sum() > 0, "conversions should have executed in this scenario"
+
+    def test_v2_models_roth_conversions(self):
+        """Toggling Roth conversions changes the v2 MC outcome — conversions are actually
+        executed inside MC (previously they were ignored entirely)."""
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._accts(), self._profile(), _base_assumptions()
+        on = run_monte_carlo_v2(accts, p, a, n_runs=150, seed=5, roth_conversion=self._conversion())
+        off = run_monte_carlo_v2(accts, p, a, n_runs=150, seed=5, roth_conversion={"enabled": False})
+        assert on["percentiles"][50][-1] != off["percentiles"][50][-1]
+
+    def test_v1_models_roth_conversions(self):
+        from montecarlo import run_monte_carlo
+        accts, p, a = self._accts(), self._profile(), _base_assumptions()
+        on = run_monte_carlo(accts, p, a, n_runs=150, seed=5, roth_conversion=self._conversion())
+        off = run_monte_carlo(accts, p, a, n_runs=150, seed=5, roth_conversion={"enabled": False})
+        assert on["percentiles"][50][-1] != off["percentiles"][50][-1]
+
+    def test_v2_low_vol_median_near_deterministic(self):
+        """At near-zero volatility the v2 median path tracks the deterministic projection
+        (same plan, minimal market/inflation noise)."""
+        import copy
+        from withdrawals import simulate_retirement
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a, rc = self._accts(), self._profile(), _base_assumptions(), self._conversion()
+        det, _ = simulate_retirement(copy.deepcopy(accts), p, a, rc)
+        det_final = det["total_portfolio"].iloc[-1]
+        mc = run_monte_carlo_v2(
+            accts, p, a, n_runs=300, seed=9,
+            equity_vol=0.002, bond_vol=0.002, equity_bond_corr=0.0, roth_conversion=rc,
+        )
+        mc_med = mc["percentiles"][50][-1]
+        assert abs(mc_med - det_final) < 0.08 * max(1.0, det_final), (
+            f"low-vol MC median {mc_med:,.0f} not near deterministic {det_final:,.0f}"
+        )
+
+
+# ===========================================================================
+# 6c. ADJUSTMENT METRICS (H2 — Kitces-style reframing of success rate)
+# ===========================================================================
+
+class TestSimulateRetirementGKMetrics:
+    """simulate_retirement must surface gk_cuts / gk_raises / gk_floor_clamps /
+    gk_min_real_ratio in its summary so MC callers can report probability of
+    adjustment. In constant_real these stay zero and the real ratio is 1.0."""
+
+    def _setup(self):
+        return _trad_account(800_000), _base_profile(retirement_age=65, life_expectancy=85)
+
+    def test_constant_real_metrics_zero(self):
+        """Constant-real mode: no GK firings, real spending ratio == 1.0."""
+        from withdrawals import simulate_retirement
+        acc, p = self._setup()
+        _, summary = simulate_retirement([acc], p, _base_assumptions())
+        assert summary["gk_cuts"] == 0
+        assert summary["gk_raises"] == 0
+        assert summary["gk_floor_clamps"] == 0
+        assert abs(summary["gk_min_real_ratio"] - 1.0) < 1e-6
+
+    def test_guardrails_summary_keys_present(self):
+        """All four GK keys must be present even when guardrails never fires."""
+        from withdrawals import simulate_retirement
+        acc, p = self._setup()
+        a = _base_assumptions(withdrawal_mode="guardrails")
+        _, summary = simulate_retirement([acc], p, a)
+        for k in ("gk_cuts", "gk_raises", "gk_floor_clamps", "gk_min_real_ratio"):
+            assert k in summary
+
+    def test_guardrails_cuts_fire_on_bad_returns(self):
+        """A sustained sequence of bad returns must trigger at least one cut and
+        push min_real_ratio below 1.0."""
+        from withdrawals import simulate_retirement
+        acc, p = self._setup()
+        a = _base_assumptions(withdrawal_mode="guardrails")
+        n = p["life_expectancy"] - p["retirement_age"] + 1
+        # All accounts lose 15% / year — withdrawal rate climbs fast.
+        mr = [{acc["id"]: -0.15} for _ in range(n)]
+        _, summary = simulate_retirement([acc], p, a, market_returns=mr)
+        assert summary["gk_cuts"] > 0, "bad-return path should trigger cuts"
+        assert summary["gk_min_real_ratio"] < 1.0
+
+    def test_guardrails_raises_fire_on_good_returns(self):
+        """A sustained boom must trigger at least one prosperity-rule raise."""
+        from withdrawals import simulate_retirement
+        acc, p = self._setup()
+        a = _base_assumptions(withdrawal_mode="guardrails")
+        n = p["life_expectancy"] - p["retirement_age"] + 1
+        mr = [{acc["id"]: 0.25} for _ in range(n)]
+        _, summary = simulate_retirement([acc], p, a, market_returns=mr)
+        assert summary["gk_raises"] > 0, "boom path should trigger raises"
+
+    def test_floor_clamps_count_only_under_guardrails(self):
+        """Floor clamps must be guardrails-only — constant_real ignores the floor."""
+        from withdrawals import simulate_retirement
+        acc, p = self._setup()
+        # Floor above baseline: constant_real ignores it; guardrails should clamp.
+        a_const = _base_assumptions(spending_floor=1_000_000)
+        _, s_const = simulate_retirement([acc], p, a_const)
+        assert s_const["gk_floor_clamps"] == 0
+
+        a_gr = _base_assumptions(withdrawal_mode="guardrails", spending_floor=1_000_000)
+        n = p["life_expectancy"] - p["retirement_age"] + 1
+        mr = [{acc["id"]: -0.10} for _ in range(n)]
+        _, s_gr = simulate_retirement([acc], p, a_gr, market_returns=mr)
+        assert s_gr["gk_floor_clamps"] > 0, "floor should clamp under bad guardrails path"
+
+    def test_survivor_baseline_drops_so_post_widowhood_not_counted_as_cut(self):
+        """After the survivor transition, the GK baseline drops by the same factor
+        as spending_target. Otherwise every post-widowhood year would falsely read
+        as a 25% real-spending cut even with constant-real."""
+        from withdrawals import simulate_retirement
+        # MFJ with spouse older than primary by 5 years so survivor fires before life expectancy.
+        p = _base_profile(
+            current_age=65, retirement_age=65, life_expectancy=85,
+            filing_status="married_filing_jointly", spouse_age=70,
+            spouse_ss_benefit=12_000, survivor_spending_reduction=0.25,
+        )
+        acc = _trad_account(1_200_000)
+        _, summary = simulate_retirement([acc], p, _base_assumptions())
+        # Constant_real mode: real ratio must stay ~1.0 across the whole horizon
+        # despite the survivor reduction part-way through.
+        assert abs(summary["gk_min_real_ratio"] - 1.0) < 1e-6, (
+            "survivor reduction should drop the baseline, leaving real_ratio unchanged"
+        )
+
+
+class TestMonteCarloV2AdjustmentMetrics:
+    """MC v2 must aggregate the per-trial GK metrics into adjustment_metrics so the
+    UI can report Kitces-style probability of adjustment alongside success rate."""
+
+    def _scenario(self):
+        # Tight enough that guardrails meaningfully flexes spending.
+        accts = [_trad_account(900_000)]
+        p = _base_profile(
+            current_age=60, retirement_age=65, life_expectancy=90,
+            filing_status="married_filing_jointly", spouse_age=60,
+            spouse_ss_benefit=15_000,
+        )
+        a = _base_assumptions(spending_mode="fixed", annual_spending_target=65_000)
+        return accts, p, a
+
+    def test_result_carries_adjustment_metrics_dict(self):
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._scenario()
+        r = run_monte_carlo_v2(accts, p, a, n_runs=120, seed=0)
+        am = r["adjustment_metrics"]
+        for k in ("prob_any_cut", "prob_any_raise", "prob_any_floor_hit",
+                  "avg_cuts_per_trial", "avg_raises_per_trial", "avg_floor_years_per_trial",
+                  "min_real_ratio_p10", "min_real_ratio_p50", "min_real_ratio_p90"):
+            assert k in am
+
+    def test_constant_real_metrics_zero(self):
+        """Under constant_real the engine must report no cuts / raises / floor hits."""
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._scenario()
+        r = run_monte_carlo_v2(accts, p, a, n_runs=120, seed=0)
+        am = r["adjustment_metrics"]
+        assert am["prob_any_cut"] == 0.0
+        assert am["prob_any_raise"] == 0.0
+        assert am["prob_any_floor_hit"] == 0.0
+        assert abs(am["min_real_ratio_p50"] - 1.0) < 1e-6
+
+    def test_guardrails_some_cuts_fire(self):
+        """At reasonable volatility a guardrails MC should fire cuts in most trials."""
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._scenario()
+        r = run_monte_carlo_v2(accts, p, a, n_runs=300, seed=0,
+                               withdrawal_mode="guardrails")
+        am = r["adjustment_metrics"]
+        assert am["prob_any_cut"] > 0.5, f"expected most trials to see a cut, got {am['prob_any_cut']}"
+        assert am["min_real_ratio_p50"] < 1.0, (
+            "median worst real-spending year should fall below baseline under guardrails"
+        )
+
+    def test_real_ratio_percentiles_are_ordered(self):
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._scenario()
+        r = run_monte_carlo_v2(accts, p, a, n_runs=200, seed=1,
+                               withdrawal_mode="guardrails")
+        am = r["adjustment_metrics"]
+        assert am["min_real_ratio_p10"] <= am["min_real_ratio_p50"] <= am["min_real_ratio_p90"]
+
+
+# ===========================================================================
+# 6d. VARIANCE REDUCTION (M3 Sobol + L4 antithetic)
+# ===========================================================================
+
+class TestMonteCarloV2VarianceReduction:
+    """Sobol quasi-random + antithetic variates should narrow the seed-to-seed
+    spread of summary statistics, and both knobs should be reflected in the
+    result dict so the UI staleness check can detect changes."""
+
+    def _scenario(self):
+        accts = [_trad_account(900_000)]
+        p = _base_profile(current_age=60, retirement_age=65, life_expectancy=90,
+                          filing_status="married_filing_jointly", spouse_age=60,
+                          spouse_ss_benefit=15_000)
+        a = _base_assumptions(spending_mode="fixed", annual_spending_target=65_000)
+        return accts, p, a
+
+    def test_flags_round_trip_into_result(self):
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._scenario()
+        r = run_monte_carlo_v2(accts, p, a, n_runs=120, seed=0,
+                               quasi_random=True, antithetic=True)
+        assert r["quasi_random"] is True
+        assert r["antithetic"] is True
+        r2 = run_monte_carlo_v2(accts, p, a, n_runs=120, seed=0,
+                                quasi_random=False, antithetic=False)
+        assert r2["quasi_random"] is False
+        assert r2["antithetic"] is False
+
+    def test_antithetic_only_runs_cleanly(self):
+        """Antithetic alone (no Sobol) is a useful fallback when scipy isn't available."""
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._scenario()
+        r = run_monte_carlo_v2(accts, p, a, n_runs=200, seed=0,
+                               quasi_random=False, antithetic=True)
+        assert 0.0 <= r["success_rate"] <= 1.0
+
+    def test_odd_n_runs_no_off_by_one(self):
+        """Antithetic uses ceil(n/2) base draws; an odd n_runs must still return
+        exactly n_runs trials (not n+1) without an index error."""
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._scenario()
+        r = run_monte_carlo_v2(accts, p, a, n_runs=101, seed=0,
+                               quasi_random=False, antithetic=True)
+        assert r["n_runs"] == 101
+        # percentile bands should have exactly horizon-length entries
+        assert len(r["percentiles"][50]) == len(r["ages"])
+
+    def test_n_runs_one_edge_case(self):
+        """A single-trial run must not crash under any combination of variance-reduction flags."""
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._scenario()
+        for q, anti in [(True, True), (True, False), (False, True), (False, False)]:
+            r = run_monte_carlo_v2(accts, p, a, n_runs=1, seed=0,
+                                   quasi_random=q, antithetic=anti)
+            assert r["n_runs"] == 1
+            assert len(r["percentiles"][50]) == len(r["ages"])
+
+    def test_qmc_reduces_seed_variance(self):
+        """Across multiple seeds, QMC+antithetic should give a tighter distribution of
+        success rates than pure pseudorandom. The reduction varies by scenario; we
+        require *some* improvement to guard against the variance-reduction path being
+        silently broken."""
+        import numpy as np
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._scenario()
+        srs_qmc = []
+        srs_psr = []
+        for s in range(6):
+            srs_qmc.append(run_monte_carlo_v2(
+                accts, p, a, n_runs=300, seed=s,
+                quasi_random=True, antithetic=True,
+            )["success_rate"])
+            srs_psr.append(run_monte_carlo_v2(
+                accts, p, a, n_runs=300, seed=s,
+                quasi_random=False, antithetic=False,
+            )["success_rate"])
+        sd_qmc = float(np.std(srs_qmc))
+        sd_psr = float(np.std(srs_psr))
+        # Skip if pseudo run happened to be unusually stable (no signal to compare).
+        if sd_psr < 1e-3:
+            pytest.skip(f"pseudo std={sd_psr:.4f} too small to compare")
+        assert sd_qmc < sd_psr, (
+            f"variance reduction failed: qmc std={sd_qmc:.4f} vs pseudo std={sd_psr:.4f}"
+        )
+
+    def test_draw_normals_shape_and_finiteness(self):
+        """The internal _draw_normals must return the requested shape with finite values
+        for every flag combo (catches the Sobol u→ndtri pipeline regression)."""
+        import numpy as np
+        from montecarlo_v2 import _draw_normals
+        rng = np.random.default_rng(0)
+        for q, anti in [(True, True), (True, False), (False, True), (False, False)]:
+            z = _draw_normals(64, 12, rng, q, anti, seed=0)
+            assert z.shape == (64, 12)
+            assert np.isfinite(z).all()
+
+
+# ===========================================================================
+# 6e. CMA PRESETS (M1 — forward-looking 2026 capital-market assumption sets)
+# ===========================================================================
+
+class TestMonteCarloV2CMAPresets:
+    """CMA_PRESETS must (a) carry the keys downstream code reads, (b) override
+    equity/bond vol+mean for global-rate accounts, and (c) leave per-account
+    overrides untouched."""
+
+    def _scenario(self, use_global=True):
+        accts = [{
+            "id": "trad1", "name": "401k", "type": "traditional_401k",
+            "balance": 800_000, "basis": 800_000,
+            "annual_contribution": 0.0, "contribution_growth_rate": 0.0,
+            "return_rate": 0.05, "use_global_return_rate": use_global,
+            "employer_match_percent": 0.0, "employer_match_limit": 0.0,
+            "qualified_dividend_yield": 0.0, "ordinary_income_yield": 0.0,
+            "net_annual_rental_income": 0.0, "withdraw_priority": "normal",
+        }]
+        p = _base_profile(current_age=60, retirement_age=65, life_expectancy=85)
+        a = _base_assumptions()
+        return accts, p, a
+
+    def test_presets_have_required_keys(self):
+        from montecarlo_v2 import CMA_PRESETS
+        for name, meta in CMA_PRESETS.items():
+            for k in ("label", "equity_mean", "bond_mean", "equity_vol", "bond_vol", "description"):
+                assert k in meta, f"preset {name} missing {k}"
+            assert 0.0 < meta["equity_mean"] < 0.20
+            assert 0.0 < meta["bond_mean"] < 0.10
+            assert 0.0 < meta["equity_vol"] < 0.50
+            assert 0.0 < meta["bond_vol"] < 0.20
+
+    def test_each_preset_runs_and_records_metadata(self):
+        from montecarlo_v2 import run_monte_carlo_v2, CMA_PRESETS
+        accts, p, a = self._scenario()
+        for name in CMA_PRESETS:
+            r = run_monte_carlo_v2(accts, p, a, n_runs=60, seed=0, cma_preset=name)
+            assert r["cma_preset"] == name
+            assert r["cma_preset_meta"] is CMA_PRESETS[name]
+            # Engine returns the preset's vols, not the user-provided ones.
+            assert r["equity_vol"] == CMA_PRESETS[name]["equity_vol"]
+            assert r["bond_vol"] == CMA_PRESETS[name]["bond_vol"]
+
+    def test_unknown_preset_name_falls_through_to_user_inputs(self):
+        """An unknown preset key must not crash — the engine falls back to the user-
+        provided equity_vol / bond_vol arguments. This guards against typos silently
+        loading the wrong CMA."""
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._scenario()
+        r = run_monte_carlo_v2(accts, p, a, n_runs=60, seed=0,
+                               cma_preset="not_a_real_preset",
+                               equity_vol=0.20, bond_vol=0.08)
+        assert r["cma_preset_meta"] is None
+        assert r["equity_vol"] == 0.20
+        assert r["bond_vol"] == 0.08
+
+    def test_preset_changes_median_outcome(self):
+        """Two presets with materially different equity means should produce
+        materially different median ending balances — proves the preset is wired
+        through _build_market_returns and not silently ignored."""
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._scenario()
+        # vanguard_2026 equity mean 4.5%, original_2022 equity mean 7.5% — 3pp gap
+        # over a 20-year horizon should compound to a clearly different median.
+        low = run_monte_carlo_v2(accts, p, a, n_runs=200, seed=0, cma_preset="vanguard_2026")
+        high = run_monte_carlo_v2(accts, p, a, n_runs=200, seed=0, cma_preset="original_2022")
+        assert high["percentiles"][50][-1] > low["percentiles"][50][-1]
+
+    def test_preset_skipped_for_per_account_overrides(self):
+        """When use_global_return_rate=False, the account drives its own return via
+        _equity_bond_means(stock_pct, own_rate). The preset must NOT override that —
+        otherwise users with fixed-rate annuities or hand-tuned account returns would
+        silently see those replaced by the preset's equity mean."""
+        from montecarlo_v2 import _build_market_returns
+        import numpy as np
+        accts = [{
+            "id": "fixed", "type": "traditional_401k",
+            "balance": 500_000, "return_rate": 0.06, "use_global_return_rate": False,
+        }]
+        ages = [65]
+        zs = np.zeros(1)
+        # With z=0 the log-normal multiplier is exp(log_mu) = (1+mean)*exp(-0.5*vol^2);
+        # the realized return ~= mean - 0.5*vol^2 for small vol. Just verify the
+        # preset doesn't drag the rate toward vanguard_2026's 4.5% equity mean.
+        out_preset = _build_market_returns(
+            accts, ages, zs, zs,
+            equity_vol=0.165, bond_vol=0.060, ret_return=0.05, stock_pct=0.60,
+            crash_years=set(), crash_magnitude=0.0,
+            eq_mean_override=0.045, bd_mean_override=0.045,
+        )
+        out_no_preset = _build_market_returns(
+            accts, ages, zs, zs,
+            equity_vol=0.165, bond_vol=0.060, ret_return=0.05, stock_pct=0.60,
+            crash_years=set(), crash_magnitude=0.0,
+        )
+        # Per-account override is honored either way: returns must match each other,
+        # not drift toward the preset's equity mean.
+        assert abs(out_preset[0]["fixed"] - out_no_preset[0]["fixed"]) < 1e-9
 
 
 # ===========================================================================
@@ -1938,14 +2402,17 @@ class TestAlreadyRetired:
         df, summary = simulate_retirement(accts, p, _base_assumptions())
         assert len(df) > 0
 
-    def test_simulation_starts_at_retirement_age_not_current_age(self):
+    def test_simulation_starts_at_current_age_when_already_retired(self):
+        """When current_age > retirement_age, the sim starts at current_age — the
+        already-elapsed retirement years (retirement_age..current_age-1) are not
+        re-simulated. (v1.4 already-retired fix; see withdrawals.simulate_retirement.)"""
         from withdrawals import simulate_retirement
         accts = [_trad_account(800_000)]
         p = _base_profile(current_age=72, retirement_age=65, life_expectancy=85)
         df, _ = simulate_retirement(accts, p, _base_assumptions())
-        assert df["age"].min() == 65
+        assert df["age"].min() == 72
         assert df["age"].max() == 85
-        assert len(df) == 85 - 65 + 1
+        assert len(df) == 85 - 72 + 1
 
     def test_accumulation_returns_empty_df_when_already_retired(self):
         from projections import project_accumulation
@@ -1976,13 +2443,14 @@ class TestAlreadyRetired:
         assert rmd_rows["rmd_amount"].sum() > 0
 
     def test_life_expectancy_must_exceed_current_age_when_already_retired(self):
-        """life_expectancy must be > max(retirement_age, current_age)."""
+        """When already retired, the simulation spans max(retirement_age, current_age)
+        through life_expectancy inclusive."""
         from withdrawals import simulate_retirement
         accts = [_trad_account(500_000)]
         # current_age=72, retirement_age=65, life_expectancy=80 — valid
         p = _base_profile(current_age=72, retirement_age=65, life_expectancy=80)
         df, _ = simulate_retirement(accts, p, _base_assumptions())
-        assert len(df) == 80 - 65 + 1
+        assert len(df) == 80 - 72 + 1
 
 
 # ===========================================================================
@@ -2146,14 +2614,20 @@ class TestMathAuditDemoScenario:
     self-consistent — not whether the financial model is theoretically correct.
     """
 
-    SCENARIO_PATH = "scenarios/My Scenario Demo.json"
+    SCENARIO_PATH = "scenarios/Demo.json"
 
     @pytest.fixture(autouse=True)
     def _setup(self):
         import json
+        import os
         from projections import project_accumulation
         from withdrawals import simulate_retirement
 
+        # scenarios/* is gitignored (except test_*.json), so this personal demo file
+        # may be absent on a clean checkout / CI. Skip gracefully rather than error —
+        # the same invariants run across committed scenarios in TestScenarioInvariants.
+        if not os.path.exists(self.SCENARIO_PATH):
+            pytest.skip(f"Scenario file not found: {self.SCENARIO_PATH}")
         with open(self.SCENARIO_PATH) as f:
             sc = json.load(f)
 
@@ -2290,14 +2764,27 @@ class TestMathAuditDemoScenario:
         """No RMDs are taken before age 73."""
         assert self.ret_df[self.ret_df["age"] < 73]["rmd_amount"].sum() == 0.0
 
-    def test_rmd_positive_from_age_73_until_depletion(self):
-        """RMDs > 0 every year from 73 until the portfolio depletes."""
-        df = self.ret_df
-        depl = self.summary["portfolio_depleted_age"]
-        rmd_window = df[(df["age"] >= 73) & (df["age"] < depl)]
-        assert (rmd_window["rmd_amount"] > 0).all(), (
-            "RMDs should be positive every year from 73 until depletion"
-        )
+    def test_rmd_positive_while_traditional_balance_remains(self):
+        """RMDs are positive every year from age 73 in which a traditional account still
+        held a balance at the end of the prior year. Traditional accounts can deplete
+        before the total portfolio, after which RMDs are correctly $0 — so the invariant
+        is keyed to the remaining traditional balance, not to total-portfolio depletion."""
+        df = self.ret_df.reset_index(drop=True)
+        trad_cols = [
+            f"bal_{a['name'].replace(' ', '_')}"
+            for a in self.accounts
+            if a["type"] in ("traditional_401k", "traditional_ira")
+        ]
+        trad_cols = [c for c in trad_cols if c in df.columns]
+        assert trad_cols, "No traditional balance columns found"
+        bad = []
+        for i in range(1, len(df)):
+            if df.iloc[i]["age"] < 73:
+                continue
+            prior_trad = sum(df.iloc[i - 1][c] for c in trad_cols)
+            if prior_trad > 1.0 and df.iloc[i]["rmd_amount"] <= 0:
+                bad.append(int(df.iloc[i]["age"]))
+        assert not bad, f"RMD should be > 0 while a traditional balance remained, at ages {bad}"
 
     def test_rmd_amount_at_73_matches_formula(self):
         """RMD at age 73 = (401k_bal + IRA_bal at end of age 72) / RMD_TABLE[73]."""
@@ -2315,9 +2802,17 @@ class TestMathAuditDemoScenario:
     # -----------------------------------------------------------------------
     # Sanity bounds
     # -----------------------------------------------------------------------
-    def test_portfolio_depleted_at_age_87(self):
-        """Demo scenario should deplete around age 86-87 with current inputs."""
-        assert self.summary["portfolio_depleted_age"] in (86, 87)
+    def test_portfolio_depletes_before_life_expectancy(self):
+        """The Demo scenario is intentionally aggressive (fixed ~$100K net spend plus
+        healthcare on a portfolio that doesn't fully sustain it), so it should deplete
+        before life expectancy. The exact age depends on the editable, un-versioned Demo
+        inputs, so we assert depletion within a plausible window rather than a single
+        hard-coded age."""
+        depl = self.summary["portfolio_depleted_age"]
+        assert depl is not None, "Demo scenario was expected to deplete before life expectancy"
+        assert 75 <= depl <= self.profile["life_expectancy"], (
+            f"Depletion age {depl} is outside the plausible window [75, life_expectancy]"
+        )
 
     def test_effective_tax_rate_in_bounds(self):
         """Effective tax rate is between 0% and 60% for every simulation year."""
@@ -2573,6 +3068,133 @@ class TestScenarioInvariants:
             f"Unexpectedly large surplus in first two retirement years (>15% of net target):\n"
             + bad.to_string(index=False)
         )
+
+
+class TestMonteCarloV2DeterministicFirstYear:
+    """run_monte_carlo_v2(deterministic_first_year=True) must pin year 0 of every
+    trial to the deterministic plan, so the near-term recommendation is a single
+    concrete figure rather than a distribution — while later years stay stochastic."""
+
+    def _accts(self):
+        return [_trad_account(800_000), _roth_account(50_000), _taxable_account(150_000, 90_000)]
+
+    def _profile(self):
+        return _base_profile(current_age=65, retirement_age=65, life_expectancy=90)
+
+    def test_first_year_portfolio_is_deterministic_across_trials(self):
+        """Year-0 terminal portfolio is identical across all trials (no MC spread)."""
+        import numpy as np
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._accts(), self._profile(), _base_assumptions()
+        mc = run_monte_carlo_v2(
+            accts, p, a, n_runs=120, seed=7, equity_vol=0.18, bond_vol=0.07,
+            deterministic_first_year=True,
+        )
+        # First entry of every percentile band must coincide → zero year-0 spread.
+        first_year_vals = [mc["percentiles"][pp][0] for pp in (10, 25, 50, 75, 90)]
+        spread = max(first_year_vals) - min(first_year_vals)
+        assert spread < 1.0, f"year-0 portfolio varied by ${spread:,.2f} across percentiles"
+
+    def test_first_year_matches_deterministic_run(self):
+        """The pinned year-0 portfolio equals the plain deterministic projection's."""
+        import copy
+        from withdrawals import simulate_retirement
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._accts(), self._profile(), _base_assumptions()
+        det, _ = simulate_retirement(copy.deepcopy(accts), p, a)
+        det_year0 = det["total_portfolio"].iloc[0]
+        mc = run_monte_carlo_v2(
+            accts, p, a, n_runs=80, seed=3, deterministic_first_year=True,
+        )
+        assert abs(mc["percentiles"][50][0] - det_year0) < 1.0
+
+    def test_later_years_still_stochastic(self):
+        """Pinning year 0 must not freeze the rest of the horizon."""
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._accts(), self._profile(), _base_assumptions()
+        mc = run_monte_carlo_v2(
+            accts, p, a, n_runs=200, seed=11, equity_vol=0.18, bond_vol=0.07,
+            deterministic_first_year=True,
+        )
+        assert mc["percentiles"][90][-1] > mc["percentiles"][10][-1]
+
+    def test_spend_and_final_percentiles_present(self):
+        """New cross-trial distributions for optimizer scoring are surfaced."""
+        from montecarlo_v2 import run_monte_carlo_v2
+        accts, p, a = self._accts(), self._profile(), _base_assumptions()
+        mc = run_monte_carlo_v2(accts, p, a, n_runs=60, seed=1)
+        for key in ("final_percentiles", "spend_percentiles"):
+            assert key in mc
+            for pp in (10, 25, 50, 75, 90):
+                assert pp in mc[key]
+        # Spend and final percentiles are monotone non-decreasing in p.
+        for key in ("final_percentiles", "spend_percentiles"):
+            vals = [mc[key][pp] for pp in (10, 25, 50, 75, 90)]
+            assert vals == sorted(vals)
+
+
+class TestOptimizerV3:
+    """MC-aware receding-horizon optimizer: scores candidates against the MC
+    distribution, screens cheap then re-scores survivors, and emits a concrete
+    deterministic first-year action plus a serializable recommendation."""
+
+    def _accts(self):
+        return [_trad_account(900_000), _roth_account(60_000), _taxable_account(200_000, 120_000)]
+
+    def _profile(self):
+        return _base_profile(current_age=62, retirement_age=65, life_expectancy=88)
+
+    def _run(self, **kw):
+        from optimizer_v3 import run_optimizer_v3
+        accts, p, a = self._accts(), self._profile(), _base_assumptions()
+        params = dict(
+            accounts_at_retirement=accts, profile=p, assumptions=a,
+            roth_conversion_baseline={"enabled": False}, spending_overrides={},
+            n_iterations=12, mc_runs_screen=40, mc_runs_final=80,
+            survivors=4, seed=42,
+        )
+        params.update(kw)
+        return run_optimizer_v3(**params)
+
+    def test_returns_expected_structure(self):
+        res = self._run()
+        for key in ("baseline_result", "best_result", "top_results", "n_evaluated", "all_scores"):
+            assert key in res
+        assert res["n_evaluated"] > 0
+
+    def test_best_carries_first_year_action_and_recommendation(self):
+        res = self._run()
+        best = res["best_result"]
+        assert "first_year_action" in best
+        rec = best.get("recommendation", {})
+        # Serializable snapshot suitable for persisting alongside a check-in.
+        import json
+        json.dumps(rec)
+        for key in ("anchor_age", "mc_success_rate", "mc_p25_legacy", "mc_median_spend"):
+            assert key in rec
+        assert 0.0 <= rec["mc_success_rate"] <= 1.0
+
+    def test_crn_makes_search_reproducible(self):
+        """Same seed → same best score (deterministic search under Common Random Numbers)."""
+        r1 = self._run(seed=99)
+        r2 = self._run(seed=99)
+        assert r1["best_result"]["score"] == r2["best_result"]["score"]
+
+    def test_score_prefers_higher_success(self):
+        """_score_mc is success-dominated: a higher success rate outranks a richer
+        but riskier plan even with lower legacy/spend."""
+        from optimizer_v3 import _score_mc
+        safe = {
+            "n_runs": 100, "success_rate": 0.98,
+            "final_percentiles": {25: 100_000}, "spend_percentiles": {50: 1_000_000},
+            "adjustment_metrics": {"avg_cuts_per_trial": 0.0},
+        }
+        risky = {
+            "n_runs": 100, "success_rate": 0.80,
+            "final_percentiles": {25: 800_000}, "spend_percentiles": {50: 1_500_000},
+            "adjustment_metrics": {"avg_cuts_per_trial": 0.0},
+        }
+        assert _score_mc(safe, 0.20) > _score_mc(risky, 0.20)
 
 
 if __name__ == "__main__":

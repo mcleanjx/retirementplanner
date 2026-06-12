@@ -82,7 +82,12 @@ def _discretionary_after_tax_net(
     ss_taxable: float,
 ) -> float:
     """Dry-run: compute after_tax_net for a given gross discretionary withdrawal."""
-    accts = copy.deepcopy(accts_snapshot)
+    # Shallow per-dict copy is sufficient and ~10x faster than deepcopy here: account
+    # dicts hold only scalar values, and _withdraw_from only reassigns balance/basis
+    # (never mutates a nested object), so the originals are not affected. This dry run
+    # runs ~21x per year inside the binary search, so the speedup is material — it also
+    # accelerates the optimizer (hundreds of fixed-net simulations).
+    accts = [dict(a) for a in accts_snapshot]
     oi = ord_income_pre
     li = ltcg_pre
     need = trial_need
@@ -248,6 +253,9 @@ def simulate_retirement(
     assumptions: dict,
     roth_conversion: dict | None = None,
     spending_overrides: dict | None = None,
+    *,
+    market_returns: list[dict] | None = None,
+    inflation_sequence: list[float] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Simulate retirement year-by-year.
@@ -255,6 +263,15 @@ def simulate_retirement(
     Returns:
         df: one row per retirement year with income, taxes, balances
         summary: dict of lifetime aggregates
+
+    Monte Carlo hooks (both default to None → deterministic path is unchanged):
+        market_returns: list indexed by simulation year (0 = first simulated year),
+            each entry a dict {account_id: return_rate} applied in Step 7 instead of the
+            deterministic global/own rate. Crash shocks should be baked into these rates.
+        inflation_sequence: list indexed by simulation year of the general inflation
+            realized during that year (drives spending growth, SS COLA, and healthcare).
+    Dynamic spending: assumptions["withdrawal_mode"] == "guardrails" enables Guyton-Klinger
+    spending adjustments, with an optional assumptions["spending_floor"] (today's dollars).
     """
     accts = copy.deepcopy(accounts)
     retirement_age = profile["retirement_age"]
@@ -321,10 +338,33 @@ def simulate_retirement(
     lifetime_passive_income = 0.0
     portfolio_depleted_age = None
 
-    for age in range(max(retirement_age, current_age), life_expectancy + 1):
+    # Dynamic-spending / MC state (no-ops in the default deterministic constant-real path)
+    sim_start_age = max(retirement_age, current_age)
+    withdrawal_mode = assumptions.get("withdrawal_mode", "constant_real")
+    _gk_base_rate = None  # Guyton-Klinger baseline withdrawal rate, locked in year 0
+    _spending_floor_real = assumptions.get("spending_floor", 0.0) * (1 + inflation) ** _years_to_ret
+    # Running healthcare inflation multiplier (used only when inflation_sequence is supplied;
+    # initialized to the elapsed deterministic factor for already-retired starts).
+    _hc_infl_factor = (1 + inflation) ** (sim_start_age - retirement_age)
+
+    # Adjustment tracking: surfaces "probability of adjustment" / floor-clamp counts so MC
+    # callers can report what really happens to retiree spending under guardrails — Kitces'
+    # reframing of success rate. Tracked in all modes (counts stay 0 in constant_real).
+    # real_ratio = post-adjustment spending_target / (baseline_nominal * cum_infl_factor),
+    # so 1.0 = constant-real baseline, <1 = cut below baseline. Baseline tracks survivor
+    # reduction so post-widowhood years aren't counted as guardrail cuts.
+    _gk_cuts = 0
+    _gk_raises = 0
+    _gk_floor_clamps = 0
+    _gk_baseline_nominal = base_spending
+    _gk_cum_infl_factor = 1.0
+    _gk_min_real_ratio = 1.0
+
+    for year_idx, age in enumerate(range(sim_start_age, life_expectancy + 1)):
         spouse_age = age + spouse_age_offset if filing_status == "married_filing_jointly" else None
         bracket_factor = (1 + bracket_inflation) ** (age - current_age)
         start_portfolio = sum(a["balance"] for a in accts)
+        infl_this_year = inflation_sequence[year_idx] if inflation_sequence is not None else inflation
 
         # --- Step 0: Survivor transition ---
         if (not survivor_triggered
@@ -336,6 +376,7 @@ def simulate_retirement(
             ss_benefit = max(ss_benefit, spouse_ss)
             spouse_ss = 0.0
             spending_target *= (1 - survivor_reduction)
+            _gk_baseline_nominal *= (1 - survivor_reduction)
             warnings.append({
                 "age": age,
                 "type": "survivor_transition",
@@ -344,12 +385,47 @@ def simulate_retirement(
 
         # Healthcare costs this year (inflation-adjusted from retirement)
         years_in = age - retirement_age
-        inflation_factor = (1 + inflation) ** years_in
+        inflation_factor = _hc_infl_factor if inflation_sequence is not None else (1 + inflation) ** years_in
         if age < 65:
             hc_cost = pre_medicare_hc * inflation_factor
         else:
             hc_cost = post_medicare_hc * inflation_factor
         lifetime_healthcare += hc_cost
+
+        # --- Guyton-Klinger guardrails (dynamic-spending MC mode; no-op otherwise) ---
+        # Adjust the discretionary spending_target based on the realized portfolio before
+        # this year's spending need is computed. Healthcare and SS are outside the
+        # retiree's control and are excluded from the comparison.
+        if withdrawal_mode == "guardrails":
+            _gk_ss = 0.0
+            if age >= ss_start:
+                _gk_ss += ss_benefit
+            if spouse_age is not None and spouse_age >= spouse_ss_start:
+                _gk_ss += spouse_ss
+            _gk_rental = sum(a.get("net_annual_rental_income", 0.0)
+                             for a in accts if a["type"] == "rental_property")
+            _gk_planned_net = max(0.0, spending_target + hc_cost - _gk_ss - _gk_rental)
+            if start_portfolio > 0:
+                _gk_rate = _gk_planned_net / start_portfolio
+                if _gk_base_rate is None:
+                    _gk_base_rate = _gk_rate                 # lock baseline in year 0
+                elif _gk_base_rate > 0:
+                    if _gk_rate > _gk_base_rate * 1.20:
+                        spending_target *= 0.90              # capital preservation rule
+                        _gk_cuts += 1
+                    elif _gk_rate < _gk_base_rate * 0.80:
+                        spending_target *= 1.10              # prosperity rule
+                        _gk_raises += 1
+                if _spending_floor_real > 0 and spending_target < _spending_floor_real:
+                    spending_target = _spending_floor_real
+                    _gk_floor_clamps += 1
+
+        # Real-spending ratio: 1.0 = constant-real baseline. Compared at this point
+        # because spending_target has been GK-adjusted but not yet grown for next year.
+        if _gk_baseline_nominal > 0:
+            _gk_real_ratio = spending_target / (_gk_baseline_nominal * _gk_cum_infl_factor)
+            if _gk_real_ratio < _gk_min_real_ratio:
+                _gk_min_real_ratio = _gk_real_ratio
 
         base_this_year = spending_overrides.get(age, spending_target)
         net_target_this_year = base_this_year if fixed_net_mode else None
@@ -806,25 +882,24 @@ def simulate_retirement(
 
         # --- Step 7: Apply returns, inflate, advance ---
         for a in accts:
-            always_own = a["type"] in {"rental_property", "bank"}
-            if always_own or not a.get("use_global_return_rate", True):
-                a["balance"] *= (1 + a.get("return_rate", 0.05))
+            if market_returns is not None:
+                # Stochastic per-account return for this year (crash shocks already baked in).
+                a["balance"] *= (1 + market_returns[year_idx].get(a["id"], 0.0))
             else:
-                a["balance"] *= (1 + ret_return)
+                always_own = a["type"] in {"rental_property", "bank"}
+                if always_own or not a.get("use_global_return_rate", True):
+                    a["balance"] *= (1 + a.get("return_rate", 0.05))
+                else:
+                    a["balance"] *= (1 + ret_return)
 
-        spending_target *= (1 + inflation)
+        spending_target *= (1 + infl_this_year)
         # SS COLA — benefits grow roughly with CPI each year, matching the inflation assumption.
-        ss_benefit *= (1 + inflation)
-        spouse_ss *= (1 + inflation)   # 0 after survivor transition; harmless
+        ss_benefit *= (1 + infl_this_year)
+        spouse_ss *= (1 + infl_this_year)   # 0 after survivor transition; harmless
+        _spending_floor_real *= (1 + infl_this_year)
+        _hc_infl_factor *= (1 + infl_this_year)
+        _gk_cum_infl_factor *= (1 + infl_this_year)
         total_balance = sum(a["balance"] for a in accts)
-
-        if total_balance <= 0 and portfolio_depleted_age is None:
-            portfolio_depleted_age = age
-            warnings.append({
-                "age": age,
-                "type": "depletion",
-                "message": f"Portfolio depleted at age {age}.",
-            })
 
         # After-tax spending = what was actually consumed (cash received minus
         # surplus reinvested minus taxes). Excludes reinvested surplus so that
@@ -832,6 +907,27 @@ def simulate_retirement(
         spendable_cash = total_cash_received - surplus_reinvested
         after_tax_spending = spendable_cash - taxes["total"]
         actual_after_tax_net = after_tax_spending - hc_cost
+
+        # --- Plan-failure detection ---
+        # "Depleted" means the portfolio could no longer fund the planned spending — not
+        # merely that total_balance reached $0. A frozen bank_buffer (or any reserve the
+        # withdrawal cascade refuses to cross) keeps total_balance permanently above zero,
+        # so the old `total_balance <= 0` test silently scored starved plans as successes:
+        # a Monte Carlo trial coming to rest on an untouchable $50k cash buffer reported
+        # success even though it could not pay a $240k spend. Detect the real shortfall
+        # instead. (This also avoids the inverse error of flagging an income-sustained plan
+        # — SS/rental covering spending at a $0 balance — as failed.)
+        if fixed_net_mode:
+            spending_shortfall = actual_after_tax_net < net_target_this_year - 1.0
+        else:
+            spending_shortfall = remaining_need > 1.0
+        if spending_shortfall and portfolio_depleted_age is None:
+            portfolio_depleted_age = age
+            warnings.append({
+                "age": age,
+                "type": "depletion",
+                "message": f"Portfolio depleted at age {age}.",
+            })
 
         # Update prev_eff_rate — used only for Step 4 LTCG harvest estimation.
         # (Fixed-net spending uses binary search; this rate is no longer used for gross-up.)
@@ -895,6 +991,10 @@ def simulate_retirement(
         "warnings": warnings,
         "conversion_vintages": conversion_vintages,
         "final_accounts": accts,
+        "gk_cuts": _gk_cuts,
+        "gk_raises": _gk_raises,
+        "gk_floor_clamps": _gk_floor_clamps,
+        "gk_min_real_ratio": _gk_min_real_ratio,
     }
 
     return df, summary

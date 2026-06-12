@@ -3,7 +3,7 @@ from constants import (
     NIIT_RATE, NIIT_THRESHOLD, IRMAA_TIERS,
     SS_TAXABILITY, BRACKET_CEILINGS,
     CA_STANDARD_DEDUCTION, CA_ORDINARY_BRACKETS,
-    MT_STANDARD_DEDUCTION, MT_ORDINARY_BRACKETS,
+    MT_STANDARD_DEDUCTION, MT_ORDINARY_BRACKETS, MT_LTCG_BRACKETS,
 )
 
 
@@ -147,18 +147,28 @@ def calculate_mt_state_tax(
     filing_status: str,
     mt_std: float | None = None,
     brackets: list | None = None,
+    ltcg_brackets: list | None = None,
 ) -> float:
     """
     Montana state income tax.
-    - Capital gains taxed as ordinary income (combined with ordinary_income)
+    - Long-term capital gains taxed at preferential rates (3.0% / 4.1%), stacked
+      on top of ordinary income to determine the rate (mirrors the federal method)
     - Social Security taxable at same rate as federal (not excluded)
     - Standard deduction mirrors federal
     """
     mt_std = mt_std if mt_std is not None else MT_STANDARD_DEDUCTION[filing_status]
     brackets = brackets or MT_ORDINARY_BRACKETS[filing_status]
-    mt_gross = ordinary_income + ltcg_income
-    mt_taxable = max(0.0, mt_gross - mt_std)
-    return _apply_brackets(mt_taxable, brackets)
+    ltcg_brackets = ltcg_brackets or MT_LTCG_BRACKETS[filing_status]
+
+    # Standard deduction applies to combined income; when ordinary income is below
+    # the deduction, the residual shelters some LTCG (same worksheet as federal).
+    ordinary_taxable = max(0.0, ordinary_income - mt_std)
+    total_taxable = max(0.0, ordinary_income + ltcg_income - mt_std)
+    ltcg_taxable = max(0.0, total_taxable - ordinary_taxable)
+
+    ordinary_tax = _apply_brackets(ordinary_taxable, brackets)
+    ltcg_tax = calculate_ltcg_tax(ltcg_taxable, ordinary_taxable, filing_status, ltcg_brackets)
+    return ordinary_tax + ltcg_tax
 
 
 def effective_tax_rate(total_tax: float, gross_income: float) -> float:
@@ -240,12 +250,14 @@ def calculate_year_taxes(
     elif state == "montana":
         scaled_mt_std = MT_STANDARD_DEDUCTION[filing_status] * bracket_factor
         scaled_mt_brackets = [(u * bracket_factor if u is not None else None, r) for u, r in MT_ORDINARY_BRACKETS[filing_status]]
+        scaled_mt_ltcg = [(u * bracket_factor if u is not None else None, r) for u, r in MT_LTCG_BRACKETS[filing_status]]
         state_tax = calculate_mt_state_tax(
             ordinary_income=ordinary_income,
             ltcg_income=ltcg_income,
             filing_status=filing_status,
             mt_std=scaled_mt_std,
             brackets=scaled_mt_brackets,
+            ltcg_brackets=scaled_mt_ltcg,
         )
     else:
         state_tax = (ordinary_income + ltcg_income) * state_tax_rate

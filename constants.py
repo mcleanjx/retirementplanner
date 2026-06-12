@@ -138,7 +138,8 @@ CA_ORDINARY_BRACKETS = {
 # Montana state income tax — 2026
 # Source: MT DOR HB337 (effective January 1, 2026)
 # Key differences from federal:
-#   - Capital gains taxed as ordinary income (no preferential rate)
+#   - Long-term capital gains taxed at preferential rates (3.0% / 4.1%), with
+#     bracket thresholds matching the ordinary-income ranges
 #   - Social Security taxable at same rate as federal (not excluded)
 #   - Standard deduction mirrors federal (MT adopted federal standard deduction)
 # ---------------------------------------------------------------------------
@@ -157,6 +158,19 @@ MT_ORDINARY_BRACKETS = {
     "married_filing_jointly": [
         (95000, 0.047),
         (None,  0.0565),
+    ],
+}
+
+# Net long-term capital gains rates (HB337, 2026). Thresholds match the ordinary
+# ranges; the rate is determined by where LTCG stacks on top of ordinary income.
+MT_LTCG_BRACKETS = {
+    "single": [
+        (47500, 0.030),
+        (None,  0.041),
+    ],
+    "married_filing_jointly": [
+        (95000, 0.030),
+        (None,  0.041),
     ],
 }
 
