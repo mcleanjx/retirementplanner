@@ -182,6 +182,14 @@ _init_state()
 _apply_pending_load()
 _apply_pending_new_scenario()
 
+# Preserve the scenario name across reruns. Streamlit deletes a keyed widget's
+# session-state entry whenever that widget isn't rendered in a run. An "Add/Remove
+# Account" click calls st.rerun() from within sidebar_accounts(), aborting the run
+# before sidebar_scenarios() draws the sc_name text_input — so without this re-commit
+# Streamlit drops sc_name and the next run's setdefault() resets it to "My Scenario".
+if "sc_name" in st.session_state:
+    st.session_state["sc_name"] = st.session_state["sc_name"]
+
 # ---------------------------------------------------------------------------
 # Sidebar helpers
 # ---------------------------------------------------------------------------
