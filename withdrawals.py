@@ -313,6 +313,8 @@ def simulate_retirement(
     # Healthcare costs (in retirement-year nominal dollars)
     pre_medicare_hc = profile.get("pre_medicare_healthcare", 0.0)
     post_medicare_hc = profile.get("post_medicare_healthcare", 0.0)
+    # Separate healthcare inflation rate; None / unset falls back to general inflation.
+    hc_inflation = profile.get("healthcare_inflation") or inflation
 
     # Roth conversion vintages for 5-year rule
     conversion_vintages: dict[int, float] = {}
@@ -345,7 +347,7 @@ def simulate_retirement(
     _spending_floor_real = assumptions.get("spending_floor", 0.0) * (1 + inflation) ** _years_to_ret
     # Running healthcare inflation multiplier (used only when inflation_sequence is supplied;
     # initialized to the elapsed deterministic factor for already-retired starts).
-    _hc_infl_factor = (1 + inflation) ** (sim_start_age - retirement_age)
+    _hc_infl_factor = (1 + hc_inflation) ** (sim_start_age - retirement_age)
 
     # Adjustment tracking: surfaces "probability of adjustment" / floor-clamp counts so MC
     # callers can report what really happens to retiree spending under guardrails — Kitces'
@@ -385,7 +387,7 @@ def simulate_retirement(
 
         # Healthcare costs this year (inflation-adjusted from retirement)
         years_in = age - retirement_age
-        inflation_factor = _hc_infl_factor if inflation_sequence is not None else (1 + inflation) ** years_in
+        inflation_factor = _hc_infl_factor if inflation_sequence is not None else (1 + hc_inflation) ** years_in
         if age < 65:
             hc_cost = pre_medicare_hc * inflation_factor
         else:
@@ -897,7 +899,7 @@ def simulate_retirement(
         ss_benefit *= (1 + infl_this_year)
         spouse_ss *= (1 + infl_this_year)   # 0 after survivor transition; harmless
         _spending_floor_real *= (1 + infl_this_year)
-        _hc_infl_factor *= (1 + infl_this_year)
+        _hc_infl_factor *= (1 + infl_this_year + (hc_inflation - inflation))
         _gk_cum_infl_factor *= (1 + infl_this_year)
         total_balance = sum(a["balance"] for a in accts)
 

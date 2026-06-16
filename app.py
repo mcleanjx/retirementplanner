@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 import optimizer as _opt
 import optimizer_v2 as _opt_v2
 from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking, get_last_used_scenario, set_last_used_scenario, validate_scenario_name
-from constants import RMD_START_AGE
+from constants import RMD_START_AGE, CONTRIBUTION_LIMITS
 
 st.set_page_config(page_title="Retirement Planner", layout="wide")
 
@@ -51,6 +51,7 @@ DEFAULT_PROFILE = {
     "survivor_spending_reduction": 0.25,
     "pre_medicare_healthcare": 15000.0,
     "post_medicare_healthcare": 12000.0,
+    "healthcare_inflation": None,
 }
 
 DEFAULT_ASSUMPTIONS = {
@@ -216,24 +217,46 @@ def _count_warnings(accounts, profile, summary) -> int:
     """Return total number of active warnings (simulation + contribution limit)."""
     count = len(summary.get("warnings", []))
     cur_age = profile["current_age"]
+    # 401k elective deferral: traditional_401k only (pre-tax designated contributions).
+    # Roth 401k accounts are excluded here because they also serve as mega backdoor Roth
+    # vehicles (after-tax, not elective deferrals); those are caught by the 415(c) check.
+    _trad_401k = sum(a.get("annual_contribution", 0) for a in accounts if a.get("type") == "traditional_401k")
+    if _trad_401k > 0:
+        _401k_limit = CONTRIBUTION_LIMITS["401k"]
+        if 50 <= cur_age <= 59 or cur_age >= 64:
+            _401k_limit += CONTRIBUTION_LIMITS["401k_catchup_50"]
+        elif 60 <= cur_age <= 63:
+            _401k_limit += CONTRIBUTION_LIMITS["401k_catchup_60"]
+        if _trad_401k > _401k_limit:
+            count += 1
+    # 401k total additions (415c): all plan money — elective (trad+Roth) + mega backdoor + match.
+    # Always checked (not just when mega backdoor is present) because a Roth 401k account may
+    # represent after-tax mega backdoor contributions and must respect the total-additions cap.
+    _roth_401k = sum(a.get("annual_contribution", 0) for a in accounts if a.get("type") == "roth_401k")
+    _mbr_total = sum(a.get("mega_backdoor_roth", 0) for a in accounts if a.get("type") == "traditional_401k")
+    _match_total = sum(
+        min(a.get("annual_contribution", 0) * a.get("employer_match_percent", 0), a.get("employer_match_limit", 0))
+        for a in accounts if a.get("type") in {"traditional_401k", "roth_401k"}
+    )
+    _415c_total = _trad_401k + _roth_401k + _mbr_total + _match_total
+    if _415c_total > 0:
+        _415c = CONTRIBUTION_LIMITS["401k_total_limit"]
+        if 50 <= cur_age <= 59 or cur_age >= 64:
+            _415c += CONTRIBUTION_LIMITS["401k_415c_catchup_50"]
+        elif 60 <= cur_age <= 63:
+            _415c += CONTRIBUTION_LIMITS["401k_415c_catchup_60"]
+        if _415c_total > _415c:
+            count += 1
     for _a in accounts:
         _contrib = _a.get("annual_contribution", 0)
         if _contrib <= 0:
             continue
         _atype = _a["type"]
-        if _atype in {"traditional_401k", "roth_401k"}:
-            _limit = 23500
-            if 50 <= cur_age <= 59 or cur_age >= 64:
-                _limit += 7500
-            elif 60 <= cur_age <= 63:
-                _limit += 11250
-            if _contrib > _limit:
-                count += 1
-        elif _atype in {"traditional_ira", "roth_ira"}:
-            if _contrib > 7000 + (1000 if cur_age >= 50 else 0):
+        if _atype in {"traditional_ira", "roth_ira"}:
+            if _contrib > CONTRIBUTION_LIMITS["ira"] + (CONTRIBUTION_LIMITS["ira_catchup"] if cur_age >= 50 else 0):
                 count += 1
         elif _atype == "hsa":
-            _limit = 8550 if profile.get("filing_status") == "married_filing_jointly" else 4300
+            _limit = CONTRIBUTION_LIMITS["hsa_family"] if profile.get("filing_status") == "married_filing_jointly" else CONTRIBUTION_LIMITS["hsa_single"]
             if _contrib > _limit:
                 count += 1
     return count
@@ -305,6 +328,19 @@ def sidebar_profile():
         st.markdown("**Healthcare**")
         p["pre_medicare_healthcare"] = st.number_input("Pre-Medicare Annual Cost ($)", 0, 50000, int(p.get("pre_medicare_healthcare", 15000)), 500)
         p["post_medicare_healthcare"] = st.number_input("Post-Medicare Annual Cost ($)", 0, 50000, int(p.get("post_medicare_healthcare", 12000)), 500)
+        _hc_infl_override = st.checkbox(
+            "Separate healthcare inflation rate",
+            value=p.get("healthcare_inflation") is not None,
+            help="Medical costs have historically grown 1–2% above CPI. Enable to set a different inflation rate for healthcare spending.",
+        )
+        if _hc_infl_override:
+            _hc_infl_default = _pct(p.get("healthcare_inflation") or 0.05)
+            p["healthcare_inflation"] = _dec(st.number_input(
+                "Healthcare Inflation Rate (%)", 0.0, 15.0, _hc_infl_default, 0.1,
+                help="Annual growth rate applied to both pre- and post-Medicare healthcare costs, independent of general inflation.",
+            ))
+        else:
+            p["healthcare_inflation"] = None
         st.markdown(
             "<div style='font-size:0.8rem;color:#888;overflow-wrap:break-word;word-break:break-word;'>"
             "Post-Medicare: include <b>Part B</b> (~$2,435/yr/person), Part D, supplemental (Medigap), "
@@ -438,6 +474,34 @@ def sidebar_accounts():
                 if a["type"] in {"traditional_401k", "roth_401k"}:
                     a["employer_match_percent"] = _dec(st.number_input("Employer Match (%)", 0.0, 100.0, _pct(a.get("employer_match_percent", 0.0)), 1.0, key=f"a_emp_{a['id']}"))
                     a["employer_match_limit"] = float(st.number_input("Employer Match Limit ($/yr)", 0, 20000, int(a.get("employer_match_limit", 0)), 500, key=f"a_empl_{a['id']}"))
+                    _ca = st.session_state.profile["current_age"]
+                    _base = CONTRIBUTION_LIMITS["401k"]
+                    if 50 <= _ca <= 59 or _ca >= 64:
+                        _cu = CONTRIBUTION_LIMITS["401k_catchup_50"]
+                        st.caption(
+                            f"2026 elective deferral limit: **\\${_base + _cu:,}** (\\${_base:,} base + \\${_cu:,} catch-up, age 50–59/64+). "
+                            f"For high earners, the \\${_cu:,} catch-up must be Roth — enter \\${_base:,} here and model the catch-up in a separate **Roth 401(k)** account."
+                        )
+                    elif 60 <= _ca <= 63:
+                        _cu = CONTRIBUTION_LIMITS["401k_catchup_60"]
+                        st.caption(
+                            f"2026 elective deferral limit: **\\${_base + _cu:,}** (\\${_base:,} base + \\${_cu:,} super catch-up, age 60–63). "
+                            f"For high earners, the \\${_cu:,} catch-up must be Roth — enter \\${_base:,} here and model the catch-up in a separate **Roth 401(k)** account."
+                        )
+                    else:
+                        st.caption(
+                            f"2026 elective deferral limit: **\\${_base:,}**. "
+                            f"At age 50, a \\$9,000 Roth catch-up becomes available (add a separate Roth 401(k) account for it)."
+                        )
+
+                if a["type"] == "traditional_401k":
+                    a["mega_backdoor_roth"] = float(st.number_input(
+                        "Mega Backdoor Roth — After-Tax Contribution ($/yr)", 0, 100000,
+                        int(a.get("mega_backdoor_roth", 0)), 500, key=f"a_mbr_{a['id']}",
+                        help="After-tax (non-elective) 401k contributions converted to Roth in-plan. "
+                             "Separate from and in addition to your pre-tax elective deferral. "
+                             "Total plan additions (pre-tax + mega backdoor + employer match) cannot exceed \\$70,000/yr (\\$79,000 with catch-up for ages 50+).",
+                    ))
 
                 if a["type"] in {"taxable", "reit"}:
                     a["basis"] = float(st.number_input("Cost Basis ($)", 0, 10000000, int(a.get("basis", a["balance"] * 0.5)), 1000, key=f"a_basis_{a['id']}"))
@@ -1361,22 +1425,49 @@ def main():
         # Contribution limit checks (2026 IRS limits)
         contrib_warnings = []
         _cur_age = profile["current_age"]
+        # 401k elective deferral: traditional_401k only (pre-tax designated contributions).
+        # Roth 401k accounts are excluded here because they also serve as mega backdoor Roth
+        # vehicles (after-tax, not elective deferrals); those are caught by the 415(c) check.
+        _trad_401k = sum(a.get("annual_contribution", 0) for a in accounts if a.get("type") == "traditional_401k")
+        if _trad_401k > 0:
+            _401k_limit = CONTRIBUTION_LIMITS["401k"]
+            if 50 <= _cur_age <= 59 or _cur_age >= 64:
+                _401k_limit += CONTRIBUTION_LIMITS["401k_catchup_50"]
+            elif 60 <= _cur_age <= 63:
+                _401k_limit += CONTRIBUTION_LIMITS["401k_catchup_60"]
+            if _trad_401k > _401k_limit:
+                contrib_warnings.append(
+                    f"**401(k) elective deferral**: traditional 401k contributions of \\${_trad_401k:,.0f}/yr exceed the "
+                    f"2026 limit of \\${_401k_limit:,.0f} for age {_cur_age}."
+                )
+        # 401k Section 415(c): all plan money — elective (trad+Roth) + mega backdoor + match.
+        # Always checked because a Roth 401k account may represent after-tax mega backdoor
+        # contributions that must respect the total-additions cap regardless of elective deferrals.
+        _roth_401k = sum(a.get("annual_contribution", 0) for a in accounts if a.get("type") == "roth_401k")
+        _mbr_total = sum(a.get("mega_backdoor_roth", 0) for a in accounts if a.get("type") == "traditional_401k")
+        _match_total = sum(
+            min(a.get("annual_contribution", 0) * a.get("employer_match_percent", 0), a.get("employer_match_limit", 0))
+            for a in accounts if a.get("type") in {"traditional_401k", "roth_401k"}
+        )
+        _grand_total = _trad_401k + _roth_401k + _mbr_total + _match_total
+        if _grand_total > 0:
+            _415c = CONTRIBUTION_LIMITS["401k_total_limit"]
+            if 50 <= _cur_age <= 59 or _cur_age >= 64:
+                _415c += CONTRIBUTION_LIMITS["401k_415c_catchup_50"]
+            elif 60 <= _cur_age <= 63:
+                _415c += CONTRIBUTION_LIMITS["401k_415c_catchup_60"]
+            if _grand_total > _415c:
+                contrib_warnings.append(
+                    f"**401(k) Section 415(c)**: total plan additions of \\${_grand_total:,.0f}/yr "
+                    f"(traditional \\${_trad_401k:,.0f} + Roth/mega-backdoor \\${_roth_401k + _mbr_total:,.0f} + employer match \\${_match_total:,.0f}) "
+                    f"exceed the 2026 annual additions limit of \\${_415c:,.0f}."
+                )
         for _acct in accounts:
             _contrib = _acct.get("annual_contribution", 0)
             if _contrib <= 0:
                 continue
             _atype = _acct["type"]
-            if _atype in {"traditional_401k", "roth_401k"}:
-                _limit = 23500
-                if 50 <= _cur_age <= 59 or _cur_age >= 64:
-                    _limit += 7500
-                elif 60 <= _cur_age <= 63:
-                    _limit += 11250
-                if _contrib > _limit:
-                    contrib_warnings.append(
-                        f"**{_acct['name']}**: contribution ${_contrib:,.0f}/yr exceeds the 2026 401(k) limit of ${_limit:,.0f} for age {_cur_age}."
-                    )
-            elif _atype in {"traditional_ira", "roth_ira"}:
+            if _atype in {"traditional_ira", "roth_ira"}:
                 _limit = 7000 + (1000 if _cur_age >= 50 else 0)
                 if _contrib > _limit:
                     contrib_warnings.append(
@@ -1429,7 +1520,7 @@ def main():
 : Moving money from a pre-tax account (Traditional) to a post-tax account (Roth). You pay ordinary income tax now, but future growth and qualified withdrawals are tax-free. Most effective in low-income years before Social Security starts or before RMDs kick in at 73.
 
 **Contribution limits**
-: IRS annual maximums for 401(k) ($23,500 in 2026, +$7,500 catch-up age 50–59 and 64+, +$11,250 catch-up age 60–63), IRA ($7,000, +$1,000 catch-up age 50+), and HSA ($4,300 individual / $8,550 family). Exceeding limits triggers penalties.
+: 401(k) elective deferral: $23,500 in 2026, +$9,000 Roth catch-up (age 50–59/64+), +$11,250 Roth catch-up (age 60–63). Limit is per-person across all 401k accounts. For high earners, the catch-up must be designated Roth — model the $23,500 base in a Traditional 401(k) and the catch-up in a separate Roth 401(k). Section 415(c) total additions limit (elective + employer match + after-tax): $70,000/yr ($79,000 with catch-up). Mega backdoor Roth uses after-tax contributions up to the 415(c) headroom; enter the amount on the Traditional 401(k) account. IRA: $7,000 (+$1,000 catch-up age 50+). HSA: $4,300 individual / $8,550 family.
 """)
 
 

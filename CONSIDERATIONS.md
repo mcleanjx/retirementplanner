@@ -35,7 +35,7 @@ Living document. Update when decisions are made or new questions arise.
 
 **No depreciation recapture on rental property** — Rental sales modeled as simple capital gains. Depreciation recapture (taxed at 25%) is ignored. Material if user has held rental property for many years.
 
-**Healthcare inflation equals general inflation** — Medical cost inflation has historically run 1–2% above CPI. Using the same inflation rate understates retiree healthcare burden, especially in high-longevity scenarios.
+**Healthcare inflation equals general inflation** *(resolved)* — An optional "Separate healthcare inflation rate" checkbox now lets users override the healthcare growth rate independently of general CPI. In MC mode the stochastic variation is preserved and the healthcare premium is added on top each year. Defaults to general inflation when unchecked.
 
 **No lot-level basis tracking** — Taxable accounts use a single blended cost basis (pro-rata). Tax-loss harvesting, specific lot identification, and wash-sale rules are not modeled.
 
@@ -46,6 +46,10 @@ Living document. Update when decisions are made or new questions arise.
 **Pro-rata rule not modeled for Roth conversions** — Conversions assume 100% of the converted amount is ordinary income. If the IRA contains after-tax basis, the actual taxable portion is lower. Users with nondeductible IRA contributions will see overstated conversion tax costs.
 
 **State tax: CA, MT, or flat-rate only** — No multi-state scenarios, no relocation modeling, no state-specific treatment of RMDs. Some states exempt SS or pension income; only CA's SS exclusion is currently modeled. MT taxes SS at the federal rate.
+
+**No Qualified Charitable Distributions (QCDs)** — Age 70½+ taxpayers can distribute up to ~$108K/year (2026, inflation-indexed) directly from a traditional IRA to a qualified charity. The distribution counts toward the RMD obligation but is excluded from taxable income, effectively reducing the tax burden of forced RMDs for charitably inclined retirees. Not modeled: the traditional IRA balance is not reduced by the QCD amount, and the income exclusion is not applied. To implement: add an annual QCD amount input per account, subtract it from the traditional balance in Step 1 of `simulate_retirement`, and exclude it from `ordinary_income` while still counting it toward the RMD requirement.
+
+**No Qualified Longevity Annuity Contracts (QLACs)** — Up to 25% of a traditional IRA balance (capped at $200K, 2026) can be transferred into a QLAC, which is excluded from RMD calculations until the annuity start date (maximum age 85). Reduces the RMD base without requiring a Roth conversion or paying taxes up front. Tradeoff: capital leaves the market and enters an insurance product; the annuity pays a fixed income stream rather than compounding at market rates. Not modeled: no annuity account type, no RMD-base exclusion for QLAC balances, and no annuity payout schedule. To implement properly: add a QLAC account type with a start age and monthly payout; exclude its balance from RMD calculations before the start age; model payouts as fixed ordinary income thereafter.
 
 **No one-time income events** — There is no way to model a discrete future event (business sale, inheritance, lawsuit settlement, property sale) as a taxed income event in a specific year. Workaround: estimate after-tax proceeds externally and add them as a Taxable Brokerage account balance. To implement properly: a one-time event would need a trigger year/age, gross amount, tax treatment (LTCG, ordinary income, or user-specified after-tax), and a destination account; the amount would flow into `simulate_retirement` as extra income in the matching year and be passed through `calculate_year_taxes`.
 

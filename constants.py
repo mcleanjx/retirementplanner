@@ -83,8 +83,11 @@ SS_TAXABILITY = {
 # IRS contribution limits 2026 (approximate — stretch goal enforcement)
 CONTRIBUTION_LIMITS = {
     "401k": 23500,
-    "401k_catchup_50": 7500,   # age 50-59 and 64+
+    "401k_catchup_50": 9000,   # age 50-59 and 64+ (must be Roth for high earners, SECURE 2.0)
     "401k_catchup_60": 11250,  # age 60-63 (SECURE 2.0 super catch-up)
+    "401k_total_limit": 72000,          # Section 415(c) total annual additions (elective + employer + after-tax)
+    "401k_415c_catchup_50": 8500,       # 415(c) catch-up age 50-59/64+: $72,000 → $80,500
+    "401k_415c_catchup_60": 11250,      # 415(c) catch-up age 60-63 (same as elective super catch-up)
     "ira": 7000,
     "ira_catchup": 1000,       # age 50+
     "hsa_single": 4300,
