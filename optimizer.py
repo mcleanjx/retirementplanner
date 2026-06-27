@@ -82,17 +82,33 @@ def _sample_strategy(profile: dict, accounts: list, rng: random.Random) -> tuple
 
     rc: dict = {"enabled": False}
     if try_roth:
+        # A meaningful fraction of conversion trials use the "aggressive full-drain" shape:
+        # convert from ALL traditional accounts, starting at the earliest legal age and
+        # running the full gap-year window up to the RMD/SS ceiling. For large traditional
+        # balances this is the configuration that empties the pre-tax accounts before RMDs
+        # and SS stack into the top brackets — but it's a low-probability combination under
+        # fully-uniform sampling (all sources AND earliest start AND widest window), so the
+        # search rarely lands it on its own. Seeding it directly keeps the default
+        # iteration count enough to find it while the remaining trials still explore.
+        aggressive = rng.random() < 0.40
+
         # Choose source accounts first so we can derive the correct min start age
-        n_sources = rng.randint(1, len(trad_accounts))
-        source_accounts = rng.sample(trad_accounts, n_sources)
+        if aggressive:
+            source_accounts = list(trad_accounts)
+        else:
+            n_sources = rng.randint(1, len(trad_accounts))
+            source_accounts = rng.sample(trad_accounts, n_sources)
         source_ids = [a["id"] for a in source_accounts]
 
-        # Minimum conversion start age = latest "ready" age across all source accounts,
-        # but never before 60 (Roth 5-year seasoning and practical planning floor).
+        # Minimum conversion start age = latest "ready" age across all source accounts
+        # (separation-from-service / IRA access), floored at the simulation start so we
+        # never convert in an already-elapsed year. No artificial age-60 floor: the
+        # Roth 5-year clock does not require waiting to convert, and the 59½ early-
+        # withdrawal penalty does not apply to conversions — so the $0-ordinary-income
+        # gap years immediately after an early retirement are prime conversion years.
         min_conv_age = max(
             max(_owner_min_conv_age(a, profile) for a in source_accounts),
             profile.get("current_age", 60),
-            60,
         )
 
         # Conversion window ceiling: stop before RMDs kick in or SS starts
@@ -105,12 +121,20 @@ def _sample_strategy(profile: dict, accounts: list, rng: random.Random) -> tuple
             # No viable window — skip Roth conversion for this trial
             return withdrawal_strategy, {"enabled": False}
 
-        start_age = rng.randint(min_conv_age, min(min_conv_age + 5, conv_max_end))
-        end_age = rng.randint(start_age, min(conv_max_end, start_age + 15))
+        if aggressive:
+            # Earliest start, full window, fill to a bracket (never a small fixed amount).
+            start_age = min_conv_age
+            end_age = conv_max_end
+            strategy = "fill_to_bracket"
+            # Bias toward the higher brackets that actually drain a large balance.
+            target_bracket = rng.choice([0.22, 0.24, 0.24])
+        else:
+            start_age = rng.randint(min_conv_age, min(min_conv_age + 5, conv_max_end))
+            end_age = rng.randint(start_age, min(conv_max_end, start_age + 15))
+            # Bias strongly toward fill_to_bracket
+            strategy = rng.choice(["fill_to_bracket", "fill_to_bracket", "fill_to_bracket", "fixed_amount"])
+            target_bracket = rng.choice(BRACKET_OPTIONS)
 
-        # Bias strongly toward fill_to_bracket
-        strategy = rng.choice(["fill_to_bracket", "fill_to_bracket", "fill_to_bracket", "fixed_amount"])
-        target_bracket = rng.choice(BRACKET_OPTIONS)
         fixed_amount = float(rng.choice([5_000, 10_000, 20_000, 30_000, 50_000, 75_000, 100_000]))
         dest_id = rng.choice([a["id"] for a in roth_accounts])
 
@@ -144,7 +168,11 @@ def _score(ret_df: pd.DataFrame, summary: dict, legacy_weight: float) -> float:
 
     lifetime_spending = float(ret_df["actual_after_tax_net"].sum())
     lifetime_taxes = float(ret_df["total_tax"].sum())
-    final_portfolio = float(ret_df["total_portfolio"].iloc[-1])
+    final_portfolio = float(
+        ret_df["tax_adj_total_portfolio"].iloc[-1]
+        if "tax_adj_total_portfolio" in ret_df.columns
+        else ret_df["total_portfolio"].iloc[-1]
+    )
     depleted = summary.get("portfolio_depleted_age") is not None
     depletion_penalty = 1_000_000.0 if depleted else 0.0
 
