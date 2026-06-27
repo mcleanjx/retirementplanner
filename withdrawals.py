@@ -430,10 +430,12 @@ def simulate_retirement(
                 _gk_min_real_ratio = _gk_real_ratio
 
         base_this_year = spending_overrides.get(age, spending_target)
-        net_target_this_year = base_this_year if fixed_net_mode else None
-        # Gross spending need: in fixed_net mode, gross up to cover taxes;
-        # the discretionary gap is refined after passive income is known (Step 5).
-        if fixed_net_mode:
+        has_override = age in spending_overrides
+        # Gross up for taxes when in fixed_net mode OR when a spending override is active
+        # (overrides always represent after-tax amounts the user wants in pocket).
+        use_net_gross_up = fixed_net_mode or has_override
+        net_target_this_year = base_this_year if use_net_gross_up else None
+        if use_net_gross_up:
             # Conservative first estimate; refined in Step 5 once passive income is known
             total_spending_need = base_this_year / max(0.05, 1 - prev_eff_rate) + hc_cost
         else:
@@ -639,7 +641,7 @@ def simulate_retirement(
             num_medicare += 1
 
         # --- Step 5: Discretionary withdrawals ---
-        if fixed_net_mode:
+        if use_net_gross_up:
             # Binary search: find exact gross withdrawal yielding net_target_this_year after tax.
             # Replaces the prev_eff_rate gross-up; converges to $1 precision in ≤50 iterations.
             remaining_need = _solve_discretionary_need(
@@ -919,7 +921,7 @@ def simulate_retirement(
         # success even though it could not pay a $240k spend. Detect the real shortfall
         # instead. (This also avoids the inverse error of flagging an income-sustained plan
         # — SS/rental covering spending at a $0 balance — as failed.)
-        if fixed_net_mode:
+        if use_net_gross_up:
             spending_shortfall = actual_after_tax_net < net_target_this_year - 1.0
         else:
             spending_shortfall = remaining_need > 1.0
@@ -942,6 +944,15 @@ def simulate_retirement(
         # Update LTCG rate separately so dividend-heavy portfolios aren't over-grossed.
         if ltcg_income > 0:
             prev_ltcg_rate = min(0.25, taxes["federal_ltcg"] / max(1.0, ltcg_income))
+
+        # Stable discount rate for tax-adjusted portfolio valuation.
+        # Uses income accounting (not cash flows) so conversion-tax-payment cash doesn't
+        # inflate the denominator and suppress the rate. Also won't collapse to the 5% floor
+        # when conv_tax_estimate overshoots actual taxes (a risk with max(target, prev_eff_rate)).
+        # Floor of 12%: minimum meaningful pre-tax discount for a retiree with traditional income.
+        _nc_income = max(1.0, ordinary_income + ltcg_income - roth_conversion_amount)
+        _nc_taxes = max(0.0, taxes["total"] - conv_tax_estimate)
+        _trad_adj_rate = min(0.45, max(0.12, _nc_taxes / _nc_income))
 
         rows.append({
             "age": age,
@@ -977,6 +988,9 @@ def simulate_retirement(
             "after_tax_spending": after_tax_spending,
             "start_portfolio": start_portfolio,
             "total_portfolio": total_balance,
+            "tax_adj_total_portfolio": max(0.0, total_balance - sum(
+                a["balance"] for a in accts if a["type"] in TRADITIONAL_TYPES
+            ) * _trad_adj_rate),
             **{f"bal_{a['name'].replace(' ','_')}": a["balance"] for a in accts},
             **{f"wd_{a['name'].replace(' ','_')}": rmd_detail.get(a["name"], 0.0) + withdrawal_detail.get(a["name"], 0.0) for a in accts},
             **{f"conv_from_{a['name'].replace(' ','_')}": conv_from_detail.get(a["name"], 0.0) for a in accts},

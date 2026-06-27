@@ -163,6 +163,22 @@ def chart_drawdown(
             line=dict(color=color, width=1),
             hovertemplate=f"<b>{label}</b><br>Age: %{{x}}<br>Balance: %{{y:$,.0f}}<extra></extra>",
         ))
+    # Tax-adjusted overlay: use the pre-computed column from simulate_retirement, which
+    # discounts traditional balances by the withdrawal-only effective rate (_computed_rate,
+    # excluding conversion taxes).  Using effective_tax_rate here instead would include
+    # conversion income in the denominator, causing the discount to spike in conversion
+    # years and largely cancel out the benefit of the shrinking traditional balance.
+    if "tax_adj_total_portfolio" in ret_df.columns:
+        fig.add_trace(go.Scatter(
+            x=ret_df["age"], y=ret_df["tax_adj_total_portfolio"],
+            name="Tax-Adjusted Total",
+            mode="lines",
+            line=dict(color="#7c3aed", width=2, dash="dot"),
+            hovertemplate=(
+                "<b>Tax-Adjusted Total</b><br>Age: %{x}<br>%{y:$,.0f}"
+                "<br><i>Pre-tax balances discounted by withdrawal effective tax rate</i><extra></extra>"
+            ),
+        ))
     # Real-dollar overlay: deflate nominal portfolio back to today's purchasing power
     if inflation > 0 and current_age > 0 and "total_portfolio" in ret_df.columns:
         real_port = ret_df["total_portfolio"] / (1 + inflation) ** (ret_df["age"] - current_age)

@@ -114,7 +114,12 @@ def _mc_single_run(
         market_returns=market_returns,
     )
     portfolio_by_age = df["total_portfolio"].tolist() if not df.empty else [0.0] * len(ages)
-    return portfolio_by_age, summary.get("portfolio_depleted_age")
+    tax_adj_final = (
+        float(df["tax_adj_total_portfolio"].iloc[-1])
+        if not df.empty and "tax_adj_total_portfolio" in df.columns
+        else portfolio_by_age[-1]
+    )
+    return portfolio_by_age, summary.get("portfolio_depleted_age"), tax_adj_final
 
 
 def run_monte_carlo(
@@ -160,17 +165,19 @@ def run_monte_carlo(
 
     all_runs: list[list[float]] = []
     depletion_ages: list[int] = []
+    tax_adj_finals: list[float] = []
 
     for _ in range(n_runs):
         # simulate_retirement deep-copies accounts internally and _build_market_returns
         # only reads metadata, so the shared list is safe to pass without a per-trial copy.
         crash_years = _first_year_crash(sim_start_age) if enable_crashes else set()
-        bal_series, dep_age = _mc_single_run(
+        bal_series, dep_age, tax_adj_final = _mc_single_run(
             accounts_at_retirement, profile, assumptions,
             roth_conversion, spending_overrides,
             rng, volatility, crash_years, crash_magnitude, stock_pct,
         )
         all_runs.append(bal_series)
+        tax_adj_finals.append(tax_adj_final)
         if dep_age is not None:
             depletion_ages.append(dep_age)
 
@@ -181,10 +188,13 @@ def run_monte_carlo(
         p: np.percentile(arr, p, axis=0).tolist()
         for p in [10, 25, 50, 75, 90]
     }
+    tax_adj_arr = np.array(tax_adj_finals)
+    tax_adj_final_percentiles = {p: float(np.percentile(tax_adj_arr, p)) for p in [10, 25, 50, 75, 90]}
 
     return {
         "ages": ages,
         "percentiles": percentiles,
+        "tax_adj_final_percentiles": tax_adj_final_percentiles,
         "success_rate": success_rate,
         "n_runs": n_runs,
         "n_depleted": len(depletion_ages),

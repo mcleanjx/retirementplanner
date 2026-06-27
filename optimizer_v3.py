@@ -68,7 +68,9 @@ def _score_mc(mc: dict, legacy_weight: float) -> float:
         return float("-inf")
 
     success = float(mc.get("success_rate", 0.0))
-    p25_legacy = float(mc.get("final_percentiles", {}).get(LEGACY_P_FOR_SCORE, 0.0))
+    p25_legacy = float(
+        mc.get("tax_adj_final_percentiles", mc.get("final_percentiles", {})).get(LEGACY_P_FOR_SCORE, 0.0)
+    )
     p50_spend = float(mc.get("spend_percentiles", {}).get(50, 0.0))
     avg_cuts = float(mc.get("adjustment_metrics", {}).get("avg_cuts_per_trial", 0.0))
 

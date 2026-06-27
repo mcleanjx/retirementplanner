@@ -336,9 +336,15 @@ def _mc_single_run_v2(
 
     portfolio_by_age = df["total_portfolio"].tolist() if not df.empty else [0.0] * len(ages)
     lifetime_spend = float(df["actual_after_tax_net"].sum()) if not df.empty else 0.0
+    tax_adj_final = (
+        float(df["tax_adj_total_portfolio"].iloc[-1])
+        if not df.empty and "tax_adj_total_portfolio" in df.columns
+        else portfolio_by_age[-1]
+    )
     trial_summary = {
         "portfolio_depleted_age": summary.get("portfolio_depleted_age"),
         "lifetime_spend": lifetime_spend,
+        "tax_adj_final": tax_adj_final,
         "gk_cuts": summary.get("gk_cuts", 0),
         "gk_raises": summary.get("gk_raises", 0),
         "gk_floor_clamps": summary.get("gk_floor_clamps", 0),
@@ -401,6 +407,7 @@ def run_monte_carlo_v2(
     all_runs: list[list[float]] = []
     depletion_ages: list[int] = []
     spend_per_trial: list[float] = []
+    tax_adj_finals: list[float] = []
     gk_cuts_per_trial: list[int] = []
     gk_raises_per_trial: list[int] = []
     gk_floor_per_trial: list[int] = []
@@ -422,6 +429,7 @@ def run_monte_carlo_v2(
         )
         all_runs.append(bal_series)
         spend_per_trial.append(trial_summary["lifetime_spend"])
+        tax_adj_finals.append(trial_summary["tax_adj_final"])
         if trial_summary["portfolio_depleted_age"] is not None:
             depletion_ages.append(trial_summary["portfolio_depleted_age"])
         gk_cuts_per_trial.append(trial_summary["gk_cuts"])
@@ -442,8 +450,10 @@ def run_monte_carlo_v2(
     # percentile of summed real-dollar spending across the horizon.
     final_arr = arr[:, -1] if arr.size else np.zeros(n_runs)
     spend_arr = np.array(spend_per_trial) if spend_per_trial else np.zeros(n_runs)
+    tax_adj_arr = np.array(tax_adj_finals) if tax_adj_finals else np.zeros(n_runs)
     final_percentiles = {p: float(np.percentile(final_arr, p)) for p in [10, 25, 50, 75, 90]}
     spend_percentiles = {p: float(np.percentile(spend_arr, p)) for p in [10, 25, 50, 75, 90]}
+    tax_adj_final_percentiles = {p: float(np.percentile(tax_adj_arr, p)) for p in [10, 25, 50, 75, 90]}
 
     # Adjustment metrics — Kitces' reframing of pure success rate. In constant_real
     # mode these stay zero (no GK firings, real ratio == 1.0); they only carry
@@ -468,6 +478,7 @@ def run_monte_carlo_v2(
         "ages": ages,
         "percentiles": percentiles,
         "final_percentiles": final_percentiles,
+        "tax_adj_final_percentiles": tax_adj_final_percentiles,
         "spend_percentiles": spend_percentiles,
         "success_rate": success_rate,
         "n_runs": n_runs,

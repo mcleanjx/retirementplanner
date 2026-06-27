@@ -834,6 +834,13 @@ def main():
     else:
         portfolio_at_le = 0.0
 
+    # Tax-adjusted end-of-life value: read directly from the pre-computed column so
+    # it uses the same withdrawal-only rate as the chart and optimizer scoring.
+    if not ret_df.empty and not le_row.empty and "tax_adj_total_portfolio" in ret_df.columns:
+        tax_adj_at_le = max(0.0, float(le_row["tax_adj_total_portfolio"].iloc[0]))
+    else:
+        tax_adj_at_le = portfolio_at_le
+
     hdr_col, tog_col = st.columns([5, 1])
     hdr_col.subheader("Summary")
     compact_view = tog_col.toggle("Snapshot", key="summary_compact", value=False)
@@ -872,7 +879,8 @@ def main():
                     unsafe_allow_html=True,
                 )
             else:
-                st.metric("Portfolio", f"${portfolio_at_le:,.0f}")
+                st.metric("Portfolio", f"${portfolio_at_le:,.0f}",
+                          help=f"Tax-adjusted (Roth + after-tax equivalent of pre-tax accounts): ${tax_adj_at_le:,.0f}")
     else:
         # ── Full summary view ──────────────────────────────────────────────────
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -902,7 +910,8 @@ def main():
                     unsafe_allow_html=True,
                 )
             else:
-                st.metric(f"Portfolio at Age {le_age}", f"${portfolio_at_le:,.0f}")
+                st.metric(f"Portfolio at Age {le_age}", f"${portfolio_at_le:,.0f}",
+                          help=f"Tax-adjusted (Roth + after-tax equivalent of pre-tax accounts): ${tax_adj_at_le:,.0f}")
 
     if portfolio_at_le <= 0:
         st.error(
@@ -1041,7 +1050,8 @@ def main():
         else:
             st.subheader("Custom Spending by Year")
             st.caption(
-                "Enter a gross spending amount for any year (excluding healthcare). "
+                "Enter the desired **after-tax** spending for any year (excluding healthcare, which is added automatically). "
+                "The simulation grosses up withdrawals to cover taxes so you net this amount. "
                 "Set to 0 to revert to the inflation-adjusted default."
             )
 
@@ -1066,17 +1076,17 @@ def main():
             })
         else:
             editor_df = pd.DataFrame({
-                "Age":                        default_spending["age"].astype(int),
-                "Default Spending":           default_spending["default_excl_healthcare"].round(0),
-                "Healthcare (auto)":          default_spending["healthcare_cost"].round(0),
-                "Override (0 = use default)": default_spending["override"].round(0),
+                "Age":                                  default_spending["age"].astype(int),
+                "Default Gross Spending":               default_spending["default_excl_healthcare"].round(0),
+                "Healthcare (auto)":                    default_spending["healthcare_cost"].round(0),
+                "Override After-Tax (0 = use default)": default_spending["override"].round(0),
             })
 
         col_config = {"Age": st.column_config.NumberColumn(disabled=True)}
         for col in editor_df.columns:
             if col == "Age":
                 continue
-            elif col == "Override (0 = use default)":
+            elif col.startswith("Override"):
                 col_config[col] = st.column_config.NumberColumn(min_value=0, format="$%,.0f")
             else:
                 col_config[col] = st.column_config.NumberColumn(disabled=True, format="$%,.0f")
@@ -1089,10 +1099,11 @@ def main():
             num_rows="fixed",
         )
 
+        _override_col = next(c for c in edited.columns if c.startswith("Override"))
         new_overrides = {
-            int(row["Age"]): float(row["Override (0 = use default)"])
+            int(row["Age"]): float(row[_override_col])
             for _, row in edited.iterrows()
-            if row["Override (0 = use default)"] > 0
+            if row[_override_col] > 0
         }
         if new_overrides != spending_overrides:
             st.session_state.spending_overrides = new_overrides
@@ -1824,11 +1835,18 @@ def main():
         if mc_result and stale:
             st.info("Settings changed — click **▶ Run Monte Carlo** to refresh results.")
         elif mc_result:
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Success Rate", f"{mc_result['success_rate']:.1%}")
-            m2.metric("Median at Life Expectancy", f"${mc_result['percentiles'][50][-1]:,.0f}")
-            m3.metric("10th Percentile at Life Expectancy", f"${mc_result['percentiles'][10][-1]:,.0f}")
-            m4.metric("Trials Depleted", f"{mc_result['n_depleted']:,} / {mc_result['n_runs']:,}")
+            m2.metric("Median at Life Expectancy", f"${mc_result['percentiles'][50][-1]:,.0f}",
+                      help="Nominal (pre-tax) portfolio at life expectancy — 50th percentile across all trials.")
+            _tax_adj_p50 = mc_result.get("tax_adj_final_percentiles", {}).get(50)
+            if _tax_adj_p50 is not None:
+                m3.metric("Tax-Adj. Median at Life Exp.", f"${_tax_adj_p50:,.0f}",
+                          help="After-tax equivalent: pre-tax (IRA/401k) balances discounted by that trial's effective tax rate, Roth at face value.")
+            else:
+                m3.metric("10th Pct. at Life Expectancy", f"${mc_result['percentiles'][10][-1]:,.0f}")
+            m4.metric("10th Pct. at Life Expectancy", f"${mc_result['percentiles'][10][-1]:,.0f}")
+            m5.metric("Trials Depleted", f"{mc_result['n_depleted']:,} / {mc_result['n_runs']:,}")
 
             # Echo back exactly which withdrawal rule this result was computed under, so the
             # displayed numbers can never be mistaken for a different mode than was run.
@@ -2062,7 +2080,8 @@ def main():
                 return float(df["total_tax"].sum()) if df is not None and not df.empty else 0.0
 
             def _final_port(df):
-                return float(df["total_portfolio"].iloc[-1]) if df is not None and not df.empty else 0.0
+                col = "tax_adj_total_portfolio" if (df is not None and "tax_adj_total_portfolio" in df.columns) else "total_portfolio"
+                return float(df[col].iloc[-1]) if df is not None and not df.empty else 0.0
 
             base_spend = _lft_spend(base_df)
             opt_spend = _lft_spend(best_df)
@@ -2093,7 +2112,7 @@ def main():
                 "Metric": [
                     "Lifetime After-Tax Income",
                     "Lifetime Taxes Paid",
-                    "Final Portfolio Value",
+                    "Tax-Adj. Final Portfolio",
                     "Total Roth Conversions",
                     "Portfolio Depleted",
                     "Trials Evaluated",
@@ -2297,7 +2316,7 @@ def main():
                 st.caption(
                     f"Orange dashed = baseline ({base['score']:,.0f}). "
                     f"Green dashed = best found ({best['score']:,.0f}). "
-                    f"Score = lifetime after-tax income − 30% × taxes + {opt_legacy:.0%} × final portfolio."
+                    f"Score = lifetime after-tax income − 30% × taxes + {opt_legacy:.0%} × tax-adjusted final portfolio."
                 )
 
 
