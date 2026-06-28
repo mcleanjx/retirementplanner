@@ -3197,5 +3197,94 @@ class TestOptimizerV3:
         assert _score_mc(safe, 0.20) > _score_mc(risky, 0.20)
 
 
+class TestOptimizerRobust:
+    """Robust-mode optimizer: score each strategy across a band of Roth-return
+    assumptions and blend the outcomes, so the recommendation is not overfit to a
+    single guessed return."""
+
+    def _accts(self):
+        return [_trad_account(900_000), _roth_account(60_000), _taxable_account(300_000, 150_000)]
+
+    def test_default_band_centers_on_highest_roth_rate(self):
+        from optimizer import default_return_band
+        accts = [_trad_account(500_000), _roth_account(100_000)]
+        accts[1]["return_rate"] = 0.07
+        accts[1]["use_global_return_rate"] = False
+        band = default_return_band(accts, _base_assumptions(), width=0.01, points=3)
+        assert band == pytest.approx([0.06, 0.07, 0.08])
+
+    def test_default_band_floors_at_zero(self):
+        from optimizer import default_return_band
+        accts = [_roth_account(100_000)]
+        accts[0]["return_rate"] = 0.005
+        accts[0]["use_global_return_rate"] = False
+        band = default_return_band(accts, _base_assumptions(), width=0.01, points=3)
+        assert band[0] == 0.0 and band[-1] == pytest.approx(0.015)
+
+    def test_apply_roth_return_only_touches_roth_and_is_pure(self):
+        from optimizer import _apply_roth_return
+        accts = self._accts()
+        before_trad = accts[0]["return_rate"]
+        out = _apply_roth_return(accts, 0.09)
+        # Roth account overridden, pinned off-global
+        assert out[1]["return_rate"] == 0.09 and out[1]["use_global_return_rate"] is False
+        # Pre-tax and taxable untouched
+        assert out[0]["return_rate"] == before_trad
+        assert out[2]["return_rate"] == accts[2]["return_rate"]
+        # Input not mutated
+        assert accts[1]["return_rate"] != 0.09
+
+    def test_robust_score_interpolates_mean_to_worst(self):
+        from optimizer import _robust_score
+        scores = [10.0, 20.0, 30.0]
+        assert _robust_score(scores, 0.0) == pytest.approx(20.0)   # mean
+        assert _robust_score(scores, 1.0) == pytest.approx(10.0)   # worst
+        assert _robust_score(scores, 0.5) == pytest.approx(15.0)   # blend
+        assert _robust_score([42.0], 0.7) == pytest.approx(42.0)   # single point
+        assert _robust_score([], 0.5) == float("-inf")
+        assert _robust_score([5.0, float("-inf")], 0.0) == float("-inf")
+
+    def test_band_none_is_backward_compatible(self):
+        """No band → single-point scoring, band_scores length 1, runs cleanly."""
+        from optimizer import run_optimizer
+        res = run_optimizer(self._accts(), _base_profile(), _base_assumptions(),
+                            {"enabled": False}, {}, n_iterations=20, seed=42)
+        assert res["return_band"] is None
+        assert len(res["best_result"]["band_scores"]) == 1
+        assert res["best_result"]["score"] == res["best_result"]["band_scores"][0]
+
+    def test_robust_run_scores_match_blend(self):
+        """best_result.score equals the λ-blend of its own per-band-point scores."""
+        from optimizer import run_optimizer, default_return_band, _robust_score
+        accts = self._accts()
+        band = default_return_band(accts, _base_assumptions(), width=0.01, points=3)
+        res = run_optimizer(accts, _base_profile(), _base_assumptions(),
+                            {"enabled": False}, {}, n_iterations=30, seed=42,
+                            return_band=band, robustness=0.5)
+        best = res["best_result"]
+        assert len(best["band_scores"]) == 3
+        assert best["score"] == pytest.approx(_robust_score(best["band_scores"], 0.5))
+        # Interpretable per-band dollar metrics are surfaced for the robustness display,
+        # aligned with the band and carrying a legacy figure for each return assumption.
+        assert len(best["band_metrics"]) == 3
+        assert all("final_portfolio" in m and "depleted" in m for m in best["band_metrics"])
+        assert len(res["baseline_result"]["band_metrics"]) == 3
+        # top_results are sorted by robust score, descending
+        scores = [r["score"] for r in res["top_results"]]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_higher_robustness_never_prefers_a_more_fragile_plan(self):
+        """The λ=1 (worst-case) winner has a worst band point no worse than the
+        λ=0 (expected-value) winner's worst band point."""
+        from optimizer import run_optimizer, default_return_band
+        accts = self._accts()
+        band = default_return_band(accts, _base_assumptions(), width=0.015, points=3)
+        kw = dict(roth_conversion_baseline={"enabled": False}, spending_overrides={},
+                  n_iterations=60, seed=42, return_band=band)
+        ev = run_optimizer(accts, _base_profile(), _base_assumptions(), robustness=0.0, **kw)
+        rob = run_optimizer(accts, _base_profile(), _base_assumptions(), robustness=1.0, **kw)
+        assert min(rob["best_result"]["band_scores"]) >= min(ev["best_result"]["band_scores"])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

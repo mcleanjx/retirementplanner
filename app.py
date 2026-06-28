@@ -2042,6 +2042,37 @@ def main():
                 help="Change to explore different random draws with the same iteration count.",
             ))
 
+        # --- Robustness to the return-rate guess ---
+        opt_robustness = 0.0
+        opt_return_band = None
+        rob_on = st.checkbox(
+            "Robust to the return assumption",
+            value=False, key="opt_robust",
+            help="The Roth conversion decision is very sensitive to the assumed Roth return (the asset-location "
+                 "guess), so a single-rate optimum is fragile. When on, every strategy is scored across a band of "
+                 "Roth-return assumptions and ranked on a blend of expected and worst-case outcomes.",
+        )
+        if rob_on and use_v2:
+            st.info("Robust mode runs on the **v1** optimizer. Switch the Optimizer Version to v1 to use it.")
+        elif rob_on:
+            rb1, rb2 = st.columns([2, 2])
+            with rb1:
+                opt_robustness = st.slider(
+                    "Robustness (λ)", min_value=0.0, max_value=1.0, value=0.5, step=0.1, key="opt_robustness",
+                    help="0 = maximize expected dollars (highest-upside plan, most sensitive to the guess). "
+                         "1 = maximize the worst case across the band (safest, least sensitive). 0.5 = neutral.",
+                )
+            with rb2:
+                _band_pp = st.slider(
+                    "Return band ± (pp)", min_value=0.5, max_value=2.0, value=1.0, step=0.5, key="opt_band_pp",
+                    help="Half-width of the Roth-return band tested, in percentage points around your assumed rate. "
+                         "Each run simulates every strategy at the low, central, and high return — roughly 3× slower.",
+                )
+            opt_return_band = _opt.default_return_band(
+                accounts_at_retirement, assumptions, width=_band_pp / 100.0, points=3,
+            )
+            st.caption("Testing Roth-return assumptions: " + ", ".join(f"{r:.1%}" for r in opt_return_band))
+
         if st.button("▶ Run Optimizer", type="primary", key="opt_run"):
             with st.spinner(f"Evaluating {opt_n:,} strategy combinations…"):
                 _opt_kwargs = dict(
@@ -2057,6 +2088,8 @@ def main():
                 if use_v2:
                     _opt_run_result = _opt_v2.run_optimizer_v2(**_opt_kwargs)
                 else:
+                    _opt_kwargs["return_band"] = opt_return_band
+                    _opt_kwargs["robustness"] = opt_robustness
                     _opt_run_result = _opt.run_optimizer(**_opt_kwargs)
                 _opt_run_result["_version"] = "v2" if use_v2 else "v1"
             st.session_state["opt_result"] = _opt_run_result
@@ -2158,6 +2191,45 @@ def main():
                 st.info("💡 **Why this strategy wins:** The optimized plan delivers " + ", and ".join(_why_parts) + ". Apply the recommended settings below to activate it.")
             elif _b_spend - _o_spend > 1000:
                 st.info("💡 The optimizer found no significant improvement over your current settings — your plan is already well-configured.")
+
+            # --- Robustness profile across the return band ---
+            _band = opt_result.get("return_band")
+            if _band:
+                st.divider()
+                st.subheader("Robustness to the Return Guess")
+                _lam = opt_result.get("robustness", 0.0)
+                _ctr = len(_band) // 2
+                st.caption(
+                    "Tax-adjusted money left at the end of the plan (**legacy**) if your Roth bucket earns each "
+                    f"return below. The middle column (**{_band[_ctr]:.1%}**) is your current assumption; the others "
+                    "are the same plan if the return comes in lower or higher. A **big swing** means the plan's "
+                    "result hinges on a return you're only guessing; a **small swing** means it holds up either way. "
+                    f"The optimizer ranked plans on a **λ={_lam:.1f}** blend of the average and the worst case across "
+                    "these (λ=0 chases the best-case upside, λ=1 protects the worst case)."
+                )
+
+                def _band_row(label, r):
+                    bm = r.get("band_metrics") or []
+                    if len(bm) != len(_band):
+                        return None
+                    legs = [m["final_portfolio"] for m in bm]
+                    row = {"Plan": label}
+                    for rate, m in zip(_band, bm):
+                        cell = f"${m['final_portfolio']:,.0f}"
+                        if m.get("depleted"):
+                            cell += " ⚠️ depletes"
+                        row[f"Roth earns {rate:.1%}"] = cell
+                    row["Swing (high − low)"] = f"${max(legs) - min(legs):,.0f}"
+                    return row
+
+                _rows = [x for x in (_band_row("Optimized plan", best), _band_row("Your current plan", base)) if x]
+                if _rows:
+                    st.dataframe(pd.DataFrame(_rows), width='stretch', hide_index=True)
+                    st.caption(
+                        "💡 Compare the two **Swing** values: if the optimized plan's swing is much larger than your "
+                        "current plan's, the optimizer's edge is mostly a bet on the assumed Roth return — raise the "
+                        "Robustness (λ) slider to favor a plan that's less sensitive to that guess."
+                    )
 
             # --- Year-by-year actions ---
             st.divider()

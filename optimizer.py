@@ -184,6 +184,135 @@ def _score(ret_df: pd.DataFrame, summary: dict, legacy_weight: float) -> float:
     )
 
 
+# ---------------------------------------------------------------------------
+# Robustness to the return-rate guess
+# ---------------------------------------------------------------------------
+# The Roth conversion decision is acutely sensitive to the assumed return on the
+# Roth bucket: converting moves money into a tax-free account, so a higher assumed
+# Roth return mechanically makes conversion look better, with decades of compounding
+# leverage on a large balance. Because the return rate is a *guess* (and, under an
+# asset-location strategy, deliberately set higher because the Roth is spent last),
+# a point-estimate optimizer overfits it and produces a fragile corner solution that
+# flips between "convert aggressively" and "don't" when the assumed rate moves a
+# tenth of a point.
+#
+# Robust mode evaluates each candidate strategy across a *band* of Roth-return
+# assumptions and scores it on a downside-aware blend of the resulting outcomes,
+# so the recommendation reflects the return uncertainty instead of a single guess.
+
+
+def _effective_roth_return(accounts: list, assumptions: dict) -> float:
+    """The assumed long-run return on the Roth bucket (the fragile asset-location guess).
+
+    Uses the highest effective return across Roth accounts — that is the aggressive
+    rate the user has assigned to the bucket that's spent last. Falls back to the
+    global retirement return when no Roth account is present.
+    """
+    global_rate = assumptions.get("retirement_return_rate", 0.07)
+    roth_rates = [
+        (a.get("return_rate", global_rate) if not a.get("use_global_return_rate", True) else global_rate)
+        for a in accounts
+        if a["type"] in ROTH_TYPES
+    ]
+    return max(roth_rates) if roth_rates else global_rate
+
+
+def default_return_band(
+    accounts: list, assumptions: dict, width: float = 0.01, points: int = 3
+) -> list[float]:
+    """Symmetric band of Roth-return assumptions centered on the current guess.
+
+    e.g. a 7% assumption with width=0.01, points=3 → [0.06, 0.07, 0.08]. Rates are
+    floored at 0. The center point (returned at the middle index) is the user's
+    actual assumption and is the one whose plan is surfaced for display.
+    """
+    center = _effective_roth_return(accounts, assumptions)
+    if points < 2:
+        return [center]
+    half = (points - 1) / 2.0
+    step = width / half
+    return [max(0.0, center + (i - half) * step) for i in range(points)]
+
+
+def _apply_roth_return(accounts: list, roth_return: float) -> list:
+    """Return a fresh account list with every Roth account's return set to `roth_return`.
+
+    Pre-tax/taxable/cash accounts are untouched, so this varies only the Roth premium
+    (the asset-location guess). Shallow-copies each account dict; never mutates input.
+    """
+    out = []
+    for a in accounts:
+        b = dict(a)
+        if b["type"] in ROTH_TYPES:
+            b["return_rate"] = roth_return
+            b["use_global_return_rate"] = False
+        out.append(b)
+    return out
+
+
+def _robust_score(scores: list[float], robustness: float) -> float:
+    """Blend a strategy's per-band-point scores into a single robust score.
+
+    robustness (λ) interpolates between expected value and worst case:
+        λ = 0 → mean(scores)          (risk-neutral; picks the highest-upside corner)
+        λ = 1 → min(scores)           (max-min robust; picks the safest plan)
+        0<λ<1 → (1-λ)·mean + λ·min     (neutral default 0.5 = average of the two)
+
+    A single-element list reproduces the plain point score exactly.
+    """
+    if not scores:
+        return float("-inf")
+    worst = min(scores)
+    if worst == float("-inf"):
+        return float("-inf")
+    mean = sum(scores) / len(scores)
+    robustness = min(1.0, max(0.0, robustness))
+    return (1.0 - robustness) * mean + robustness * worst
+
+
+def _point_metrics(ret_df: pd.DataFrame, summary: dict) -> dict:
+    """Interpretable dollar outcomes for one band point (for display, not ranking)."""
+    if ret_df is None or ret_df.empty:
+        return {"final_portfolio": 0.0, "lifetime_spend": 0.0, "lifetime_tax": 0.0, "depleted": True}
+    col = "tax_adj_total_portfolio" if "tax_adj_total_portfolio" in ret_df.columns else "total_portfolio"
+    return {
+        "final_portfolio": float(ret_df[col].iloc[-1]),
+        "lifetime_spend": float(ret_df["actual_after_tax_net"].sum()),
+        "lifetime_tax": float(ret_df["total_tax"].sum()),
+        "depleted": summary.get("portfolio_depleted_age") is not None,
+    }
+
+
+def _evaluate_across_band(
+    account_variants: list,
+    profile: dict,
+    trial_assumptions: dict,
+    rc: dict,
+    spending_overrides: Optional[dict],
+    legacy_weight: float,
+    robustness: float,
+    center_idx: int,
+) -> tuple[float, list[float], list[dict], pd.DataFrame, dict]:
+    """Simulate a strategy under each return-band variant.
+
+    Returns (robust_score, per_point_scores, per_point_metrics, center_ret_df,
+    center_summary). `per_point_metrics` holds interpretable dollar outcomes (legacy,
+    lifetime spend/tax, depletion) aligned with the band, for the robustness display.
+    The center variant's simulation is the representative plan surfaced to the user.
+    """
+    scores: list[float] = []
+    band_metrics: list[dict] = []
+    center_df: pd.DataFrame = pd.DataFrame()
+    center_summary: dict = {}
+    for i, accts in enumerate(account_variants):
+        df, summ = simulate_retirement(accts, profile, trial_assumptions, rc, spending_overrides)
+        scores.append(_score(df, summ, legacy_weight))
+        band_metrics.append(_point_metrics(df, summ))
+        if i == center_idx:
+            center_df, center_summary = df, summ
+    return _robust_score(scores, robustness), scores, band_metrics, center_df, center_summary
+
+
 def _describe_strategy(withdrawal_strategy: str, rc: dict, accounts: list, annual_rebalance_gain: float = 0.0) -> dict:
     """Build a human-readable description of a strategy configuration."""
     ws_label = "Tax Efficient" if withdrawal_strategy == "tax_efficient" else "Roth Preservation"
@@ -329,9 +458,18 @@ def run_optimizer(
     n_iterations: int = 500,
     legacy_weight: float = 0.20,
     seed: int = 42,
+    return_band: Optional[list[float]] = None,
+    robustness: float = 0.0,
 ) -> dict:
     """
     Run the strategy optimizer over `n_iterations` random trials.
+
+    Robust mode (opt-in): pass `return_band` (a list of Roth-return assumptions,
+    e.g. from `default_return_band`) to score every candidate across that band
+    instead of a single guess. `robustness` (λ, 0–1) blends each candidate's
+    band outcomes: 0 = expected value (upside-seeking corner), 1 = worst case
+    (max-min robust), 0.5 = neutral. With `return_band=None` (default) behavior
+    is unchanged — a single point-estimate run.
 
     Returns a dict with:
         baseline_result  – simulation of current (unchanged) settings
@@ -339,21 +477,34 @@ def run_optimizer(
         top_results      – top 10 configurations
         n_evaluated      – number of successful simulation runs
         all_scores       – list of all valid scores (for distribution)
+        return_band      – the band used (None if not in robust mode)
+        robustness       – the λ used
     """
     rng = random.Random(seed)
 
+    robust_mode = bool(return_band) and len(return_band) > 1
+    if robust_mode:
+        account_variants = [_apply_roth_return(accounts_at_retirement, r) for r in return_band]
+        center_idx = len(account_variants) // 2
+    else:
+        account_variants = [accounts_at_retirement]
+        center_idx = 0
+
     # --- Baseline (current settings, unmodified) ---
     try:
-        base_df, base_summary = simulate_retirement(
-            accounts_at_retirement, profile, assumptions,
-            roth_conversion_baseline, spending_overrides,
+        base_assumptions = {**assumptions}
+        base_score, base_band_scores, base_band_metrics, base_df, base_summary = _evaluate_across_band(
+            account_variants, profile, base_assumptions, roth_conversion_baseline or {"enabled": False},
+            spending_overrides, legacy_weight, robustness, center_idx,
         )
-        base_score = _score(base_df, base_summary, legacy_weight)
     except Exception:
         base_df, base_summary, base_score = pd.DataFrame(), {}, float("-inf")
+        base_band_scores, base_band_metrics = [], []
 
     baseline_result = {
         "score": base_score,
+        "band_scores": base_band_scores,
+        "band_metrics": base_band_metrics,
         "withdrawal_strategy": assumptions.get("withdrawal_strategy", "tax_efficient"),
         "roth_conversion": copy.deepcopy(roth_conversion_baseline) or {"enabled": False},
         "annual_rebalance_gain": assumptions.get("annual_rebalance_gain", 0.0),
@@ -372,14 +523,16 @@ def run_optimizer(
         trial_assumptions = {**assumptions, "withdrawal_strategy": w_strat, "annual_rebalance_gain": annual_rebalance_gain}
 
         try:
-            ret_df, sim_summary = simulate_retirement(
-                accounts_at_retirement, profile, trial_assumptions, rc, spending_overrides,
+            sc, band_scores, band_metrics, ret_df, sim_summary = _evaluate_across_band(
+                account_variants, profile, trial_assumptions, rc,
+                spending_overrides, legacy_weight, robustness, center_idx,
             )
-            sc = _score(ret_df, sim_summary, legacy_weight)
             n_evaluated += 1
             all_scores.append(sc)
             results.append({
                 "score": sc,
+                "band_scores": band_scores,
+                "band_metrics": band_metrics,
                 "withdrawal_strategy": w_strat,
                 "roth_conversion": rc,
                 "annual_rebalance_gain": annual_rebalance_gain,
@@ -400,4 +553,6 @@ def run_optimizer(
         "top_results": results[:10],
         "n_evaluated": n_evaluated,
         "all_scores": all_scores,
+        "return_band": return_band if robust_mode else None,
+        "robustness": robustness,
     }
