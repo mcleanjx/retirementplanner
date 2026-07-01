@@ -1,6 +1,10 @@
 """
 optimizer_v3.py — MC-aware, receding-horizon strategy optimizer.
 
+EXPERIMENTAL — this engine is complete and tested but is NOT wired into the
+app UI; no user can reach it from app.py. Kept in the tree for the next
+iteration (Progress-tab receding-horizon re-optimization). See CLAUDE.md.
+
 Where v1/v2 score each candidate strategy against a *single deterministic*
 `simulate_retirement` run, v3 scores each candidate against a **Monte Carlo
 distribution** (via `montecarlo_v2.run_monte_carlo_v2`), so the search rewards
@@ -39,12 +43,11 @@ import copy
 import random
 from typing import Optional
 
-import pandas as pd
 
 from withdrawals import simulate_retirement
 from montecarlo_v2 import run_monte_carlo_v2
 from optimizer import build_actions_table
-from optimizer_v2 import _sample_strategy_v2, describe_strategy_v2
+from optimizer_v2 import _sample_strategy_v2
 
 # --- Robust objective weights ------------------------------------------------
 # Lifetime spend / legacy are in dollars (~$1M-$10M); success_rate is in [0, 1].

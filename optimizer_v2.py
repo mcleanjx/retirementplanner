@@ -34,13 +34,11 @@ from typing import Optional
 import pandas as pd
 
 from withdrawals import simulate_retirement
-from constants import RMD_START_AGE, IRMAA_TIERS
+from constants import RMD_START_AGE
 from optimizer import (
     _owner_min_conv_age,
     _score,
     _describe_strategy,
-    build_actions_table,
-    build_balances_table,
     TRADITIONAL_TYPES,
     ROTH_TYPES,
     TAXABLE_TYPES,

@@ -5,6 +5,7 @@ Run with:  python -m pytest test_retirement.py -v
 """
 
 import json
+import os
 
 import pytest
 
@@ -1874,7 +1875,7 @@ class TestEdgeCases:
 # ===========================================================================
 
 class TestSpecGaps:
-    """Covers every gap identified against prompt.md."""
+    """Covers every gap identified against docs/research/prompt.md."""
 
     # -----------------------------------------------------------------------
     # Gap 1: withdraw_priority="last" accounts are deferred
@@ -2618,8 +2619,6 @@ class TestMathAuditDemoScenario:
 
     @pytest.fixture(autouse=True)
     def _setup(self):
-        import json
-        import os
         from projections import project_accumulation
         from withdrawals import simulate_retirement
 
@@ -2840,8 +2839,6 @@ class TestMathAuditDemoScenario:
 # 15. SCENARIO INVARIANT TESTS — parametrized across all scenario files
 # ===========================================================================
 
-import os as _os
-
 _SCENARIO_PATHS = [
     # Existing scenarios (all fixed-net mode)
     "scenarios/My Scenario Demo.json",
@@ -2862,7 +2859,7 @@ _SCENARIO_PATHS = [
 ]
 
 _SCENARIO_IDS = [
-    _os.path.splitext(_os.path.basename(p))[0].replace(" ", "_")
+    os.path.splitext(os.path.basename(p))[0].replace(" ", "_")
     for p in _SCENARIO_PATHS
 ]
 
@@ -2895,7 +2892,7 @@ def scenario_data(request):
     Skips gracefully when the file is absent (e.g. personal scenarios on other machines).
     """
     path = request.param
-    if not _os.path.exists(path):
+    if not os.path.exists(path):
         pytest.skip(f"Scenario file not found: {path}")
     return _run_scenario(path)
 
@@ -3065,7 +3062,7 @@ class TestScenarioInvariants:
         threshold = early["net_spending_target"] * 0.15
         bad = early[early["surplus_reinvested"] > threshold][["age", "surplus_reinvested", "net_spending_target"]]
         assert bad.empty, (
-            f"Unexpectedly large surplus in first two retirement years (>15% of net target):\n"
+            "Unexpectedly large surplus in first two retirement years (>15% of net target):\n"
             + bad.to_string(index=False)
         )
 
@@ -3083,7 +3080,6 @@ class TestMonteCarloV2DeterministicFirstYear:
 
     def test_first_year_portfolio_is_deterministic_across_trials(self):
         """Year-0 terminal portfolio is identical across all trials (no MC spread)."""
-        import numpy as np
         from montecarlo_v2 import run_monte_carlo_v2
         accts, p, a = self._accts(), self._profile(), _base_assumptions()
         mc = run_monte_carlo_v2(
@@ -3284,6 +3280,181 @@ class TestOptimizerRobust:
         ev = run_optimizer(accts, _base_profile(), _base_assumptions(), robustness=0.0, **kw)
         rob = run_optimizer(accts, _base_profile(), _base_assumptions(), robustness=1.0, **kw)
         assert min(rob["best_result"]["band_scores"]) >= min(ev["best_result"]["band_scores"])
+
+
+class TestOptimizerCashReserve:
+    """Pre-retirement taxable→cash reserve dimension: the optimizer can trial holding
+    extra cash at retirement to fund early Roth-conversion taxes without selling
+    appreciated taxable lots (the CONSIDERATIONS.md synergy)."""
+
+    def _accts(self):
+        # CA-style: big appreciated taxable + a bank to hold the reserve + convertible pre-tax.
+        return [
+            _trad_account(1_200_000),
+            _roth_account(60_000),
+            _taxable_account(800_000, 200_000),
+            _bank_account(100_000),
+        ]
+
+    def test_apply_reserve_is_wealth_neutral_and_pure(self):
+        from optimizer import _apply_cash_reserve
+        accts = self._accts()
+        before_total = sum(a["balance"] for a in accts)
+        before_taxable = accts[2]["balance"]
+        out = _apply_cash_reserve(accts, 300_000)
+        # Total wealth preserved; money moved taxable→bank.
+        assert sum(a["balance"] for a in out) == pytest.approx(before_total)
+        assert out[2]["balance"] == pytest.approx(before_taxable - 300_000)
+        assert out[3]["balance"] == pytest.approx(100_000 + 300_000)
+        # Basis drawn down pro-rata (gain ratio preserved on the remaining taxable lot).
+        assert out[2]["basis"] / out[2]["balance"] == pytest.approx(200_000 / before_taxable)
+        # Input not mutated.
+        assert accts[2]["balance"] == before_taxable
+
+    def test_apply_reserve_zero_is_identity_no_copy(self):
+        from optimizer import _apply_cash_reserve
+        accts = self._accts()
+        assert _apply_cash_reserve(accts, 0) is accts          # same ref → no copy cost
+        assert _apply_cash_reserve(accts, -5) is accts
+
+    def test_reserve_clamped_and_skipped_without_bank(self):
+        from optimizer import _apply_cash_reserve, _max_cash_reserve
+        no_bank = [_trad_account(500_000), _roth_account(50_000), _taxable_account(300_000, 100_000)]
+        assert _max_cash_reserve(no_bank) == 0.0                # nowhere to hold it
+        assert _apply_cash_reserve(no_bank, 100_000) is no_bank
+        # Over-asking is clamped to available taxable.
+        accts = self._accts()
+        out = _apply_cash_reserve(accts, 10_000_000)
+        assert out[2]["balance"] == pytest.approx(0.0)
+        assert out[3]["balance"] == pytest.approx(100_000 + 800_000)
+
+    def test_reserve_only_sampled_with_conversion(self):
+        """_sample_strategy never returns a non-zero reserve when the trial has no
+        conversion (the reserve's only purpose is funding conversion taxes)."""
+        import random
+        from optimizer import _sample_strategy
+        rng = random.Random(0)
+        accts = self._accts()
+        prof = _base_profile()
+        saw_noconv = saw_conv_reserve = False
+        for _ in range(200):
+            _ws, rc, _reb, reserve = _sample_strategy(prof, accts, rng)
+            if not rc.get("enabled"):
+                assert reserve == 0.0
+                saw_noconv = True
+            elif reserve > 0:
+                saw_conv_reserve = True
+        assert saw_noconv and saw_conv_reserve            # both branches exercised
+
+    def test_optimizer_records_reserve_and_leaves_accounts_unmutated(self):
+        from optimizer import run_optimizer
+        accts = self._accts()
+        before = [dict(a) for a in accts]
+        res = run_optimizer(accts, _base_profile(), _base_assumptions(),
+                            {"enabled": False}, {}, n_iterations=80, seed=3)
+        assert "cash_reserve" in res["best_result"]
+        assert res["baseline_result"]["cash_reserve"] == 0.0
+        # The shared accounts_at_retirement is never mutated by a reserving trial.
+        assert [dict(a) for a in accts] == before
+
+
+class TestTaxSmoothingObjective:
+    """Tax-smoothing conversion objective: rank conversions at equal returns (premium
+    neutralized) per the marginal-rate equivalency principle, and report the asset-
+    location premium separately so a return bet can't masquerade as a tax strategy."""
+
+    def _accts_with_premium(self):
+        # Pre-tax grows at the global rate; Roth pinned higher (asset-location premium).
+        trad = _trad_account(900_000)
+        trad["use_global_return_rate"] = True
+        roth = _roth_account(50_000)
+        roth["return_rate"] = 0.09
+        roth["use_global_return_rate"] = False
+        return [trad, roth, _taxable_account(400_000, 200_000)]
+
+    def _profile(self):
+        return _base_profile(current_age=60, retirement_age=62, life_expectancy=90)
+
+    def test_returns_expected_structure(self):
+        from optimizer import run_optimizer
+        res = run_optimizer(self._accts_with_premium(), self._profile(), _base_assumptions(),
+                            {"enabled": False}, {}, n_iterations=40, seed=42,
+                            conversion_objective="tax_smoothing")
+        assert res["conversion_objective"] == "tax_smoothing"
+        assert "equal_return_rate" in res and "noconv_equal_legacy" in res
+        pa = res["best_result"]["premium_analysis"]
+        for k in ("legacy_equal", "legacy_real", "premium_value", "tax_value"):
+            assert k in pa
+
+    def test_premium_is_reported_not_baked_into_ranking(self):
+        """With a Roth premium present, the equal-return ranking sees no premium, so
+        the best plan's premium_value (real − equal legacy) is positive and separate."""
+        from optimizer import run_optimizer
+        res = run_optimizer(self._accts_with_premium(), self._profile(), _base_assumptions(),
+                            {"enabled": False}, {}, n_iterations=60, seed=42,
+                            conversion_objective="tax_smoothing")
+        agg = res.get("aggressive_reference")
+        assert agg is not None
+        # The aggressive 'chase the premium' plan must show a real, positive asset-location
+        # premium (it converts a lot into the 9% Roth), surfaced as its own figure.
+        assert agg["premium_analysis"]["premium_value"] > 0
+
+    def test_tax_value_zero_when_recommendation_is_no_conversion(self):
+        from optimizer import run_optimizer
+        res = run_optimizer(self._accts_with_premium(), self._profile(), _base_assumptions(),
+                            {"enabled": False}, {}, n_iterations=60, seed=42,
+                            conversion_objective="tax_smoothing")
+        best = res["best_result"]
+        if not best["roth_conversion"].get("enabled"):
+            assert best["premium_analysis"]["tax_value"] == pytest.approx(0.0, abs=1.0)
+
+    def test_wealth_objective_unchanged_default(self):
+        """Default objective stays 'wealth' and does not emit tax-smoothing keys."""
+        from optimizer import run_optimizer
+        res = run_optimizer(self._accts_with_premium(), self._profile(), _base_assumptions(),
+                            {"enabled": False}, {}, n_iterations=20, seed=42)
+        assert res.get("conversion_objective") in (None,)  # not set on the wealth path
+        assert "premium_analysis" not in res["best_result"]
+
+
+class TestFillRateCurve:
+    """Suggested conversion fill-to rate: sweep the marginal-rate ceiling and pick the
+    peak of the TOTAL after-tax outcome (full sim at real returns)."""
+
+    def _accts(self, roth_premium):
+        trad = _trad_account(900_000)
+        trad["use_global_return_rate"] = True
+        roth = _roth_account(50_000)
+        roth["return_rate"] = 0.09 if roth_premium else 0.05
+        roth["use_global_return_rate"] = not roth_premium  # pinned high when premium present
+        return [trad, roth, _taxable_account(400_000, 200_000)]
+
+    def test_curve_structure_and_suggestion(self):
+        from optimizer import compute_fill_rate_curve, FILL_TO_RATES
+        fc = compute_fill_rate_curve(self._accts(True), _base_profile(current_age=60, retirement_age=62),
+                                     _base_assumptions(), {}, 0.20)
+        assert fc["curve"] and fc["suggested_rate"] in FILL_TO_RATES
+        for pt in fc["curve"]:
+            for k in ("rate", "score", "legacy", "lifetime_tax", "after_tax_spend"):
+                assert k in pt
+        # The suggested rate is the score-maximizing point of the curve.
+        best = max(fc["curve"], key=lambda c: c["score"])
+        assert fc["suggested_rate"] == best["rate"]
+        assert fc["monotonic_corner"] == (best["rate"] in (min(c["rate"] for c in fc["curve"]),
+                                                            max(c["rate"] for c in fc["curve"])))
+
+    def test_curve_attached_to_run_optimizer_results(self):
+        from optimizer import run_optimizer
+        for kw in ({}, {"conversion_objective": "tax_smoothing"}):
+            res = run_optimizer(self._accts(True), _base_profile(current_age=60, retirement_age=62),
+                                _base_assumptions(), {"enabled": False}, {}, n_iterations=15, seed=42, **kw)
+            assert res.get("fill_rate_curve", {}).get("curve")
+
+    def test_no_conversion_point_present(self):
+        from optimizer import compute_fill_rate_curve
+        fc = compute_fill_rate_curve(self._accts(False), _base_profile(current_age=60, retirement_age=62),
+                                     _base_assumptions(), {}, 0.20)
+        assert any(pt["rate"] == 0.0 for pt in fc["curve"])  # 'no conversion' always evaluated
 
 
 if __name__ == "__main__":

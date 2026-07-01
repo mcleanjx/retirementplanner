@@ -5,17 +5,19 @@ import streamlit as st
 import pandas as pd
 
 from projections import project_accumulation
-from withdrawals import simulate_retirement
+from withdrawals import simulate_retirement, TRADITIONAL_TYPES, ROTH_TYPES
 import charts as _charts
 import montecarlo as _mc
 import montecarlo_v2 as _mc2
 import plotly.graph_objects as go
 import optimizer as _opt
 import optimizer_v2 as _opt_v2
-from scenarios import list_scenarios, latest_scenario, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking, get_last_used_scenario, set_last_used_scenario, validate_scenario_name
-from constants import RMD_START_AGE, CONTRIBUTION_LIMITS
+from scenarios import list_scenarios, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking, get_last_used_scenario, set_last_used_scenario, validate_scenario_name
+from constants import CONTRIBUTION_LIMITS
 
-st.set_page_config(page_title="Retirement Planner", layout="wide")
+__version__ = "2.0.0"
+
+st.set_page_config(page_title=f"Retirement Planner v{__version__}", layout="wide")
 
 # Prevent Streamlit's built-in 'C' shortcut (Clear cache) from firing during Ctrl+C (copy).
 st.html(
@@ -756,6 +758,7 @@ def main():
     sidebar_accounts()
     sidebar_roth_conversion()
     sidebar_scenarios()
+    st.sidebar.caption(f"Retirement Planner v{__version__}")
 
     profile = st.session_state.profile
     assumptions = st.session_state.assumptions
@@ -872,7 +875,7 @@ def main():
             st.markdown(f"**End of Life  (Age {le_age})**")
             if portfolio_at_le <= 0:
                 st.markdown(
-                    f"""<div style="border:2px solid #cc0000;border-radius:8px;padding:10px 14px;background:#fff0f0;margin-bottom:1rem;">
+                    """<div style="border:2px solid #cc0000;border-radius:8px;padding:10px 14px;background:#fff0f0;margin-bottom:1rem;">
                     <div style="font-size:0.85rem;color:#888;margin-bottom:4px;">Portfolio</div>
                     <div style="font-size:1.6rem;font-weight:700;color:#cc0000;">$0 — Depleted</div>
                     </div>""",
@@ -880,14 +883,23 @@ def main():
                 )
             else:
                 st.metric("Portfolio", f"${portfolio_at_le:,.0f}",
-                          help=f"Tax-adjusted (Roth + after-tax equivalent of pre-tax accounts): ${tax_adj_at_le:,.0f}")
+                          help=f"This headline figure is the **full portfolio value**, before the ordinary income "
+                               f"tax still owed on pre-tax (Traditional) accounts. After that tax, the **tax-adjusted "
+                               f"legacy is ${tax_adj_at_le:,.0f}**. In that adjusted figure: Roth counts at full value "
+                               "(tax-free); pre-tax is discounted for the income tax owed; taxable/real-estate count "
+                               "at full value because they receive a stepped-up basis at death (embedded capital gains "
+                               "escape tax for heirs).")
     else:
         # ── Full summary view ──────────────────────────────────────────────────
         c1, c2, c3, c4, c5 = st.columns(5)
+        _comp_note = ("This is the composition on **day 1 of retirement** — it does not change with Roth "
+                      "conversions, which happen later during retirement and gradually move money from "
+                      "**Pre-Tax → Roth**. See the year-by-year chart below (or the optimizer's End-of-Plan "
+                      "by Tax Treatment table) for the post-conversion mix.")
         c1.metric("Portfolio at Retirement", f"${total_at_retirement:,.0f}")
-        c2.metric("Pre-Tax", f"${pre_tax_total:,.0f}")
-        c3.metric("Roth / Tax-Free", f"${roth_total:,.0f}")
-        c4.metric("Taxable / Real Estate", f"${taxable_total:,.0f}")
+        c2.metric("Pre-Tax", f"${pre_tax_total:,.0f}", help=_comp_note)
+        c3.metric("Roth / Tax-Free", f"${roth_total:,.0f}", help=_comp_note)
+        c4.metric("Taxable / Real Estate", f"${taxable_total:,.0f}", help=_comp_note)
         c5.metric("Portfolio Longevity", longevity_str)
 
         c6, c7, c8, c9, c10 = st.columns(5)
@@ -897,7 +909,10 @@ def main():
             f"${annual_withdrawal:,.0f}",
             help=f"Your spending target ({_infl_pct:.1f}% inflation applied from today's dollars to retirement year 1)." if fixed_net_mode else None,
         )
-        c7.metric("Lifetime Taxes", f"${summary['lifetime_taxes']:,.0f}")
+        _lt_state = float(ret_df["state_tax"].sum()) if not ret_df.empty and "state_tax" in ret_df.columns else 0.0
+        _lt_fed = summary['lifetime_taxes'] - _lt_state
+        c7.metric("Lifetime Taxes", f"${summary['lifetime_taxes']:,.0f}",
+                  help=f"Federal: ${_lt_fed:,.0f}  ·  State: ${_lt_state:,.0f}")
         c8.metric("Lifetime Healthcare", f"${summary['lifetime_healthcare']:,.0f}")
         c9.metric("Lifetime Passive Income", f"${summary['lifetime_passive_income']:,.0f}")
         with c10:
@@ -911,7 +926,12 @@ def main():
                 )
             else:
                 st.metric(f"Portfolio at Age {le_age}", f"${portfolio_at_le:,.0f}",
-                          help=f"Tax-adjusted (Roth + after-tax equivalent of pre-tax accounts): ${tax_adj_at_le:,.0f}")
+                          help=f"This headline figure is the **full portfolio value**, before the ordinary income "
+                               f"tax still owed on pre-tax (Traditional) accounts. After that tax, the **tax-adjusted "
+                               f"legacy is ${tax_adj_at_le:,.0f}**. In that adjusted figure: Roth counts at full value "
+                               "(tax-free); pre-tax is discounted for the income tax owed; taxable/real-estate count "
+                               "at full value because they receive a stepped-up basis at death (embedded capital gains "
+                               "escape tax for heirs).")
 
     if portfolio_at_le <= 0:
         st.error(
@@ -934,7 +954,6 @@ def main():
             if st.button("Run Comparison", key="cmp_run"):
                 with st.spinner("Running comparison…"):
                     try:
-                        import copy as _copy
                         _cmp_data = load_scenario(_cmp_sel)
                         _cmp_accs, _cmp_accts_ret = project_accumulation(
                             _cmp_data["accounts"], _cmp_data["profile"], _cmp_data["assumptions"]
@@ -960,6 +979,7 @@ def main():
                             "spend_yr1": float(_cmp_ret_df[_cmp_spend_col].iloc[0]) if not _cmp_ret_df.empty else 0.0,
                             "portfolio_at_le": float(_cmp_le_row["total_portfolio"].iloc[0]) if not _cmp_le_row.empty else 0.0,
                             "lifetime_taxes": _cmp_sum.get("lifetime_taxes", 0),
+                            "lifetime_state_tax": float(_cmp_ret_df["state_tax"].sum()) if not _cmp_ret_df.empty and "state_tax" in _cmp_ret_df.columns else 0.0,
                             "lifetime_healthcare": _cmp_sum.get("lifetime_healthcare", 0),
                         }
                     except Exception as _cmp_e:
@@ -969,6 +989,11 @@ def main():
             if _cmp_result:
                 if _cmp_result["name"] != st.session_state.get("cmp_sel", ""):
                     st.caption("Showing comparison with a previously run scenario — click Run Comparison to refresh.")
+                # Federal vs state lifetime tax breakout (federal = total − state).
+                _cur_state = float(ret_df["state_tax"].sum()) if not ret_df.empty and "state_tax" in ret_df.columns else 0.0
+                _cur_fed = summary['lifetime_taxes'] - _cur_state
+                _cmp_state = _cmp_result.get('lifetime_state_tax', 0.0)
+                _cmp_fed = _cmp_result['lifetime_taxes'] - _cmp_state
                 _cmp_table = {
                     "Metric": [
                         "Portfolio at Retirement",
@@ -976,6 +1001,8 @@ def main():
                         "Year 1 Annual Spending",
                         "Portfolio at End of Plan",
                         "Lifetime Taxes",
+                        "    — Federal",
+                        "    — State",
                         "Lifetime Healthcare",
                     ],
                     _cur_sc_name or "Current": [
@@ -984,6 +1011,8 @@ def main():
                         f"${annual_withdrawal:,.0f}",
                         f"${portfolio_at_le:,.0f}",
                         f"${summary['lifetime_taxes']:,.0f}",
+                        f"${_cur_fed:,.0f}",
+                        f"${_cur_state:,.0f}",
                         f"${summary['lifetime_healthcare']:,.0f}",
                     ],
                     _cmp_result["name"]: [
@@ -992,6 +1021,8 @@ def main():
                         f"${_cmp_result['spend_yr1']:,.0f}",
                         f"${_cmp_result['portfolio_at_le']:,.0f}",
                         f"${_cmp_result['lifetime_taxes']:,.0f}",
+                        f"${_cmp_fed:,.0f}",
+                        f"${_cmp_state:,.0f}",
                         f"${_cmp_result['lifetime_healthcare']:,.0f}",
                     ],
                 }
@@ -1037,6 +1068,67 @@ def main():
         st.plotly_chart(_charts.chart_spending_coverage(ret_df, _cur_age, _ret_age), width='stretch')
         st.plotly_chart(_charts.chart_annual_income(ret_df, assumptions.get("inflation_rate", 0.03), _ret_age, _cur_age), width='stretch')
         st.plotly_chart(_charts.chart_tax_burden(ret_df, _cur_age, _ret_age), width='stretch')
+
+        # --- Year-by-year actions (mirrors the Optimizer tab) ---
+        st.divider()
+        st.subheader("Recommended Actions by Year")
+        st.markdown(
+            "🔴 **Red** — action required: sell / withdraw / convert out of this account. &nbsp;"
+            "🟢 **Green** — money arriving (Roth conversion receipt). &nbsp;"
+            "🟡 **Amber** — expense (taxes, healthcare). &nbsp;"
+            "🔵 **Blue** — income columns: SS & Passive Income offsets the portfolio draw; Ordinary Income is total taxable ordinary income driving your bracket. &nbsp;"
+            "💚 **Bold green** — **Total Spend**: what you actually have to live on after all costs. "
+            "Check: |Portfolio Draw| + SS & Passive Income − |Taxes| − |Healthcare| = Total Spend."
+        )
+        actions_df = _opt.build_actions_table(ret_df, roth_conversion, accounts_at_retirement)
+        if not actions_df.empty:
+            non_dollar = {"Age", "Eff. Tax Rate"}
+            act_fmt = {c: "${:,.0f}" for c in actions_df.columns if c not in non_dollar}
+            act_fmt["Eff. Tax Rate"] = "{:.1%}"
+
+            _acct_cols    = {a["name"] for a in accounts_at_retirement}
+            _expense_cols = {"Fed Tax", "State Tax", "Taxes", "Healthcare"}
+            _income_cols  = {"SS & Passive Income", "Ordinary Income"}
+            _draw_cols    = {"Portfolio Draw"}
+            _spend_cols   = {"Total Spend"}
+
+            def _actions_style(df: pd.DataFrame) -> pd.DataFrame:
+                out = pd.DataFrame("", index=df.index, columns=df.columns)
+                for col in df.columns:
+                    if col in _acct_cols or col in _draw_cols:
+                        bold = "; font-weight: 600" if col in _draw_cols else ""
+                        out[col] = df[col].apply(lambda v:
+                            f"background-color: #ffd6d6; color: #b30000{bold}"
+                            if isinstance(v, (int, float)) and v < -0.5
+                            else f"background-color: #d6f0d6; color: #1a6b1a{bold}"
+                            if isinstance(v, (int, float)) and v > 0.5
+                            else ""
+                        )
+                    elif col in _expense_cols:
+                        out[col] = df[col].apply(lambda v:
+                            "background-color: #fff0cc; color: #7a5c00"
+                            if isinstance(v, (int, float)) and v < -0.5
+                            else ""
+                        )
+                    elif col in _income_cols:
+                        out[col] = df[col].apply(lambda v:
+                            "background-color: #d6eaf8; color: #1a4f7a"
+                            if isinstance(v, (int, float)) and v > 0.5
+                            else ""
+                        )
+                    elif col in _spend_cols:
+                        out[col] = df[col].apply(lambda v:
+                            "background-color: #b7e4b7; color: #0d5c0d; font-weight: 700"
+                            if isinstance(v, (int, float)) and v > 0.5
+                            else ""
+                        )
+                return out
+
+            st.dataframe(
+                actions_df.style.format(act_fmt, na_rep="—").apply(_actions_style, axis=None),
+                width='stretch',
+                hide_index=True,
+            )
 
     with tab3:
         fixed_net_mode = assumptions.get("spending_mode") == "fixed"
@@ -1146,6 +1238,9 @@ def main():
         _display_df = ret_df.copy()
         _display_df["withdrawal_pct"] = _display_df["spending_target"] / _display_df["start_portfolio"].clip(lower=1.0)
         _display_df["net_spending_delta"] = _display_df["actual_after_tax_net"] - _display_df["net_spending_target"]
+        # Federal vs state tax breakout (federal = total − state, so it sums to the total).
+        if "state_tax" in _display_df.columns:
+            _display_df["federal_tax"] = _display_df["total_tax"] - _display_df["state_tax"]
 
         display_cols = [
             # ── Context ──────────────────────────────────────────
@@ -1162,8 +1257,8 @@ def main():
             "qual_dividends", "harvest_ltcg", "withdrawal_ltcg",
             # ── Tax calculation inputs ────────────────────────────
             "ordinary_income", "ltcg_income", "magi",
-            # ── Tax bill ─────────────────────────────────────────
-            "total_tax", "effective_tax_rate", "federal_irmaa", "healthcare_cost",
+            # ── Tax bill (federal vs state, then total) ──────────
+            "federal_tax", "state_tax", "total_tax", "effective_tax_rate", "federal_irmaa", "healthcare_cost",
             # ── Result ────────────────────────────────────────────
             "after_tax_spending", "actual_after_tax_net", "net_spending_delta", "surplus_reinvested",
             # ── End state ─────────────────────────────────────────
@@ -2042,16 +2137,40 @@ def main():
                 help="Change to explore different random draws with the same iteration count.",
             ))
 
-        # --- Robustness to the return-rate guess ---
+        # --- Conversion decision basis ---
         opt_robustness = 0.0
         opt_return_band = None
-        rob_on = st.checkbox(
-            "Robust to the return assumption",
-            value=False, key="opt_robust",
-            help="The Roth conversion decision is very sensitive to the assumed Roth return (the asset-location "
-                 "guess), so a single-rate optimum is fragile. When on, every strategy is scored across a band of "
-                 "Roth-return assumptions and ranked on a blend of expected and worst-case outcomes.",
+        opt_conv_objective = "wealth"
+        conv_basis = st.radio(
+            "How should the Roth conversion amount be decided?",
+            options=["Wealth-maximizing (default)", "Tax-rate smoothing (marginal-rate)"],
+            index=0, key="opt_conv_basis", horizontal=True,
+            help="Wealth-maximizing scores conversions on total legacy at your assumed returns — but if your Roth "
+                 "is assumed to out-earn pre-tax (asset location), that return premium is linear in dollars and "
+                 "pushes the answer to a corner (convert hard, or not at all), which flips with the return guess. "
+                 "Tax-rate smoothing instead decides the conversion on tax grounds only (equal returns, per the "
+                 "marginal-rate equivalency principle): convert up to where the conversion's marginal rate meets "
+                 "your expected future rate — a gradual amount — and reports the return premium separately.",
         )
+        if conv_basis.startswith("Tax-rate"):
+            opt_conv_objective = "tax_smoothing"
+            if use_v2:
+                st.info("Tax-smoothing runs on the **v1** optimizer. Switch the Optimizer Version to v1 to use it.")
+            else:
+                st.caption(
+                    "Conversions ranked on tax arbitrage only (Roth return premium neutralized to the global "
+                    f"{assumptions.get('retirement_return_rate', 0.0):.1%}); the asset-location premium is reported separately."
+                )
+
+        # --- Robustness to the return-rate guess (wealth objective only) ---
+        rob_on = False
+        if opt_conv_objective == "wealth":
+            rob_on = st.checkbox(
+                "Robust to the return assumption",
+                value=False, key="opt_robust",
+                help="Score every strategy across a band of Roth-return assumptions and rank on a blend of expected "
+                     "and worst-case outcomes, instead of a single fragile guess.",
+            )
         if rob_on and use_v2:
             st.info("Robust mode runs on the **v1** optimizer. Switch the Optimizer Version to v1 to use it.")
         elif rob_on:
@@ -2090,6 +2209,7 @@ def main():
                 else:
                     _opt_kwargs["return_band"] = opt_return_band
                     _opt_kwargs["robustness"] = opt_robustness
+                    _opt_kwargs["conversion_objective"] = opt_conv_objective
                     _opt_run_result = _opt.run_optimizer(**_opt_kwargs)
                 _opt_run_result["_version"] = "v2" if use_v2 else "v1"
             st.session_state["opt_result"] = _opt_run_result
@@ -2112,9 +2232,33 @@ def main():
             def _lft_tax(df):
                 return float(df["total_tax"].sum()) if df is not None and not df.empty else 0.0
 
+            def _lft_state_tax(df):
+                return float(df["state_tax"].sum()) if df is not None and not df.empty and "state_tax" in df.columns else 0.0
+
             def _final_port(df):
                 col = "tax_adj_total_portfolio" if (df is not None and "tax_adj_total_portfolio" in df.columns) else "total_portfolio"
                 return float(df[col].iloc[-1]) if df is not None and not df.empty else 0.0
+
+            def _tax_buckets(summary, df):
+                """End-of-plan balances split by tax treatment. Returns
+                (tax_free, pre_tax_nominal, pre_tax_after_heir_tax, taxable_other).
+                The pre-tax after-tax figure reuses the same effective discount baked
+                into tax_adj_total_portfolio so the buckets reconcile to that column."""
+                accts = (summary or {}).get("final_accounts", []) or []
+                tax_free = sum(a["balance"] for a in accts if a["type"] in ROTH_TYPES)
+                pre_tax = sum(a["balance"] for a in accts if a["type"] in TRADITIONAL_TYPES)
+                other = sum(a["balance"] for a in accts
+                            if a["type"] not in ROTH_TYPES | TRADITIONAL_TYPES)
+                # Recover the discount rate applied in tax_adj_total_portfolio:
+                # tax_adj = total − pre_tax × rate  ⇒  rate = (total − tax_adj) / pre_tax.
+                pre_tax_after = pre_tax
+                if df is not None and not df.empty and "tax_adj_total_portfolio" in df.columns:
+                    total = float(df["total_portfolio"].iloc[-1])
+                    tax_adj = float(df["tax_adj_total_portfolio"].iloc[-1])
+                    if pre_tax > 0:
+                        rate = max(0.0, min(1.0, (total - tax_adj) / pre_tax))
+                        pre_tax_after = pre_tax * (1 - rate)
+                return tax_free, pre_tax, pre_tax_after, other
 
             base_spend = _lft_spend(base_df)
             opt_spend = _lft_spend(best_df)
@@ -2137,6 +2281,10 @@ def main():
             _o_port  = round(opt_port)
             _b_roth  = round(base_roth_total)
             _o_roth  = round(opt_roth_total)
+            _b_state = round(_lft_state_tax(base_df))
+            _o_state = round(_lft_state_tax(best_df))
+            _b_fed   = _b_tax - _b_state   # federal = total − state (sums exactly)
+            _o_fed   = _o_tax - _o_state
 
             # --- Top-line comparison ---
             st.divider()
@@ -2145,6 +2293,8 @@ def main():
                 "Metric": [
                     "Lifetime After-Tax Income",
                     "Lifetime Taxes Paid",
+                    "    — Federal",
+                    "    — State",
                     "Tax-Adj. Final Portfolio",
                     "Total Roth Conversions",
                     "Portfolio Depleted",
@@ -2153,6 +2303,8 @@ def main():
                 "Baseline": [
                     f"${_b_spend:,}",
                     f"${_b_tax:,}",
+                    f"${_b_fed:,}",
+                    f"${_b_state:,}",
                     f"${_b_port:,}",
                     f"${_b_roth:,}",
                     f"Age {base_depl}" if base_depl else "No",
@@ -2161,6 +2313,8 @@ def main():
                 "Optimized": [
                     f"${_o_spend:,}",
                     f"${_o_tax:,}",
+                    f"${_o_fed:,}",
+                    f"${_o_state:,}",
                     f"${_o_port:,}",
                     f"${_o_roth:,}",
                     f"Age {opt_depl}" if opt_depl else "No",
@@ -2169,6 +2323,8 @@ def main():
                 "Change": [
                     f"${_o_spend - _b_spend:+,} ({(_o_spend - _b_spend) / max(_b_spend, 1):.1%})",
                     f"${_o_tax - _b_tax:+,} ({(_o_tax - _b_tax) / max(_b_tax, 1):.1%})",
+                    f"${_o_fed - _b_fed:+,}",
+                    f"${_o_state - _b_state:+,}",
                     f"${_o_port - _b_port:+,}",
                     f"${_o_roth - _b_roth:+,}",
                     "—",
@@ -2176,6 +2332,57 @@ def main():
                 ],
             }
             st.dataframe(pd.DataFrame(comparison_data), width='stretch', hide_index=True)
+
+            # --- End-of-plan portfolio by tax treatment (Roth-conversion payoff) ---
+            _b_free, _b_pre, _b_pre_at, _b_other = _tax_buckets(base_summary, base_df)
+            _o_free, _o_pre, _o_pre_at, _o_other = _tax_buckets(best_summary, best_df)
+            _b_tot = _b_free + _b_pre + _b_other
+            _o_tot = _o_free + _o_pre + _o_other
+            if _b_tot > 0 or _o_tot > 0:
+                st.markdown("**End-of-Plan Portfolio by Tax Treatment**")
+                st.caption(
+                    "What's left at the end of the plan, split by how it's taxed. A Roth conversion's "
+                    "payoff shows up here as dollars moving from **Pre-Tax** (still owed ordinary income "
+                    "tax — by you on withdrawal or by your heirs) into **Tax-Free (Roth)** (never taxed "
+                    "again). The *after heir tax* column nets the pre-tax bucket down to its real value."
+                )
+                _bucket_data = {
+                    "Tax treatment": [
+                        "Tax-Free (Roth)",
+                        "Pre-Tax (Traditional)",
+                        "    — after heir's tax",
+                        "Taxable & Cash",
+                        "Tax-free share",
+                    ],
+                    "Baseline": [
+                        f"${round(_b_free):,}",
+                        f"${round(_b_pre):,}",
+                        f"${round(_b_pre_at):,}",
+                        f"${round(_b_other):,}",
+                        f"{_b_free / max(_b_tot, 1):.0%}",
+                    ],
+                    "Optimized": [
+                        f"${round(_o_free):,}",
+                        f"${round(_o_pre):,}",
+                        f"${round(_o_pre_at):,}",
+                        f"${round(_o_other):,}",
+                        f"{_o_free / max(_o_tot, 1):.0%}",
+                    ],
+                    "Change": [
+                        f"${round(_o_free - _b_free):+,}",
+                        f"${round(_o_pre - _b_pre):+,}",
+                        f"${round(_o_pre_at - _b_pre_at):+,}",
+                        f"${round(_o_other - _b_other):+,}",
+                        f"{(_o_free / max(_o_tot, 1)) - (_b_free / max(_b_tot, 1)):+.0%}",
+                    ],
+                }
+                st.dataframe(pd.DataFrame(_bucket_data), width='stretch', hide_index=True)
+                if _o_free - _b_free > 1000:
+                    st.success(
+                        f"💡 The optimized plan ends with **${round(_o_free - _b_free):,} more in tax-free "
+                        f"Roth dollars** — that's the conversion payoff: money that will never be taxed "
+                        "again, versus pre-tax dollars that still owe ordinary income tax."
+                    )
 
             # Plain-English explanation of why the optimized strategy wins
             _why_parts = []
@@ -2191,6 +2398,105 @@ def main():
                 st.info("💡 **Why this strategy wins:** The optimized plan delivers " + ", and ".join(_why_parts) + ". Apply the recommended settings below to activate it.")
             elif _b_spend - _o_spend > 1000:
                 st.info("💡 The optimizer found no significant improvement over your current settings — your plan is already well-configured.")
+
+            # --- Suggested conversion fill-to rate (total-return sweep) ---
+            _fc = opt_result.get("fill_rate_curve")
+            if _fc and _fc.get("curve"):
+                st.divider()
+                st.subheader("Suggested Conversion Fill-To Rate")
+                _sug = _fc.get("suggested_rate")
+                st.caption(
+                    "Each row converts during your gap years up to that marginal-rate ceiling, scored on your "
+                    "**total** after-tax outcome at your real returns — RMD avoidance, the 0%-capital-gains-harvest "
+                    "opportunity cost, the conversion-tax funding drag, and any Roth return premium all included. "
+                    "The optimizer suggests the peak of this curve."
+                )
+                _fc_rows = []
+                for c in _fc["curve"]:
+                    _fc_rows.append({
+                        "Fill conversions to": "No conversion" if c["rate"] == 0 else f"{c['rate']:.0%} bracket",
+                        "Total after-tax score": f"${c['score']:,.0f}",
+                        "Tax-adj. legacy": f"${c['legacy']:,.0f}",
+                        "Lifetime fed tax": f"${c.get('lifetime_federal_tax', c['lifetime_tax'] - c.get('lifetime_state_tax', 0.0)):,.0f}",
+                        "Lifetime state tax": f"${c.get('lifetime_state_tax', 0.0):,.0f}",
+                        "Lifetime tax": f"${c['lifetime_tax']:,.0f}",
+                        "Suggested": "✅" if c["rate"] == _sug else "",
+                    })
+                st.dataframe(pd.DataFrame(_fc_rows), width='stretch', hide_index=True)
+                if _sug == 0:
+                    st.warning(
+                        "Suggested: **no conversion**. On a total-return basis your gap years are worth more for "
+                        "0%-bracket capital-gains harvesting than for conversions, and the conversion tax would be "
+                        "funded by realizing gains — so converting nets negative here."
+                    )
+                elif _fc.get("monotonic_corner"):
+                    st.info(
+                        f"Suggested: **fill to {_sug:.0%}** — the top of the tested range, so the total-return-optimal "
+                        "conversion here is 'as much as the bracket allows', an all-or-nothing tilt usually driven by "
+                        "an assumed Roth return premium. Use Tax-rate smoothing above to see the premium isolated."
+                    )
+                else:
+                    st.success(
+                        f"Suggested fill-to rate: **{_sug:.0%}** — a specific, gradual ceiling. Converting up to the "
+                        f"{_sug:.0%} bracket each gap year maximizes your total after-tax outcome; filling higher pushes "
+                        "marginal conversions into brackets that cost more now than they save later."
+                    )
+
+            # --- Tax-smoothing rationale (marginal-rate conversion objective) ---
+            if opt_result.get("conversion_objective") == "tax_smoothing":
+                st.divider()
+                st.subheader("Conversion Rationale (Tax-Smoothing)")
+                _eqr = opt_result.get("equal_return_rate", 0.0)
+                _pa = best.get("premium_analysis", {})
+                _tax_v = _pa.get("tax_value", 0.0)
+                _prem_v = _pa.get("premium_value", 0.0)
+                _conv_on = best["roth_conversion"].get("enabled")
+
+                st.caption(
+                    "The conversion amount is decided on **tax grounds only** — every plan is scored with the Roth "
+                    f"return premium removed (all growth at the global **{_eqr:.1%}**), per the marginal-rate "
+                    "equivalency principle. The return premium is reported separately below, so it informs you "
+                    "without dictating the recommendation."
+                )
+                if _conv_on:
+                    st.success(
+                        f"💡 **Tax-justified conversion:** the marginal-rate rule supports this conversion — it saves "
+                        f"an estimated **${_tax_v:,.0f}** in lifetime tax terms (legacy, equal returns) vs. not converting."
+                    )
+                else:
+                    st.warning(
+                        "💡 **On tax grounds, no Roth conversion is justified here.** This couple's future marginal "
+                        "rate isn't above the rate they'd convert at, so converting only pays tax early without a "
+                        "rate arbitrage. Any case for converting rests entirely on the return premium below — an "
+                        "allocation bet on the Roth out-earning pre-tax, not a tax saving."
+                    )
+
+                _agg = opt_result.get("aggressive_reference")
+                rows = [{
+                    "Plan": "Recommended (tax-smoothing)",
+                    "Conversion": _opt._describe_strategy(
+                        best["withdrawal_strategy"], best["roth_conversion"], accounts_at_retirement
+                    ).get("Conversion Method", "None") if best["roth_conversion"].get("enabled") else "None",
+                    "Tax-arbitrage value": f"${_tax_v:,.0f}",
+                    "Asset-location premium (the return bet)": f"${_prem_v:,.0f}",
+                }]
+                if _agg:
+                    _apa = _agg.get("premium_analysis", {})
+                    rows.append({
+                        "Plan": "Aggressive (fill 24% — chase the premium)",
+                        "Conversion": "Fill to 24% bracket, gap years",
+                        "Tax-arbitrage value": f"${_apa.get('tax_value', 0.0):,.0f}",
+                        "Asset-location premium (the return bet)": f"${_apa.get('premium_value', 0.0):,.0f}",
+                    })
+                st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+                st.caption(
+                    "**Tax-arbitrage value** = legacy gain from converting, returns held equal (the genuine tax case). "
+                    "**Asset-location premium** = extra legacy purely because the Roth is assumed to out-earn pre-tax — "
+                    "real only if that return gap holds, and it's an *allocation* choice (hold your highest-return assets "
+                    "in the Roth) rather than a reason to convert. A large negative tax-arbitrage value with a large "
+                    "positive premium (typical of the aggressive plan) means the conversion is a return bet wearing a "
+                    "tax strategy's clothes."
+                )
 
             # --- Robustness profile across the return band ---
             _band = opt_result.get("return_band")
@@ -2251,7 +2557,7 @@ def main():
                 act_fmt["Eff. Tax Rate"] = "{:.1%}"
 
                 _acct_cols    = {a["name"] for a in accounts_at_retirement}
-                _expense_cols = {"Taxes", "Healthcare"}
+                _expense_cols = {"Fed Tax", "State Tax", "Taxes", "Healthcare"}
                 _income_cols  = {"SS & Passive Income", "Ordinary Income"}
                 _draw_cols    = {"Portfolio Draw"}
                 _spend_cols   = {"Total Spend"}
@@ -2312,7 +2618,7 @@ def main():
                     annual_rebalance_gain=best.get("annual_rebalance_gain", 0.0),
                 )
             else:
-                desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement, best.get("annual_rebalance_gain", 0.0))
+                desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement, best.get("annual_rebalance_gain", 0.0), best.get("cash_reserve", 0.0))
             desc_df = pd.DataFrame(
                 [{"Setting": k, "Recommended Value": v} for k, v in desc.items()]
             )
@@ -2359,36 +2665,49 @@ def main():
                 width='stretch',
             )
 
-            # --- Score distribution ---
+            # --- How the trial strategies compare to your current plan ---
             st.divider()
-            st.subheader("Score Distribution Across Trials")
+            st.subheader("How the Trial Strategies Compare to Your Current Plan")
             all_scores = opt_result.get("all_scores", [])
-            if len(all_scores) > 1:
+            base_s = base["score"]
+            if len(all_scores) > 1 and base_s not in (None, float("-inf")):
+                # Re-express the abstract optimizer score as dollars BETTER or WORSE than the
+                # user's current plan (baseline = 0). The score is already a blended after-tax
+                # dollar figure (lifetime spending − 30%×taxes + legacy weight × legacy), so the
+                # difference vs. baseline reads as "this strategy is worth ~$X more/less than what
+                # you have now."
+                deltas = [s - base_s for s in all_scores if s != float("-inf")]
+                best_delta = best["score"] - base_s
+                n_better = sum(1 for d in deltas if d > 0)
+
                 score_fig = go.Figure()
                 score_fig.add_trace(go.Histogram(
-                    x=all_scores, nbinsx=40, marker_color="steelblue", opacity=0.75,
+                    x=deltas, nbinsx=40, marker_color="steelblue", opacity=0.75,
                 ))
                 score_fig.add_vline(
-                    x=base["score"], line_dash="dash", line_color="orange",
-                    annotation_text="Baseline", annotation_position="top right",
+                    x=0, line_dash="dash", line_color="orange",
+                    annotation_text="Your current plan", annotation_position="top right",
                 )
                 score_fig.add_vline(
-                    x=best["score"], line_dash="dash", line_color="green",
-                    annotation_text="Best Found", annotation_position="top left",
+                    x=best_delta, line_dash="dash", line_color="green",
+                    annotation_text="Best found", annotation_position="top left",
                 )
                 score_fig.update_layout(
-                    title="Optimizer Score Distribution (higher = better)",
-                    xaxis_title="Score",
-                    yaxis_title="Count",
+                    title="Each bar = a candidate strategy · right of the orange line = better than your current plan",
+                    xaxis_title="Lifetime value vs. your current plan ($)",
+                    yaxis_title="Number of strategies",
                     showlegend=False,
                     height=300,
                     margin=dict(t=40, b=30),
                 )
+                score_fig.update_xaxes(tickprefix="$", tickformat=".2s")
                 st.plotly_chart(score_fig, width='stretch')
                 st.caption(
-                    f"Orange dashed = baseline ({base['score']:,.0f}). "
-                    f"Green dashed = best found ({best['score']:,.0f}). "
-                    f"Score = lifetime after-tax income − 30% × taxes + {opt_legacy:.0%} × tax-adjusted final portfolio."
+                    f"**{n_better:,} of {len(deltas):,}** tested strategies beat your current plan; the best found is "
+                    f"worth about **${best_delta:,.0f} more** than what you have now. "
+                    "“Value” blends lifetime after-tax spending, taxes paid, and tax-adjusted money left at the end — "
+                    f"specifically lifetime after-tax income − 30% of taxes + {opt_legacy:.0%} of final legacy — so a "
+                    "strategy to the right delivers more of that combined after-tax benefit than your current settings."
                 )
 
 

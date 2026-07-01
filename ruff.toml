@@ -1,0 +1,12 @@
+# Lint configuration. Run `ruff check .` before cutting a release (see CLAUDE.md).
+target-version = "py311"
+line-length = 120
+
+[lint]
+# pyflakes (F) + a pragmatic subset of pycodestyle (E) — catches unused imports,
+# empty f-strings, misplaced imports, and multiple-statements-per-line.
+select = ["F", "E4", "E7", "E9"]
+
+[lint.per-file-ignores]
+# Tests use local imports inside fixtures/among sections by design.
+"test_retirement.py" = ["E402"]

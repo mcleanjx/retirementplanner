@@ -22,10 +22,60 @@ TAXABLE_TYPES = {"taxable", "reit"}
 BRACKET_OPTIONS = [0.10, 0.12, 0.22, 0.24]
 WITHDRAWAL_STRATEGIES = ["tax_efficient", "roth_preservation"]
 REBALANCE_OPTIONS = [0, 0, 0, 10_000, 25_000, 50_000, 75_000, 100_000, 150_000, 200_000]
+# Pre-retirement taxable→cash reallocation the optimizer may trial alongside a Roth
+# conversion. Holding extra cash at retirement lets the early-year conversion taxes be
+# paid from cash instead of by selling appreciated taxable lots (which in CA realize
+# gains at ~33% mid-conversion) — a synergy the optimizer otherwise can't discover
+# because it treats `accounts_at_retirement` as fixed. Heavily zero-weighted so the
+# no-reserve plan stays well-explored; only sampled when a conversion is enabled and a
+# gainful taxable account + a bank account both exist. See CONSIDERATIONS.md.
+RESERVE_OPTIONS = [0, 0, 0, 0, 250_000, 500_000, 1_000_000, 1_500_000, 2_000_000]
 
 # 401(k) accounts require separation from service before the funds can be moved at all.
 # Traditional IRAs have no such restriction and can be converted at any age.
 SEPARATION_REQUIRED_TYPES = {"traditional_401k"}
+
+
+def _max_cash_reserve(accounts: list) -> float:
+    """Total taxable balance that could be moved into cash (the funding ceiling for a
+    reserve). Zero when there is no bank account to hold the reserve."""
+    if not any(a["type"] == "bank" for a in accounts):
+        return 0.0
+    return sum(a["balance"] for a in accounts if a["type"] in TAXABLE_TYPES)
+
+
+def _apply_cash_reserve(accounts: list, reserve: float) -> list:
+    """Return account balances with `reserve` dollars shifted from taxable accounts into
+    the bank account, keeping total wealth constant.
+
+    This is the counterfactual "held the cash all along" reallocation (the half-day
+    version in CONSIDERATIONS.md): taxable balance and basis are drawn down pro-rata so
+    the remaining lots keep their gain ratio, and the bank receives the cash with full
+    basis. It does NOT model realizing the embedded gain when the reserve is set up, so
+    it slightly flatters the reserve by skipping that one-time tax — the more accurate
+    "setup-year realization" variant (realize at the retirement year's 0–15% rate) is the
+    documented follow-up. Returns the SAME list object unchanged when reserve <= 0 (so
+    the common no-reserve trial pays no copy cost and behaves exactly as before)."""
+    if reserve <= 0:
+        return accounts
+    bank = next((a for a in accounts if a["type"] == "bank"), None)
+    taxable = [a for a in accounts if a["type"] in TAXABLE_TYPES and a["balance"] > 0]
+    if bank is None or not taxable:
+        return accounts
+    total_taxable = sum(a["balance"] for a in taxable)
+    move = min(reserve, total_taxable)
+    if move <= 0:
+        return accounts
+    fresh = copy.deepcopy(accounts)
+    bank = next(a for a in fresh if a["type"] == "bank")
+    for a in fresh:
+        if a["type"] in TAXABLE_TYPES and a["balance"] > 0:
+            basis_ratio = a.get("basis", a["balance"]) / a["balance"]
+            share = (a["balance"] / total_taxable) * move
+            a["balance"] -= share
+            a["basis"] = max(0.0, a.get("basis", a["balance"]) - share * basis_ratio)
+    bank["balance"] += move
+    return fresh
 
 
 def _owner_min_conv_age(account: dict, profile: dict) -> int:
@@ -67,8 +117,14 @@ def _owner_min_conv_age(account: dict, profile: dict) -> int:
     return int(owner_ret_as_primary_age)
 
 
-def _sample_strategy(profile: dict, accounts: list, rng: random.Random) -> tuple[str, dict, float]:
-    """Randomly sample a complete retirement strategy configuration."""
+def _sample_strategy(profile: dict, accounts: list, rng: random.Random) -> tuple[str, dict, float, float]:
+    """Randomly sample a complete retirement strategy configuration.
+
+    Returns (withdrawal_strategy, roth_conversion, annual_rebalance_gain, cash_reserve).
+    `cash_reserve` is the pre-retirement taxable→cash reallocation (see RESERVE_OPTIONS);
+    it is only sampled non-zero when a Roth conversion is enabled for the trial, because
+    its whole point is funding conversion taxes from cash rather than selling appreciated
+    lots."""
     life_expectancy = profile.get("life_expectancy", 90)
     ss_start = profile.get("social_security_start_age", 67)
 
@@ -118,8 +174,9 @@ def _sample_strategy(profile: dict, accounts: list, rng: random.Random) -> tuple
         )
 
         if min_conv_age > conv_max_end:
-            # No viable window — skip Roth conversion for this trial
-            return withdrawal_strategy, {"enabled": False}
+            # No viable window — skip Roth conversion (and the reserve, which only funds
+            # conversion taxes) for this trial.
+            return withdrawal_strategy, {"enabled": False}, 0.0, 0.0
 
         if aggressive:
             # Earliest start, full window, fill to a bracket (never a small fixed amount).
@@ -153,7 +210,16 @@ def _sample_strategy(profile: dict, accounts: list, rng: random.Random) -> tuple
     has_gains = any(a["balance"] > a.get("basis", a["balance"]) for a in taxable_accounts)
     annual_rebalance_gain = float(rng.choice(REBALANCE_OPTIONS)) if has_gains else 0.0
 
-    return withdrawal_strategy, rc, annual_rebalance_gain
+    # Pre-retirement cash reserve: only meaningful when a conversion is enabled (it funds
+    # the conversion taxes) and there is taxable money to move into a bank account.
+    cash_reserve = 0.0
+    if rc.get("enabled"):
+        max_reserve = _max_cash_reserve(accounts)
+        if max_reserve > 0:
+            options = [r for r in RESERVE_OPTIONS if r <= max_reserve]
+            cash_reserve = float(rng.choice(options)) if options else 0.0
+
+    return withdrawal_strategy, rc, annual_rebalance_gain, cash_reserve
 
 
 def _score(ret_df: pd.DataFrame, summary: dict, legacy_weight: float) -> float:
@@ -313,17 +379,268 @@ def _evaluate_across_band(
     return _robust_score(scores, robustness), scores, band_metrics, center_df, center_summary
 
 
-def _describe_strategy(withdrawal_strategy: str, rc: dict, accounts: list, annual_rebalance_gain: float = 0.0) -> dict:
+# ---------------------------------------------------------------------------
+# Tax-smoothing (marginal-rate) conversion objective
+# ---------------------------------------------------------------------------
+# A deterministic, constant-return wealth maximization makes Roth conversion a
+# bang-bang problem: because an assumed Roth return premium (asset location) is
+# LINEAR in converted dollars, it swamps the convex tax structure and the optimum
+# snaps to a corner (fill the top bracket, or convert nothing). That flip-flops
+# with the return guess — the artifact the user observed.
+#
+# The finance literature (Kitces' "marginal tax rate equivalency"; the FPA
+# "arithmetic of Roth conversions") says the conversion decision should be made on
+# TAX-RATE grounds only — the return rate is mathematically irrelevant to whether a
+# conversion pays off, because it scales both sides equally. Converting up to the
+# point where the conversion's marginal tax rate equals the expected FUTURE marginal
+# rate is an interior, gradual fill — not a corner.
+#
+# Tax-smoothing mode implements that: it scores every candidate at EQUAL returns
+# (Roth premium neutralized to the global rate), so the ranking reflects only tax
+# arbitrage and lands on the interior fill-to-your-future-rate amount. The asset-
+# location premium is then reported SEPARATELY (real-return legacy minus equal-return
+# legacy) so it informs the user without hijacking the recommendation.
+
+
+def _legacy(ret_df: pd.DataFrame) -> float:
+    """Final tax-adjusted portfolio (legacy) in dollars, or 0 for an empty run."""
+    if ret_df is None or ret_df.empty:
+        return 0.0
+    col = "tax_adj_total_portfolio" if "tax_adj_total_portfolio" in ret_df.columns else "total_portfolio"
+    return float(ret_df[col].iloc[-1])
+
+
+def _gap_conversion_window(accounts: list, profile: dict):
+    """(start_age, end_age, trad_accounts, roth_accounts) for the gap-year conversion
+    window — earliest legal conversion age through the year before RMDs/SS. None if a
+    conversion isn't applicable (no traditional source or no Roth destination)."""
+    trad = [a for a in accounts if a["type"] in TRADITIONAL_TYPES]
+    roth = [a for a in accounts if a["type"] in ROTH_TYPES]
+    if not trad or not roth:
+        return None
+    min_conv_age = max(
+        max(_owner_min_conv_age(a, profile) for a in trad),
+        profile.get("current_age", 60),
+    )
+    conv_max_end = max(
+        min_conv_age + 1,
+        min(RMD_START_AGE - 1,
+            profile.get("social_security_start_age", 67) - 1,
+            profile.get("life_expectancy", 90) - 5),
+    )
+    return int(min_conv_age), int(conv_max_end), trad, roth
+
+
+def _fill_to_rc(accounts: list, profile: dict, assumptions: dict, bracket: float) -> Optional[dict]:
+    """Canonical gap-year conversion: fill to `bracket` from every traditional account,
+    routed to the highest-returning Roth (best asset location). None if N/A."""
+    w = _gap_conversion_window(accounts, profile)
+    if w is None:
+        return None
+    start, end, trad, roth = w
+    g = assumptions.get("retirement_return_rate", 0.07)
+
+    def _eff(a):
+        return a["return_rate"] if not a.get("use_global_return_rate", True) else g
+
+    dest = max(roth, key=_eff)
+    return {
+        "enabled": True, "strategy": "fill_to_bracket", "target_bracket": bracket,
+        "fixed_amount": 0.0, "start_age": start, "end_age": end,
+        "source_account_ids": [a["id"] for a in trad],
+        "destination_account_id": dest["id"],
+    }
+
+
+def _aggressive_reference_rc(accounts: list, profile: dict, assumptions: dict) -> Optional[dict]:
+    """A canonical 'chase the premium' conversion: fill the 24% bracket across the gap
+    years. Contrast figure for the tax-smoothing decomposition."""
+    return _fill_to_rc(accounts, profile, assumptions, 0.24)
+
+
+# Marginal-rate ceilings a gap-year conversion can target (federal ordinary brackets).
+FILL_TO_RATES = [0.0, 0.10, 0.12, 0.22, 0.24, 0.32, 0.35]
+
+
+def compute_fill_rate_curve(
+    accounts: list,
+    profile: dict,
+    assumptions: dict,
+    spending_overrides: Optional[dict],
+    legacy_weight: float,
+    rates: Optional[list[float]] = None,
+) -> dict:
+    """Sweep the conversion fill-to marginal-rate ceiling and score each on the user's
+    TOTAL after-tax outcome (full simulation at real returns — so RMD avoidance, the
+    0%-LTCG-harvest opportunity cost, conversion-tax funding, and any return premium are
+    all priced in). The optimizer's suggested fill-to rate is the peak of this curve.
+
+    rate 0.0 = no conversion. Returns {"curve": [...], "suggested_rate": float|None,
+    "monotonic_corner": bool} where each curve point carries score, legacy, lifetime tax,
+    and lifetime after-tax spending.
+    """
+    rates = rates if rates is not None else FILL_TO_RATES
+    curve: list[dict] = []
+    for br in rates:
+        rc = {"enabled": False} if br == 0.0 else _fill_to_rc(accounts, profile, assumptions, br)
+        if rc is None:
+            continue
+        try:
+            df, summ = simulate_retirement(accounts, profile, assumptions, rc, spending_overrides)
+        except Exception:
+            continue
+        _ltax = float(df["total_tax"].sum()) if not df.empty else 0.0
+        _lstate = float(df["state_tax"].sum()) if not df.empty and "state_tax" in df.columns else 0.0
+        curve.append({
+            "rate": br,
+            "score": _score(df, summ, legacy_weight),
+            "legacy": _legacy(df),
+            "lifetime_tax": _ltax,
+            "lifetime_state_tax": _lstate,
+            "lifetime_federal_tax": _ltax - _lstate,
+            "after_tax_spend": float(df["actual_after_tax_net"].sum()) if not df.empty else 0.0,
+        })
+    if not curve:
+        return {"curve": [], "suggested_rate": None, "monotonic_corner": False}
+    best = max(curve, key=lambda c: c["score"])
+    sampled = [c["rate"] for c in curve]
+    monotonic_corner = best["rate"] in (min(sampled), max(sampled))
+    return {"curve": curve, "suggested_rate": best["rate"], "monotonic_corner": monotonic_corner}
+
+
+def _run_tax_smoothing(
+    accounts_at_retirement: list,
+    profile: dict,
+    assumptions: dict,
+    roth_conversion_baseline: Optional[dict],
+    spending_overrides: Optional[dict],
+    n_iterations: int,
+    legacy_weight: float,
+    seed: int,
+) -> dict:
+    """Rank conversion strategies by tax arbitrage alone (equal returns), then attach
+    a tax-vs-premium decomposition computed at the user's real returns. See module note.
+    """
+    rng = random.Random(seed)
+    global_rate = assumptions.get("retirement_return_rate", 0.07)
+    eval_accounts = _apply_roth_return(accounts_at_retirement, global_rate)  # premium-neutralized → scoring
+    real_accounts = accounts_at_retirement                                   # actual returns → display
+
+    def _sim(accounts, ta, rc):
+        df, summ = simulate_retirement(accounts, profile, ta, rc, spending_overrides)
+        return _score(df, summ, legacy_weight), df, summ
+
+    # Pure tax-arbitrage baseline: not converting, scored at equal returns.
+    _, noconv_equal_df, _ = _sim(eval_accounts, assumptions, {"enabled": False})
+    noconv_equal_legacy = _legacy(noconv_equal_df)
+
+    def _decompose(ta, rc, cash_reserve=0.0):
+        """Equal-return rank score + real-return display sim + tax/premium split."""
+        eq_score, eq_df, _ = _sim(_apply_cash_reserve(eval_accounts, cash_reserve), ta, rc)
+        _, real_df, real_summary = _sim(_apply_cash_reserve(real_accounts, cash_reserve), ta, rc)
+        analysis = {
+            "legacy_equal": _legacy(eq_df),
+            "legacy_real": _legacy(real_df),
+            "premium_value": _legacy(real_df) - _legacy(eq_df),      # asset-location bet
+            "tax_value": _legacy(eq_df) - noconv_equal_legacy,        # genuine tax arbitrage
+        }
+        return eq_score, real_df, real_summary, analysis
+
+    # Baseline (current settings)
+    base_score, base_df, base_summary, base_analysis = _decompose(
+        assumptions, roth_conversion_baseline or {"enabled": False}
+    )
+    baseline_result = {
+        "score": base_score,
+        "premium_analysis": base_analysis,
+        "withdrawal_strategy": assumptions.get("withdrawal_strategy", "tax_efficient"),
+        "roth_conversion": copy.deepcopy(roth_conversion_baseline) or {"enabled": False},
+        "annual_rebalance_gain": assumptions.get("annual_rebalance_gain", 0.0),
+        "cash_reserve": 0.0,
+        "ret_df": base_df, "summary": base_summary,
+        "label": "Baseline (Current Settings)",
+    }
+
+    # --- Random search, ranked on tax arbitrage only ---
+    results: list[dict] = []
+    all_scores: list[float] = []
+    n_evaluated = 0
+    for _ in range(n_iterations):
+        try:
+            w_strat, rc, reb, cash_reserve = _sample_strategy(profile, accounts_at_retirement, rng)
+            ta = {**assumptions, "withdrawal_strategy": w_strat, "annual_rebalance_gain": reb}
+            eq_score, _, _ = _sim(_apply_cash_reserve(eval_accounts, cash_reserve), ta, rc)
+        except Exception:
+            continue
+        n_evaluated += 1
+        all_scores.append(eq_score)
+        results.append({
+            "score": eq_score,
+            "withdrawal_strategy": w_strat,
+            "roth_conversion": rc,
+            "annual_rebalance_gain": reb,
+            "cash_reserve": cash_reserve,
+            "label": "Optimized",
+        })
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+
+    # Attach real-return sims + tax/premium decomposition to the contenders shown.
+    for r in results[:10]:
+        ta = {**assumptions, "withdrawal_strategy": r["withdrawal_strategy"],
+              "annual_rebalance_gain": r["annual_rebalance_gain"]}
+        _, df, summ, analysis = _decompose(ta, r["roth_conversion"], r.get("cash_reserve", 0.0))
+        r["ret_df"], r["summary"], r["premium_analysis"] = df, summ, analysis
+
+    best_result = results[0] if results else copy.deepcopy(baseline_result)
+    best_result["label"] = "Optimized"
+
+    # Contrast figure: what aggressively chasing the premium would add (and how much
+    # of that is premium vs. tax) — so the user sees the bet they're declining.
+    aggressive_ref = None
+    agg_rc = _aggressive_reference_rc(accounts_at_retirement, profile, assumptions)
+    if agg_rc is not None:
+        try:
+            _, _, _, agg_analysis = _decompose(assumptions, agg_rc)
+            aggressive_ref = {"roth_conversion": agg_rc, "premium_analysis": agg_analysis}
+        except Exception:
+            aggressive_ref = None
+
+    return {
+        "baseline_result": baseline_result,
+        "best_result": best_result,
+        "top_results": results[:10],
+        "n_evaluated": n_evaluated,
+        "all_scores": all_scores,
+        "conversion_objective": "tax_smoothing",
+        "equal_return_rate": global_rate,
+        "noconv_equal_legacy": noconv_equal_legacy,
+        "aggressive_reference": aggressive_ref,
+        "fill_rate_curve": compute_fill_rate_curve(
+            accounts_at_retirement, profile, assumptions, spending_overrides, legacy_weight
+        ),
+        "return_band": None,
+        "robustness": 0.0,
+    }
+
+
+def _describe_strategy(withdrawal_strategy: str, rc: dict, accounts: list,
+                       annual_rebalance_gain: float = 0.0, cash_reserve: float = 0.0) -> dict:
     """Build a human-readable description of a strategy configuration."""
     ws_label = "Tax Efficient" if withdrawal_strategy == "tax_efficient" else "Roth Preservation"
 
     rebalance_label = f"${annual_rebalance_gain:,.0f}/yr (sell-and-rebuy taxable positions)" if annual_rebalance_gain > 0 else "Disabled"
+    reserve_label = (
+        f"${cash_reserve:,.0f} moved taxable→cash at retirement (funds early conversion taxes "
+        f"without selling appreciated lots)" if cash_reserve > 0 else "None"
+    )
 
     if not rc.get("enabled"):
         return {
             "Withdrawal Strategy": ws_label,
             "Roth Conversion": "Disabled",
             "Taxable Rebalancing": rebalance_label,
+            "Pre-Retirement Cash Reserve": reserve_label,
         }
 
     strat = rc.get("strategy", "fill_to_bracket")
@@ -366,6 +683,7 @@ def _describe_strategy(withdrawal_strategy: str, rc: dict, accounts: list, annua
         "Conversion Ages (primary person)": f"{start_age} – {rc.get('end_age', '?')}",
         "Eligibility Notes": " | ".join(eligibility_notes),
         "Taxable Rebalancing": rebalance_label,
+        "Pre-Retirement Cash Reserve": reserve_label,
     }
 
 
@@ -420,8 +738,14 @@ def build_actions_table(ret_df: pd.DataFrame, rc: dict, accounts: list) -> pd.Da
         rec["Gain Harvest"]     = float(row.get("harvest_ltcg",      0.0))
         rec["Rebalance Gain"]   = float(row.get("rebalance_ltcg",    0.0))
 
-        # Expense breakdown (informational — funded by account withdrawals above)
-        rec["Taxes"]       = -float(row.get("total_tax",            0.0))
+        # Expense breakdown (informational — funded by account withdrawals above).
+        # Taxes split into federal vs state; federal = total − state so it always sums
+        # exactly to the total (federal = ordinary + LTCG + NIIT + IRMAA).
+        _total_tax = float(row.get("total_tax",  0.0))
+        _state_tax = float(row.get("state_tax",  0.0))
+        rec["Fed Tax"]     = -(_total_tax - _state_tax)
+        rec["State Tax"]   = -_state_tax
+        rec["Taxes"]       = -_total_tax
         rec["Healthcare"]  = -float(row.get("healthcare_cost",     0.0))
         rec["Total Spend"] =  float(row.get("actual_after_tax_net", 0.0))
 
@@ -460,9 +784,17 @@ def run_optimizer(
     seed: int = 42,
     return_band: Optional[list[float]] = None,
     robustness: float = 0.0,
+    conversion_objective: str = "wealth",
 ) -> dict:
     """
     Run the strategy optimizer over `n_iterations` random trials.
+
+    Conversion objective: "wealth" (default) maximizes the composite legacy/spending
+    score under the user's actual returns — this can recommend an aggressive corner
+    when an assumed Roth return premium dominates. "tax_smoothing" instead ranks
+    conversions at equal returns (premium neutralized), per the marginal-rate
+    equivalency principle, yielding a gradual fill-to-your-future-rate amount, and
+    reports the asset-location premium separately (see `_run_tax_smoothing`).
 
     Robust mode (opt-in): pass `return_band` (a list of Roth-return assumptions,
     e.g. from `default_return_band`) to score every candidate across that band
@@ -480,6 +812,12 @@ def run_optimizer(
         return_band      – the band used (None if not in robust mode)
         robustness       – the λ used
     """
+    if conversion_objective == "tax_smoothing":
+        return _run_tax_smoothing(
+            accounts_at_retirement, profile, assumptions, roth_conversion_baseline,
+            spending_overrides, n_iterations, legacy_weight, seed,
+        )
+
     rng = random.Random(seed)
 
     robust_mode = bool(return_band) and len(return_band) > 1
@@ -508,6 +846,7 @@ def run_optimizer(
         "withdrawal_strategy": assumptions.get("withdrawal_strategy", "tax_efficient"),
         "roth_conversion": copy.deepcopy(roth_conversion_baseline) or {"enabled": False},
         "annual_rebalance_gain": assumptions.get("annual_rebalance_gain", 0.0),
+        "cash_reserve": 0.0,
         "ret_df": base_df,
         "summary": base_summary,
         "label": "Baseline (Current Settings)",
@@ -519,12 +858,15 @@ def run_optimizer(
     n_evaluated = 0
 
     for _ in range(n_iterations):
-        w_strat, rc, annual_rebalance_gain = _sample_strategy(profile, accounts_at_retirement, rng)
+        w_strat, rc, annual_rebalance_gain, cash_reserve = _sample_strategy(profile, accounts_at_retirement, rng)
         trial_assumptions = {**assumptions, "withdrawal_strategy": w_strat, "annual_rebalance_gain": annual_rebalance_gain}
+        # A reserving trial reallocates taxable→cash on a FRESH copy of every band variant
+        # so the shared `accounts_at_retirement` is never mutated. No-op (same refs) at 0.
+        trial_variants = [_apply_cash_reserve(v, cash_reserve) for v in account_variants]
 
         try:
             sc, band_scores, band_metrics, ret_df, sim_summary = _evaluate_across_band(
-                account_variants, profile, trial_assumptions, rc,
+                trial_variants, profile, trial_assumptions, rc,
                 spending_overrides, legacy_weight, robustness, center_idx,
             )
             n_evaluated += 1
@@ -536,6 +878,7 @@ def run_optimizer(
                 "withdrawal_strategy": w_strat,
                 "roth_conversion": rc,
                 "annual_rebalance_gain": annual_rebalance_gain,
+                "cash_reserve": cash_reserve,
                 "ret_df": ret_df,
                 "summary": sim_summary,
                 "label": "Optimized",
@@ -555,4 +898,7 @@ def run_optimizer(
         "all_scores": all_scores,
         "return_band": return_band if robust_mode else None,
         "robustness": robustness,
+        "fill_rate_curve": compute_fill_rate_curve(
+            accounts_at_retirement, profile, assumptions, spending_overrides, legacy_weight
+        ),
     }
