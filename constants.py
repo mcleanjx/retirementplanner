@@ -64,6 +64,32 @@ IRMAA_TIERS = [
 ]
 MEDICARE_PART_B_BASE_MONTHLY = 202.90  # per person
 
+# --- ACA Premium Tax Credit (pre-65 marketplace coverage) ---
+# The ARPA/IRA subsidy expansion (8.5% MAGI cap, no upper income limit) expired at the
+# end of 2025, so for the 2026 plan year the pre-ARPA structure is back in force: a hard
+# 400%-FPL cliff above which no premium tax credit is available, and a sliding
+# "applicable percentage" of MAGI the household is expected to contribute below it.
+#
+# Federal Poverty Level (48 contiguous states + DC). Chosen so 400% × FPL reproduces the
+# ACA cliffs optimizer_v2 already uses ($62,700 single / $84,600 household of 2).
+FPL_BASE = 15_675.0            # 1-person household
+FPL_PER_ADDITIONAL = 5_475.0  # each additional household member
+ACA_FPL_CLIFF_RATIO = 4.0     # 400% FPL — above this the credit disappears entirely
+
+# Applicable percentage schedule: (income as a fraction of FPL, expected contribution as a
+# fraction of MAGI). Linearly interpolated between anchors; flat below the first / above the
+# last anchor (and zeroed entirely once income exceeds ACA_FPL_CLIFF_RATIO). Mirrors the
+# pre-ARPA (2021) table that returns in 2026.
+ACA_APPLICABLE_PCT = [
+    (1.00, 0.0207),
+    (1.33, 0.0207),
+    (1.50, 0.0414),
+    (2.00, 0.0652),
+    (2.50, 0.0833),
+    (3.00, 0.0983),
+    (4.00, 0.0983),
+]
+
 # RMD uniform lifetime table: age -> distribution period divisor
 RMD_TABLE = {
     72: 27.4, 73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9,
@@ -80,11 +106,19 @@ SS_TAXABILITY = {
     "married_filing_jointly": {"tier1": 32000, "tier2": 44000},
 }
 
+# Social Security Full Retirement Age for anyone born 1960 or later. Claiming
+# before this age permanently reduces the benefit; claiming after earns delayed
+# retirement credits up to age 70. See ss_benefit_factor() in optimizer_v2.py.
+SS_FULL_RETIREMENT_AGE = 67
+
 # IRS contribution limits 2026 (approximate — stretch goal enforcement)
 CONTRIBUTION_LIMITS = {
     "401k": 23500,
-    "401k_catchup_50": 7500,   # age 50-59 and 64+
+    "401k_catchup_50": 9000,   # age 50-59 and 64+ (must be Roth for high earners, SECURE 2.0)
     "401k_catchup_60": 11250,  # age 60-63 (SECURE 2.0 super catch-up)
+    "401k_total_limit": 72000,          # Section 415(c) total annual additions (elective + employer + after-tax)
+    "401k_415c_catchup_50": 8500,       # 415(c) catch-up age 50-59/64+: $72,000 → $80,500
+    "401k_415c_catchup_60": 11250,      # 415(c) catch-up age 60-63 (same as elective super catch-up)
     "ira": 7000,
     "ira_catchup": 1000,       # age 50+
     "hsa_single": 4300,

@@ -9,10 +9,11 @@ A personal retirement planning app built with Python and Streamlit. Model your r
 ## Features
 
 - **Retirement Projections** — Year-by-year accumulation and drawdown modeling across multiple account types (401k, Roth IRA, taxable brokerage, real estate, etc.)
-- **Tax Calculations** — Federal and California state tax, RMDs, Social Security taxability, IRMAA, LTCG, and NIIT
+- **Tax Calculations** — Federal, California, and Montana state tax, RMDs, Social Security taxability, IRMAA, LTCG, NIIT, and the ACA pre-65 premium subsidy (with its 400%-FPL cliff)
+- **Tax-Adjusted Valuation** — legacy and comparison figures discount pre-tax balances for embedded tax liability, so cross-strategy comparisons are apples-to-apples
 - **Withdrawal Strategies** — Tax-efficient, Roth-preservation, and traditional-first strategies with binary search solver for net-spending accuracy
-- **Monte Carlo Simulation** — Probability of success across up to 10,000 simulated market scenarios; CMA Log-Normal (v2) and standard normal (v1) engines
-- **Strategy Optimizer** — Random-search optimizer (v1: withdrawal + Roth conversions; v2: adds Social Security start age and IRMAA/ACA cliff-aware conversion amounts) to maximize after-tax lifetime wealth
+- **Monte Carlo Simulation** — Probability of success across up to 10,000 simulated market scenarios; CMA Log-Normal (v2) and standard normal (v1) engines, both running the full plan (strategy parity)
+- **Strategy Optimizer** — Random-search optimizer (v1: withdrawal + Roth conversions, robust/tax-smoothing objectives; v2: adds actuarially re-priced Social Security start age and IRMAA/ACA cliff-aware conversion amounts) to maximize after-tax lifetime wealth
 - **Scenario Management** — Save, load, and compare multiple planning scenarios with name validation
 - **Account Management** — Track balances, contributions, employer match, and per-account return rates
 - **Progress Tracking** — Check-in system to compare actual vs. projected balances over time
@@ -63,6 +64,15 @@ Scenario data is stored in `scenarios/` and tracking data in `scenarios/tracking
 ---
 
 ## Releases
+
+### v2.0 — July 2026
+- **Tax-adjusted portfolio valuation** threaded through the deterministic sim, both Monte Carlo engines, the optimizer, and the UI — legacy figures are discounted for embedded tax so strategies compare apples-to-apples
+- **ACA premium subsidy modeled as a real cost** (opt-in) — the pre-65 marketplace Premium Tax Credit and its 400%-FPL cliff are now priced into the simulation and the fixed-net solver, matching how IRMAA is already handled
+- **Actuarial Social Security re-pricing** — when the optimizer moves the claiming age it rescales the benefit by the correct early-claim reduction / delayed-retirement credit (FRA 67) instead of paying the same dollar benefit at every age
+- **Robust optimizer mode** and an opt-in **tax-smoothing conversion objective** (Kitces marginal-rate equivalency) so the Roth-conversion recommendation no longer flips on a fractional return-rate nudge, plus a **suggested fill-to-rate curve**
+- **Montana LTCG preferential rates** (HB337 2026), **separate healthcare inflation rate**, and a **first-year market-crash stress test**
+- Fixed `bracket_ceiling_for_rate` returning 0 for 32%/35% brackets; Monte Carlo now delegates the full plan to the deterministic engine (strategy parity). Test suite at 400 passing, ruff clean
+- See [CHANGELOG.md](CHANGELOG.md) for the full list
 
 ### v1.4 — May 2026
 - **Optimizer v2** — new `optimizer_v2.py` extends the random-search optimizer with two additional decision variables:

@@ -75,7 +75,9 @@ You'll also enter your spouse's age, retirement age, Social Security benefit, an
 - **Pre-Medicare** (before age 65): the annual cost of health insurance and out-of-pocket expenses when you're not yet on Medicare. Default: $15,000/year.
 - **Post-Medicare** (age 65+): Part B premiums, supplemental/Medigap, dental, vision, and out-of-pocket costs. Default: $12,000/year. IRMAA surcharges (income-based Medicare penalties) are calculated separately and added on top.
 
-Both amounts inflate each year with the general inflation rate.
+Both amounts inflate each year with the general inflation rate. An optional **Separate healthcare inflation rate** checkbox lets you grow healthcare costs faster than general CPI if you wish; it defaults to the general inflation rate when unchecked.
+
+**Model ACA premium subsidy** (optional, default off): if you buy pre-65 marketplace coverage, check this to have the app treat your pre-Medicare healthcare input as the *full unsubsidized* premium and subtract each year's ACA Premium Tax Credit from it. The subsidy shrinks as your income (MAGI) rises and disappears entirely above the 400%-FPL cliff (~$84,600 MFJ / $62,700 single in 2026) — so large Roth conversions or withdrawals in a subsidy year cost you real money. Per-year subsidy and cliff columns appear in the Retirement and Optimizer detail tables, and a lifetime-subsidy total is added to the healthcare summary. Leave it off to treat your healthcare input as the net amount you actually pay.
 
 ---
 
@@ -593,7 +595,7 @@ The Optimizer is a random search over the space of possible retirement strategie
 
 For each of N trials (you set N, default 500), the optimizer randomly picks:
 
-1. **Social Security start ages:** Both your age and your spouse's (if applicable) are varied independently across the valid range (62–70). Later claiming increases the monthly benefit but delays the income stream; the optimizer searches for the combination that maximizes your score.
+1. **Social Security start ages:** Both your age and your spouse's (if applicable) are varied independently across the valid range (62–70). Later claiming increases the monthly benefit but delays the income stream; the optimizer searches for the combination that maximizes your score. When it moves the claiming age away from the one you entered, it **actuarially re-prices** the benefit — applying the real early-claim reduction (down to ~70% of the full benefit at 62) or delayed-retirement credit (up to ~124% at 70, relative to a Full Retirement Age of 67) — so early claiming is no longer treated as free.
 
 2. **Withdrawal strategy:** Tax-Efficient or Roth Preservation
 
@@ -630,4 +632,4 @@ The optimizer reports:
 
 ---
 
-*This guide reflects the app as of June 2026. Tax brackets and Medicare thresholds are for 2026 and are scaled forward in the simulation by the Tax Bracket Inflation Rate.*
+*This guide reflects the app as of v2.0 (July 2026). Tax brackets, Medicare (IRMAA) thresholds, and ACA/FPL cliffs are for 2026 and are scaled forward in the simulation by the Tax Bracket Inflation Rate.*
