@@ -80,11 +80,6 @@ def project_accumulation(accounts: list[dict], profile: dict, assumptions: dict)
                     + (qual_div * eff_state if state == "california" else 0)
                 )
 
-            # Mega backdoor Roth: after-tax 401k contributions that convert to Roth.
-            # Tracked separately from the pre-tax balance so the Roth bucket is correctly
-            # sized at retirement without conflating it with the traditional balance.
-            mbr_bal = a.get("_mbr_bal", 0.0) if atype == "traditional_401k" else 0.0
-
             rows.append({
                 "age": age,
                 "account_id": a["id"],
@@ -96,18 +91,6 @@ def project_accumulation(accounts: list[dict], profile: dict, assumptions: dict)
                 "passive_income": passive_income,
                 "tax_drag": tax_drag,
             })
-            if atype == "traditional_401k" and mbr_bal > 0:
-                rows.append({
-                    "age": age,
-                    "account_id": a["id"] + "_mbr",
-                    "account_name": a["name"] + " (Mega Backdoor Roth)",
-                    "account_type": "roth_401k",
-                    "balance": mbr_bal,
-                    "basis": mbr_bal,
-                    "unrealized_gain": 0.0,
-                    "passive_income": 0.0,
-                    "tax_drag": 0.0,
-                })
 
             # Grow balance only during accumulation years; retirement_age row shows
             # start-of-retirement balances and accts retains those values for simulate_retirement.
@@ -135,40 +118,8 @@ def project_accumulation(accounts: list[dict], profile: dict, assumptions: dict)
                         basis += contrib
                     a["annual_contribution"] = contrib * (1 + a.get("contribution_growth_rate", 0.0))
 
-                if atype == "traditional_401k":
-                    mbr_contrib = a.get("mega_backdoor_roth", 0.0)
-                    if mbr_contrib > 0:
-                        mbr_bal = mbr_bal * (1 + rate) + mbr_contrib
-                        a["_mbr_bal"] = mbr_bal
-
                 a["balance"] = bal
                 a["basis"] = basis
-
-    # Surface mega backdoor Roth balances as separate roth_401k accounts in final_accounts
-    # so the withdrawal engine treats them as Roth money.
-    mbr_accounts = []
-    for a in accts:
-        if a["type"] == "traditional_401k":
-            mbr = a.pop("_mbr_bal", 0.0)
-            if mbr > 0:
-                mbr_accounts.append({
-                    "id": a["id"] + "_mbr",
-                    "name": a["name"] + " (Mega Backdoor Roth)",
-                    "type": "roth_401k",
-                    "owner": a.get("owner", "self"),
-                    "balance": mbr,
-                    "basis": mbr,
-                    "annual_contribution": 0.0,
-                    "contribution_growth_rate": 0.0,
-                    "return_rate": a.get("return_rate", 0.07),
-                    "use_global_return_rate": a.get("use_global_return_rate", True),
-                    "employer_match_percent": 0.0,
-                    "employer_match_limit": 0.0,
-                    "qualified_dividend_yield": 0.0,
-                    "ordinary_income_yield": 0.0,
-                    "net_annual_rental_income": 0.0,
-                })
-    accts.extend(mbr_accounts)
 
     df = pd.DataFrame(rows)
 

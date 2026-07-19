@@ -4,8 +4,11 @@ optimizer_v2.py — Strategy optimizer v2.
 Extends v1 (optimizer.py) with two additional decision variables that have
 real, deterministic dollar impact:
 
-  1. Social Security start age (62–70) for primary and spouse — unchanged from
-     the first v2 draft; 8%/yr delay credit is fully modeled in simulate_retirement.
+  1. Social Security start age (62–70) for primary and spouse. The benefit is
+     actuarially re-priced for the chosen age (early-claim reduction / delayed
+     retirement credits via ss_benefit_factor) before it is simulated, so a
+     recommended age change reflects the real lower/higher benefit — not the
+     full FRA amount paid at the wrong age.
 
   2. IRMAA-aware Roth conversions — for conversion windows that overlap Medicare
      ages (65+), cap conversions just below the IRMAA Tier-0 income threshold
@@ -34,7 +37,7 @@ from typing import Optional
 import pandas as pd
 
 from withdrawals import simulate_retirement
-from constants import RMD_START_AGE
+from constants import RMD_START_AGE, SS_FULL_RETIREMENT_AGE
 from optimizer import (
     _owner_min_conv_age,
     _score,
@@ -49,6 +52,46 @@ from optimizer import (
 
 # SS start age range (delayed retirement credits: +8%/yr from 62 → 70)
 SS_AGE_OPTIONS = list(range(62, 71))
+
+
+def ss_benefit_factor(claim_age: float, fra: int = SS_FULL_RETIREMENT_AGE) -> float:
+    """Multiplier on the Primary Insurance Amount (the benefit payable at Full
+    Retirement Age) for claiming Social Security at ``claim_age``.
+
+    Early claiming (before FRA) permanently reduces the benefit:
+      - 5/9 of 1% per month for the first 36 months before FRA, then
+      - 5/12 of 1% per month for any additional months.
+    So claiming at 62 (FRA 67) yields 0.70 (a 30% cut).
+
+    Delayed claiming (after FRA) earns delayed retirement credits of 2/3 of 1%
+    per month (8%/yr), capped at age 70 — so age 70 yields 1.24 (a 24% raise).
+    """
+    months = round((claim_age - fra) * 12)
+    if months == 0:
+        return 1.0
+    if months < 0:  # early — permanent reduction
+        early = -months
+        first_36 = min(early, 36)
+        beyond_36 = max(0, early - 36)
+        reduction = first_36 * (5 / 900) + beyond_36 * (5 / 1200)
+        return 1.0 - reduction
+    # delayed — credits accrue only through age 70
+    credited = min(months, (70 - fra) * 12)
+    return 1.0 + credited * (2 / 300)
+
+
+def _adjusted_ss_benefit(base_benefit: float, base_start_age: int, new_start_age: int) -> float:
+    """Re-price a benefit the user quoted for ``base_start_age`` to what it would
+    actually be if claimed at ``new_start_age``. The quoted amount is treated as
+    correct for the age the user entered, so when the optimizer leaves the age
+    unchanged the benefit is unchanged; only a proposed age change rescales it by
+    the ratio of actuarial factors."""
+    if not base_benefit:
+        return base_benefit
+    base_f = ss_benefit_factor(base_start_age)
+    if base_f <= 0:
+        return base_benefit
+    return base_benefit * ss_benefit_factor(new_start_age) / base_f
 
 # IRMAA Tier-0 income ceilings (2026) — staying below avoids ALL Medicare surcharges
 IRMAA_CEILING_MFJ    = 218_000
@@ -92,15 +135,23 @@ def _estimate_nonconv_income(
     filing = profile.get("filing_status", "single")
     is_mfj = filing == "married_filing_jointly"
 
-    ss_start = ss_start_override or profile.get("social_security_start_age", 67)
-    primary_ss = profile.get("social_security_benefit", 0.0) * inflate if at_age >= ss_start else 0.0
+    orig_ss_start = profile.get("social_security_start_age", SS_FULL_RETIREMENT_AGE)
+    ss_start = ss_start_override or orig_ss_start
+    primary_benefit = _adjusted_ss_benefit(
+        profile.get("social_security_benefit", 0.0), orig_ss_start, ss_start
+    )
+    primary_ss = primary_benefit * inflate if at_age >= ss_start else 0.0
 
     spouse_ss = 0.0
     if is_mfj:
-        sp_ss_start = spouse_ss_start_override or profile.get("spouse_ss_start_age", 67)
+        orig_sp_start = profile.get("spouse_ss_start_age", SS_FULL_RETIREMENT_AGE)
+        sp_ss_start = spouse_ss_start_override or orig_sp_start
         sp_offset = profile.get("spouse_age", profile.get("current_age", 0)) - profile.get("current_age", 0)
         if at_age + sp_offset >= sp_ss_start:
-            spouse_ss = profile.get("spouse_ss_benefit", 0.0) * inflate
+            spouse_benefit = _adjusted_ss_benefit(
+                profile.get("spouse_ss_benefit", 0.0), orig_sp_start, sp_ss_start
+            )
+            spouse_ss = spouse_benefit * inflate
 
     # Taxable investment income: dividends + interest at retirement-date balances
     inv_income = sum(
@@ -273,11 +324,24 @@ def _sample_strategy_v2(
 
     ss_start = rng.choice(SS_AGE_OPTIONS)
     profile_overrides: dict = {"social_security_start_age": ss_start}
+    # Re-price the benefit for the proposed claiming age so the trial doesn't
+    # collect the full FRA amount while claiming early (or shortchange a delayed
+    # claim). Only added when the age actually moves off the profile's setting.
+    orig_ss_start = profile.get("social_security_start_age", SS_FULL_RETIREMENT_AGE)
+    if ss_start != orig_ss_start:
+        profile_overrides["social_security_benefit"] = _adjusted_ss_benefit(
+            profile.get("social_security_benefit", 0.0), orig_ss_start, ss_start
+        )
 
     spouse_ss_start = None
     if profile.get("filing_status") == "married_filing_jointly":
         spouse_ss_start = rng.choice(SS_AGE_OPTIONS)
         profile_overrides["spouse_ss_start_age"] = spouse_ss_start
+        orig_sp_start = profile.get("spouse_ss_start_age", SS_FULL_RETIREMENT_AGE)
+        if spouse_ss_start != orig_sp_start:
+            profile_overrides["spouse_ss_benefit"] = _adjusted_ss_benefit(
+                profile.get("spouse_ss_benefit", 0.0), orig_sp_start, spouse_ss_start
+            )
 
     rc, cliff_label = _sample_roth_conversion(
         profile, accounts, assumptions, rng, ss_start, spouse_ss_start
@@ -310,23 +374,33 @@ def describe_strategy_v2(
     """Human-readable description of a v2 strategy, extending v1's output."""
     desc = _describe_strategy(withdrawal_strategy, roth_conversion, accounts, annual_rebalance_gain)
 
-    # SS start ages
-    orig_ss = base_profile.get("social_security_start_age", 67)
+    # SS start ages. When the optimizer moves the claiming age it re-prices the
+    # benefit (early = permanent cut, delayed = credit); surface both the new age
+    # and the resulting benefit so the recommendation is honest about the tradeoff.
+    def _ss_label(new_age, orig_age, base_benefit):
+        label = f"Age {new_age}"
+        if new_age != orig_age and base_benefit:
+            new_benefit = _adjusted_ss_benefit(base_benefit, orig_age, new_age)
+            delta_pct = (ss_benefit_factor(new_age) / ss_benefit_factor(orig_age) - 1) * 100
+            sign = "+" if delta_pct >= 0 else "−"
+            label += (
+                f"  (benefit ≈ ${new_benefit:,.0f}/yr, "
+                f"{sign}{abs(delta_pct):.0f}% vs. claiming at {orig_age})"
+            )
+        return label
+
+    orig_ss = base_profile.get("social_security_start_age", SS_FULL_RETIREMENT_AGE)
     new_ss  = profile_overrides.get("social_security_start_age", orig_ss)
-    ss_label = f"Age {new_ss}"
-    if new_ss != orig_ss:
-        delta_pct = (new_ss - 62) * 8
-        ss_label += f"  (≈ +{delta_pct}% vs. claiming at 62)"
-    desc["SS Start Age (primary)"] = ss_label
+    desc["SS Start Age (primary)"] = _ss_label(
+        new_ss, orig_ss, base_profile.get("social_security_benefit", 0.0)
+    )
 
     if base_profile.get("filing_status") == "married_filing_jointly":
-        orig_sp = base_profile.get("spouse_ss_start_age", 67)
+        orig_sp = base_profile.get("spouse_ss_start_age", SS_FULL_RETIREMENT_AGE)
         new_sp  = profile_overrides.get("spouse_ss_start_age", orig_sp)
-        sp_label = f"Age {new_sp}"
-        if new_sp != orig_sp:
-            delta_pct = (new_sp - 62) * 8
-            sp_label += f"  (≈ +{delta_pct}% vs. claiming at 62)"
-        desc["SS Start Age (spouse)"] = sp_label
+        desc["SS Start Age (spouse)"] = _ss_label(
+            new_sp, orig_sp, base_profile.get("spouse_ss_benefit", 0.0)
+        )
 
     # Cliff awareness
     if cliff_label == "irmaa" and irmaa_headroom > 0:

@@ -64,6 +64,32 @@ IRMAA_TIERS = [
 ]
 MEDICARE_PART_B_BASE_MONTHLY = 202.90  # per person
 
+# --- ACA Premium Tax Credit (pre-65 marketplace coverage) ---
+# The ARPA/IRA subsidy expansion (8.5% MAGI cap, no upper income limit) expired at the
+# end of 2025, so for the 2026 plan year the pre-ARPA structure is back in force: a hard
+# 400%-FPL cliff above which no premium tax credit is available, and a sliding
+# "applicable percentage" of MAGI the household is expected to contribute below it.
+#
+# Federal Poverty Level (48 contiguous states + DC). Chosen so 400% × FPL reproduces the
+# ACA cliffs optimizer_v2 already uses ($62,700 single / $84,600 household of 2).
+FPL_BASE = 15_675.0            # 1-person household
+FPL_PER_ADDITIONAL = 5_475.0  # each additional household member
+ACA_FPL_CLIFF_RATIO = 4.0     # 400% FPL — above this the credit disappears entirely
+
+# Applicable percentage schedule: (income as a fraction of FPL, expected contribution as a
+# fraction of MAGI). Linearly interpolated between anchors; flat below the first / above the
+# last anchor (and zeroed entirely once income exceeds ACA_FPL_CLIFF_RATIO). Mirrors the
+# pre-ARPA (2021) table that returns in 2026.
+ACA_APPLICABLE_PCT = [
+    (1.00, 0.0207),
+    (1.33, 0.0207),
+    (1.50, 0.0414),
+    (2.00, 0.0652),
+    (2.50, 0.0833),
+    (3.00, 0.0983),
+    (4.00, 0.0983),
+]
+
 # RMD uniform lifetime table: age -> distribution period divisor
 RMD_TABLE = {
     72: 27.4, 73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9,
@@ -79,6 +105,11 @@ SS_TAXABILITY = {
     "single":                {"tier1": 25000, "tier2": 34000},
     "married_filing_jointly": {"tier1": 32000, "tier2": 44000},
 }
+
+# Social Security Full Retirement Age for anyone born 1960 or later. Claiming
+# before this age permanently reduces the benefit; claiming after earns delayed
+# retirement credits up to age 70. See ss_benefit_factor() in optimizer_v2.py.
+SS_FULL_RETIREMENT_AGE = 67
 
 # IRS contribution limits 2026 (approximate — stretch goal enforcement)
 CONTRIBUTION_LIMITS = {

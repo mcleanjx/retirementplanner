@@ -251,6 +251,64 @@ class TestIRMAA:
         assert abs(irmaa - (487.00 + 91.00) * 12) < 0.01
 
 
+class TestAcaPtc:
+    def test_above_cliff_no_subsidy(self):
+        from taxes import calculate_aca_ptc
+        # Household of 2, 400% FPL cliff ≈ $84,600; MAGI above it → no credit.
+        assert calculate_aca_ptc(90_000, 20_000, 2) == 0.0
+
+    def test_below_cliff_positive_subsidy(self):
+        from taxes import calculate_aca_ptc
+        # Moderate MAGI well under the cliff → partial subsidy against a $20k premium.
+        ptc = calculate_aca_ptc(40_000, 20_000, 2)
+        assert 0 < ptc < 20_000
+
+    def test_subsidy_capped_at_premium(self):
+        from taxes import calculate_aca_ptc
+        # Very low income → expected contribution tiny, credit can't exceed the premium.
+        ptc = calculate_aca_ptc(21_000, 8_000, 2)
+        assert ptc <= 8_000
+
+    def test_subsidy_shrinks_as_income_rises(self):
+        from taxes import calculate_aca_ptc
+        low = calculate_aca_ptc(35_000, 20_000, 2)
+        high = calculate_aca_ptc(70_000, 20_000, 2)
+        assert low > high  # higher MAGI → larger expected contribution → smaller credit
+
+    def test_cliff_reproduces_optimizer_v2_constant(self):
+        from taxes import aca_fpl
+        from constants import ACA_FPL_CLIFF_RATIO
+        # 400% × FPL should match the ACA cliffs optimizer_v2 hardcodes.
+        assert abs(aca_fpl(2) * ACA_FPL_CLIFF_RATIO - 84_600) < 1.0
+        assert abs(aca_fpl(1) * ACA_FPL_CLIFF_RATIO - 62_700) < 1.0
+
+    def test_disabled_by_default_no_effect(self):
+        # A pre-65 retiree with the toggle OFF gets no subsidy columns effect.
+        from withdrawals import simulate_retirement
+        profile = _base_profile(current_age=55, retirement_age=55, life_expectancy=70,
+                                pre_medicare_healthcare=20_000)
+        df, summary = simulate_retirement(
+            [_trad_account(), _taxable_account(), _bank_account()],
+            profile, _base_assumptions())
+        assert summary.get("lifetime_aca_subsidy", 0.0) == 0.0
+        assert (df["aca_subsidy"] == 0).all()
+
+    def test_enabled_reduces_healthcare(self):
+        # Enabling ACA modeling for a modest-income pre-65 retiree lowers net healthcare.
+        from withdrawals import simulate_retirement
+        accounts = [_trad_account(balance=300_000), _bank_account(balance=200_000)]
+        base_p = _base_profile(current_age=58, retirement_age=58, life_expectancy=68,
+                               pre_medicare_healthcare=20_000)
+        aca_p = _base_profile(current_age=58, retirement_age=58, life_expectancy=68,
+                              pre_medicare_healthcare=20_000, model_aca_subsidy=True)
+        assump = _base_assumptions(spending_mode="fixed", annual_spending_target=45_000)
+        _, s_base = simulate_retirement([dict(a) for a in accounts], base_p, assump)
+        df_aca, s_aca = simulate_retirement([dict(a) for a in accounts], aca_p, assump)
+        assert s_aca["lifetime_aca_subsidy"] > 0
+        assert s_aca["lifetime_healthcare"] < s_base["lifetime_healthcare"]
+        assert (df_aca["aca_gross_premium"] > 0).any()
+
+
 class TestSSTaxability:
     def test_no_ss(self):
         from taxes import calculate_ss_taxable_amount
@@ -1667,6 +1725,39 @@ class TestScenarios:
         from scenarios import latest_scenario
         assert latest_scenario() is None
 
+    def test_save_mc_summary_attaches_to_scenario(self):
+        from scenarios import save_scenario, save_mc_summary, load_scenario
+        d = self._scenario_data()
+        save_scenario(d["name"], d["profile"], d["assumptions"], d["accounts"])
+        mc = {"success_rate": 0.92, "median_at_le": 1_234_567, "n_runs": 1000}
+        save_mc_summary(d["name"], mc)
+        loaded = load_scenario(d["name"])
+        assert loaded["mc_summary"] == mc
+
+    def test_save_mc_summary_noop_when_missing(self):
+        from scenarios import save_mc_summary, list_scenarios
+        save_mc_summary("ghost", {"success_rate": 1.0})  # must not raise or create a file
+        assert list_scenarios() == []
+
+    def test_save_scenario_preserves_existing_mc_summary(self):
+        from scenarios import save_scenario, save_mc_summary, load_scenario
+        d = self._scenario_data()
+        save_scenario(d["name"], d["profile"], d["assumptions"], d["accounts"])
+        mc = {"success_rate": 0.88, "median_at_le": 500_000, "n_runs": 500}
+        save_mc_summary(d["name"], mc)
+        # A normal re-save (no MC data) must not wipe the recorded MC headline.
+        save_scenario(d["name"], d["profile"], d["assumptions"], d["accounts"])
+        assert load_scenario(d["name"])["mc_summary"] == mc
+
+    def test_save_scenario_explicit_mc_summary_overrides(self):
+        from scenarios import save_scenario, save_mc_summary, load_scenario
+        d = self._scenario_data()
+        save_scenario(d["name"], d["profile"], d["assumptions"], d["accounts"])
+        save_mc_summary(d["name"], {"success_rate": 0.5})
+        newer = {"success_rate": 0.99, "median_at_le": 1, "n_runs": 10}
+        save_scenario(d["name"], d["profile"], d["assumptions"], d["accounts"], mc_summary=newer)
+        assert load_scenario(d["name"])["mc_summary"] == newer
+
     def test_latest_scenario_returns_most_recent(self):
         import time
         from scenarios import save_scenario, latest_scenario
@@ -2856,6 +2947,7 @@ _SCENARIO_PATHS = [
     "scenarios/test_trad_heavy_conversions.json",     # large traditional 401k, Roth conversion ladder, Florida
     "scenarios/test_rental_income.json",              # rental property passive income, MFJ, California progressive tax
     "scenarios/test_ss_dependent.json",               # low-income single, SS-heavy, portfolio depletes mid-retirement
+    "scenarios/test_ca_appreciated_taxable.json",     # CA, large appreciated taxable + bank + conversion (phantom-cash regression shape)
 ]
 
 _SCENARIO_IDS = [
@@ -2884,6 +2976,67 @@ def _run_scenario(path: str):
 
     df, summary = simulate_retirement(ret_accts, profile, assumptions, roth_conversion)
     return df, summary, assumptions
+
+
+def _run_scenario_optimizer(path: str, n_iterations: int = 40, seed: int = 13):
+    """Load a scenario, run accumulation, then the v1 strategy optimizer.
+    Returns (optimizer_result, ret_accts). Iterations are kept low so this stays
+    affordable when parametrized across every scenario file."""
+    from projections import project_accumulation
+    from optimizer import run_optimizer
+
+    with open(path) as f:
+        sc = json.load(f)
+
+    profile = sc["profile"]
+    assumptions = sc["assumptions"]
+    accounts = sc["accounts"]
+
+    _, ret_accts = project_accumulation(accounts, profile, assumptions)
+    rate_prefs = {a["id"]: a.get("use_global_return_rate", True) for a in accounts}
+    for a in ret_accts:
+        a["use_global_return_rate"] = rate_prefs.get(a["id"], True)
+
+    res = run_optimizer(
+        ret_accts, profile, assumptions,
+        sc.get("roth_conversion"), sc.get("spending_overrides") or {},
+        n_iterations=n_iterations, seed=seed,
+    )
+    return res, ret_accts
+
+
+@pytest.mark.parametrize("scenario_path", _SCENARIO_PATHS, ids=_SCENARIO_IDS)
+def test_optimizer_never_conjures_cash_across_scenarios(scenario_path):
+    """Phantom-cash regression guard, run against EVERY scenario file (not just one
+    hand-built fixture). Runs the v1 optimizer on each scenario and asserts that no
+    recommended plan reallocates money into a bank/cash account: a bank in drawdown can
+    only be spent down or grow at its own return rate, so its opening balance can never
+    exceed the starting bank. The removed cash-reserve dimension violated this by moving
+    appreciated taxable into cash with no sale and no tax. Skips scenarios with no bank
+    account (nothing to conjure into) and files absent on this machine."""
+    if not os.path.exists(scenario_path):
+        pytest.skip(f"Scenario file not found: {scenario_path}")
+    from optimizer import build_balances_table
+
+    res, ret_accts = _run_scenario_optimizer(scenario_path)
+    bank_names = [a["name"] for a in ret_accts if a["type"] == "bank"]
+    if not bank_names:
+        pytest.skip("no bank account — nothing to conjure cash into")
+
+    start_bank = sum(a["balance"] for a in ret_accts if a["type"] == "bank")
+    # A bank grows at most ~its return rate in year one; 20% slack (+ $1 for a $0 bank)
+    # is far above any legitimate value yet far below a taxable→cash reallocation.
+    cap = start_bank * 1.2 + 1.0
+
+    plans = [res["baseline_result"], res["best_result"], *res.get("top_results", [])]
+    for plan in plans:
+        bal = build_balances_table(plan["ret_df"], ret_accts)
+        opening_cash = sum(float(bal.iloc[0][n]) for n in bank_names if n in bal.columns)
+        assert opening_cash <= cap, (
+            f"{os.path.basename(scenario_path)}: plan '{plan.get('label')}' opens with "
+            f"${opening_cash:,.0f} cash vs a ${start_bank:,.0f} starting bank — the "
+            f"optimizer is conjuring cash (reallocating into the bank with no sale/tax)"
+        )
 
 
 @pytest.fixture(params=_SCENARIO_PATHS, ids=_SCENARIO_IDS, scope="class")
@@ -3282,13 +3435,95 @@ class TestOptimizerRobust:
         assert min(rob["best_result"]["band_scores"]) >= min(ev["best_result"]["band_scores"])
 
 
-class TestOptimizerCashReserve:
-    """Pre-retirement taxable→cash reserve dimension: the optimizer can trial holding
-    extra cash at retirement to fund early Roth-conversion taxes without selling
-    appreciated taxable lots (the CONSIDERATIONS.md synergy)."""
+class TestSSClaimingAgeAdjustment:
+    """When the optimizer recommends a Social Security claiming age, the simulated
+    benefit must be actuarially re-priced for that age (early = permanent cut,
+    delayed = credit) rather than paying the full FRA amount at the wrong age."""
+
+    def test_benefit_factor_known_values(self):
+        from optimizer_v2 import ss_benefit_factor
+        # FRA (67) is the reference point.
+        assert ss_benefit_factor(67) == pytest.approx(1.0)
+        # Early claim: 5/9%/mo for first 36 mo, then 5/12%/mo.
+        assert ss_benefit_factor(62) == pytest.approx(0.70)   # 30% cut
+        assert ss_benefit_factor(64) == pytest.approx(0.80)   # exactly 36 mo early
+        assert ss_benefit_factor(66) == pytest.approx(0.9333, abs=1e-4)
+        # Delayed retirement credits: 8%/yr.
+        assert ss_benefit_factor(68) == pytest.approx(1.08)
+        assert ss_benefit_factor(70) == pytest.approx(1.24)
+
+    def test_delayed_credits_cap_at_70(self):
+        from optimizer_v2 import ss_benefit_factor
+        # No further credit is earned past age 70.
+        assert ss_benefit_factor(72) == pytest.approx(ss_benefit_factor(70))
+
+    def test_adjusted_benefit_identity_when_age_unchanged(self):
+        from optimizer_v2 import _adjusted_ss_benefit
+        # Leaving the age alone must not touch the user's quoted figure.
+        assert _adjusted_ss_benefit(30_000, 67, 67) == pytest.approx(30_000)
+        assert _adjusted_ss_benefit(30_000, 62, 62) == pytest.approx(30_000)
+        assert _adjusted_ss_benefit(0.0, 67, 62) == 0.0
+
+    def test_adjusted_benefit_reprices_relative_to_quoted_age(self):
+        from optimizer_v2 import _adjusted_ss_benefit
+        # A $28k figure quoted for FRA drops to 70% of it if claimed at 62.
+        assert _adjusted_ss_benefit(28_000, 67, 62) == pytest.approx(28_000 * 0.70)
+        # A figure the user quoted *for age 62* is already reduced; moving to FRA
+        # grosses it back up (÷0.70), not ×0.70 again.
+        assert _adjusted_ss_benefit(19_600, 62, 67) == pytest.approx(19_600 / 0.70)
+
+    def test_sample_strategy_reprices_benefit_for_new_age(self):
+        import random
+        from optimizer_v2 import _sample_strategy_v2, _adjusted_ss_benefit
+        accts = [_trad_account(600_000), _roth_account(50_000)]
+        profile = _base_profile(social_security_benefit=24_000, social_security_start_age=67)
+        assumptions = _base_assumptions()
+        rng = random.Random(0)
+        saw_change = False
+        for _ in range(200):
+            _, _, overrides, _, _ = _sample_strategy_v2(profile, accts, assumptions, rng)
+            new_age = overrides["social_security_start_age"]
+            if new_age != 67:
+                saw_change = True
+                assert overrides["social_security_benefit"] == pytest.approx(
+                    _adjusted_ss_benefit(24_000, 67, new_age)
+                )
+                if new_age < 67:
+                    assert overrides["social_security_benefit"] < 24_000
+            else:
+                assert "social_security_benefit" not in overrides
+        assert saw_change, "sampler never varied the SS age — test is vacuous"
+
+    def test_optimizer_recommendation_carries_repriced_benefit(self):
+        """End-to-end: any winning trial that moved the SS age simulates the
+        re-priced benefit, so the recommended plan can't collect the full FRA
+        benefit while claiming early."""
+        from optimizer_v2 import run_optimizer_v2, _adjusted_ss_benefit
+        accts = [_trad_account(700_000), _roth_account(80_000), _taxable_account(200_000, 120_000)]
+        profile = _base_profile(social_security_benefit=30_000, social_security_start_age=67)
+        res = run_optimizer_v2(accts, profile, _base_assumptions(),
+                               {"enabled": False}, {}, n_iterations=40, seed=42)
+        for r in [res["best_result"], *res["top_results"]]:
+            ov = r.get("profile_overrides", {})
+            new_age = ov.get("social_security_start_age", 67)
+            if new_age != 67:
+                assert ov["social_security_benefit"] == pytest.approx(
+                    _adjusted_ss_benefit(30_000, 67, new_age)
+                )
+
+
+class TestOptimizerConservesOpeningBalances:
+    """Regression guard against the 'phantom cash' defect (the pre-retirement cash-reserve
+    dimension, removed in v2.0.0). The optimizer varies STRATEGY only — conversion timing,
+    withdrawal order, rebalancing. It must simulate every plan from the caller's opening
+    balance sheet UNCHANGED. It must never silently reallocate balances between accounts
+    (e.g. taxable→cash) before simulating: that conjured cash with no sale and no
+    capital-gains tax, so the recommended plan showed an implausible cash pile and an
+    overstated legacy. These tests would fail loudly if any such reallocation returns."""
 
     def _accts(self):
-        # CA-style: big appreciated taxable + a bank to hold the reserve + convertible pre-tax.
+        # The exact shape that triggered the bug: large appreciated taxable + a small
+        # bank + convertible pre-tax + a Roth destination (a high-tax-state retiree).
         return [
             _trad_account(1_200_000),
             _roth_account(60_000),
@@ -3296,66 +3531,64 @@ class TestOptimizerCashReserve:
             _bank_account(100_000),
         ]
 
-    def test_apply_reserve_is_wealth_neutral_and_pure(self):
-        from optimizer import _apply_cash_reserve
-        accts = self._accts()
-        before_total = sum(a["balance"] for a in accts)
-        before_taxable = accts[2]["balance"]
-        out = _apply_cash_reserve(accts, 300_000)
-        # Total wealth preserved; money moved taxable→bank.
-        assert sum(a["balance"] for a in out) == pytest.approx(before_total)
-        assert out[2]["balance"] == pytest.approx(before_taxable - 300_000)
-        assert out[3]["balance"] == pytest.approx(100_000 + 300_000)
-        # Basis drawn down pro-rata (gain ratio preserved on the remaining taxable lot).
-        assert out[2]["basis"] / out[2]["balance"] == pytest.approx(200_000 / before_taxable)
-        # Input not mutated.
-        assert accts[2]["balance"] == before_taxable
+    _RC = {
+        "enabled": True, "strategy": "fill_to_bracket", "target_bracket": 0.24,
+        "fixed_amount": 20_000.0, "start_age": 66, "end_age": 72,
+        "source_account_ids": ["trad1"], "destination_account_id": "roth1",
+    }
 
-    def test_apply_reserve_zero_is_identity_no_copy(self):
-        from optimizer import _apply_cash_reserve
-        accts = self._accts()
-        assert _apply_cash_reserve(accts, 0) is accts          # same ref → no copy cost
-        assert _apply_cash_reserve(accts, -5) is accts
-
-    def test_reserve_clamped_and_skipped_without_bank(self):
-        from optimizer import _apply_cash_reserve, _max_cash_reserve
-        no_bank = [_trad_account(500_000), _roth_account(50_000), _taxable_account(300_000, 100_000)]
-        assert _max_cash_reserve(no_bank) == 0.0                # nowhere to hold it
-        assert _apply_cash_reserve(no_bank, 100_000) is no_bank
-        # Over-asking is clamped to available taxable.
-        accts = self._accts()
-        out = _apply_cash_reserve(accts, 10_000_000)
-        assert out[2]["balance"] == pytest.approx(0.0)
-        assert out[3]["balance"] == pytest.approx(100_000 + 800_000)
-
-    def test_reserve_only_sampled_with_conversion(self):
-        """_sample_strategy never returns a non-zero reserve when the trial has no
-        conversion (the reserve's only purpose is funding conversion taxes)."""
-        import random
-        from optimizer import _sample_strategy
-        rng = random.Random(0)
-        accts = self._accts()
-        prof = _base_profile()
-        saw_noconv = saw_conv_reserve = False
-        for _ in range(200):
-            _ws, rc, _reb, reserve = _sample_strategy(prof, accts, rng)
-            if not rc.get("enabled"):
-                assert reserve == 0.0
-                saw_noconv = True
-            elif reserve > 0:
-                saw_conv_reserve = True
-        assert saw_noconv and saw_conv_reserve            # both branches exercised
-
-    def test_optimizer_records_reserve_and_leaves_accounts_unmutated(self):
+    def test_optimizer_leaves_accounts_unmutated(self):
+        """The shared accounts_at_retirement must never be mutated by any trial."""
         from optimizer import run_optimizer
         accts = self._accts()
         before = [dict(a) for a in accts]
-        res = run_optimizer(accts, _base_profile(), _base_assumptions(),
-                            {"enabled": False}, {}, n_iterations=80, seed=3)
-        assert "cash_reserve" in res["best_result"]
-        assert res["baseline_result"]["cash_reserve"] == 0.0
-        # The shared accounts_at_retirement is never mutated by a reserving trial.
+        run_optimizer(accts, _base_profile(), _base_assumptions(),
+                      self._RC, {}, n_iterations=80, seed=3)
         assert [dict(a) for a in accts] == before
+
+    def test_no_plan_conjures_cash(self):
+        """A bank/cash account in drawdown can only be spent down or grow at its own
+        return rate (~4%/yr here) — the optimizer can never add PRINCIPAL to it. So the
+        opening cash of every recommended plan must stay at/near the starting bank
+        balance. The removed reserve dimension moved appreciated taxable into cash with
+        no sale, inflating opening cash to many times the starting bank; this asserts
+        that can't happen. (Empirically, legitimate opening cash here is $0–$27k vs a
+        $100k starting bank; a reallocation would push it toward the $800k taxable.)"""
+        from optimizer import run_optimizer, build_balances_table
+        accts = self._accts()
+        start_bank = 100_000
+        cap = start_bank * 1.2  # one year of growth can't exceed ~4%; 20% is generous slack
+        res = run_optimizer(accts, _base_profile(), _base_assumptions(),
+                            self._RC, {}, n_iterations=120, seed=7)
+        # Check the baseline and every recommended plan, not just the single best.
+        plans = [res["baseline_result"], res["best_result"], *res.get("top_results", [])]
+        for plan in plans:
+            bal = build_balances_table(plan["ret_df"], accts)
+            assert "Checking" in bal.columns
+            opening_cash = float(bal.iloc[0]["Checking"])
+            assert opening_cash <= cap, (
+                f"plan '{plan.get('label')}' opens with ${opening_cash:,.0f} cash vs a "
+                f"${start_bank:,.0f} starting bank — the optimizer is conjuring cash "
+                f"(reallocating into the bank with no sale/tax)"
+            )
+
+    def test_optimizer_does_not_inflate_total_wealth(self):
+        """Beyond cash specifically: the best plan's opening total portfolio must not
+        exceed the baseline's opening total. Both simulate from the same accounts, so the
+        only ways the optimizer could show MORE opening wealth are creating money or
+        dodging a tax it should have paid — exactly the reserve defect's signature."""
+        from optimizer import run_optimizer
+        accts = self._accts()
+        res = run_optimizer(accts, _base_profile(), _base_assumptions(),
+                            self._RC, {}, n_iterations=120, seed=7)
+        base_open = float(res["baseline_result"]["ret_df"].iloc[0]["total_portfolio"])
+        best_open = float(res["best_result"]["ret_df"].iloc[0]["total_portfolio"])
+        # Small tolerance for benign strategy differences in year one (e.g. a lower-tax
+        # withdrawal order); a reallocation defect showed up as a large, one-sided gap.
+        assert best_open <= base_open * 1.02, (
+            f"best plan opens with ${best_open:,.0f} vs baseline ${base_open:,.0f} — "
+            f"the optimizer appears to be creating wealth or skipping a setup tax"
+        )
 
 
 class TestTaxSmoothingObjective:

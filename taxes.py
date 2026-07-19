@@ -1,9 +1,10 @@
 from constants import (
     STANDARD_DEDUCTION, ORDINARY_BRACKETS, LTCG_BRACKETS,
     NIIT_RATE, NIIT_THRESHOLD, IRMAA_TIERS,
-    SS_TAXABILITY, BRACKET_CEILINGS,
+    SS_TAXABILITY,
     CA_STANDARD_DEDUCTION, CA_ORDINARY_BRACKETS,
     MT_STANDARD_DEDUCTION, MT_ORDINARY_BRACKETS, MT_LTCG_BRACKETS,
+    FPL_BASE, FPL_PER_ADDITIONAL, ACA_FPL_CLIFF_RATIO, ACA_APPLICABLE_PCT,
 )
 
 
@@ -69,6 +70,54 @@ def calculate_irmaa(magi: float, filing_status: str, num_medicare_eligible: int,
     return (monthly_b + monthly_d) * 12 * num_medicare_eligible
 
 
+def aca_fpl(household_size: int, bracket_factor: float = 1.0) -> float:
+    """Federal Poverty Level for a household of the given size, scaled by inflation."""
+    n = max(1, int(household_size))
+    return (FPL_BASE + FPL_PER_ADDITIONAL * (n - 1)) * bracket_factor
+
+
+def _aca_applicable_pct(fpl_ratio: float) -> float:
+    """Expected-contribution percentage of MAGI, interpolated on the FPL-ratio schedule."""
+    anchors = ACA_APPLICABLE_PCT
+    if fpl_ratio <= anchors[0][0]:
+        return anchors[0][1]
+    if fpl_ratio >= anchors[-1][0]:
+        return anchors[-1][1]
+    for (lo_r, lo_p), (hi_r, hi_p) in zip(anchors, anchors[1:]):
+        if lo_r <= fpl_ratio <= hi_r:
+            span = hi_r - lo_r
+            frac = (fpl_ratio - lo_r) / span if span > 0 else 0.0
+            return lo_p + frac * (hi_p - lo_p)
+    return anchors[-1][1]
+
+
+def calculate_aca_ptc(
+    magi: float,
+    benchmark_premium: float,
+    household_size: int,
+    bracket_factor: float = 1.0,
+) -> float:
+    """
+    Annual ACA Premium Tax Credit (subsidy) for pre-65 marketplace coverage.
+
+    The credit equals the benchmark (second-lowest-cost silver) premium minus the
+    household's expected contribution (applicable % of MAGI), floored at $0 and capped at
+    the premium itself. Above the 400%-FPL cliff the credit is $0 (2026 law — the ARPA/IRA
+    8.5% cap has expired). `benchmark_premium` should already be in the year's nominal
+    dollars; `bracket_factor` inflation-indexes the FPL thresholds to match.
+    """
+    if benchmark_premium <= 0:
+        return 0.0
+    fpl = aca_fpl(household_size, bracket_factor)
+    if fpl <= 0:
+        return 0.0
+    fpl_ratio = magi / fpl
+    if fpl_ratio > ACA_FPL_CLIFF_RATIO:
+        return 0.0  # 400% FPL cliff — no subsidy
+    expected_contribution = _aca_applicable_pct(fpl_ratio) * max(0.0, magi)
+    return max(0.0, min(benchmark_premium, benchmark_premium - expected_contribution))
+
+
 def calculate_ss_taxable_amount(
     provisional_income: float,
     ss_benefit: float,
@@ -94,8 +143,18 @@ def calculate_ss_taxable_amount(
 
 
 def bracket_ceiling_for_rate(rate: float, filing_status: str, bracket_factor: float = 1.0) -> float:
-    """Returns the taxable income ceiling for a given marginal rate bracket."""
-    return BRACKET_CEILINGS[filing_status].get(rate, 0.0) * bracket_factor
+    """Returns the taxable income ceiling (top of the bracket) for a given marginal rate.
+
+    Derived from the authoritative ORDINARY_BRACKETS table rather than the partial
+    BRACKET_CEILINGS lookup, which only carried the 10/12/22/24% ceilings — every other
+    rate (notably 32% and 35%) silently returned 0.0, so a "fill to 32%/35% bracket"
+    Roth conversion filled only to the standard deduction and converted almost nothing.
+    The top bracket (37%, upper bound None) has no ceiling and returns +inf (unbounded).
+    """
+    for upper, r in ORDINARY_BRACKETS[filing_status]:
+        if r == rate:
+            return float("inf") if upper is None else upper * bracket_factor
+    return 0.0
 
 
 def marginal_rate(taxable_income: float, filing_status: str) -> float:

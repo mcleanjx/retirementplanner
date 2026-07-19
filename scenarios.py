@@ -58,11 +58,20 @@ def validate_scenario_name(name: str) -> None:
         )
 
 
-def save_scenario(name: str, profile: dict, assumptions: dict, accounts: list[dict], roth_conversion: dict | None = None) -> None:
+def save_scenario(name: str, profile: dict, assumptions: dict, accounts: list[dict], roth_conversion: dict | None = None, mc_summary: dict | None = None) -> None:
     _ensure_dir()
     validate_scenario_name(name)
     safe_name = name.strip()
     path = SCENARIOS_DIR / f"{safe_name}.json"
+    # Preserve a previously recorded Monte Carlo summary on a normal save (which
+    # doesn't carry MC data) so re-saving the plan doesn't wipe the last-run MC
+    # headline. An explicit mc_summary always overrides.
+    if mc_summary is None and path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            mc_summary = existing.get("mc_summary")
+        except Exception:
+            pass
     payload = {
         "scenario_name": name,
         "profile": profile,
@@ -70,7 +79,29 @@ def save_scenario(name: str, profile: dict, assumptions: dict, accounts: list[di
         "accounts": accounts,
         "roth_conversion": roth_conversion or {},
     }
+    if mc_summary is not None:
+        payload["mc_summary"] = mc_summary
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def save_mc_summary(name: str, mc_summary: dict) -> None:
+    """Record the last-run Monte Carlo summary onto an existing scenario file.
+
+    Loads the current scenario JSON and rewrites it with `mc_summary` attached,
+    leaving all other fields untouched. No-op if the scenario doesn't exist yet.
+    """
+    _ensure_dir()
+    path = SCENARIOS_DIR / f"{_safe_name(name)}.json"
+    if not path.exists():
+        path = SCENARIOS_DIR / f"{name}.json"
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    data["mc_summary"] = mc_summary
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def load_scenario(name: str) -> dict:

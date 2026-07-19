@@ -7,12 +7,11 @@ import pandas as pd
 from projections import project_accumulation
 from withdrawals import simulate_retirement, TRADITIONAL_TYPES, ROTH_TYPES
 import charts as _charts
-import montecarlo as _mc
 import montecarlo_v2 as _mc2
 import plotly.graph_objects as go
 import optimizer as _opt
 import optimizer_v2 as _opt_v2
-from scenarios import list_scenarios, save_scenario, load_scenario, delete_scenario, load_tracking, save_tracking, get_last_used_scenario, set_last_used_scenario, validate_scenario_name
+from scenarios import list_scenarios, save_scenario, save_mc_summary, load_scenario, delete_scenario, load_tracking, save_tracking, get_last_used_scenario, set_last_used_scenario, validate_scenario_name
 from constants import CONTRIBUTION_LIMITS
 
 __version__ = "2.0.0"
@@ -54,6 +53,8 @@ DEFAULT_PROFILE = {
     "pre_medicare_healthcare": 15000.0,
     "post_medicare_healthcare": 12000.0,
     "healthcare_inflation": None,
+    "model_aca_subsidy": False,
+    "aca_household_size": None,
 }
 
 DEFAULT_ASSUMPTIONS = {
@@ -112,6 +113,15 @@ DEFAULT_ROTH_CONVERSION = {
 }
 
 
+def _plan_signature(profile, accounts_at_retirement, assumptions, roth_conversion, spending_overrides) -> str:
+    """Signature of the plan inputs that a Monte Carlo run depends on.
+
+    Used both when caching an MC result and when deciding whether a recorded MC
+    headline is still current for the plan shown in the Summary.
+    """
+    return repr((profile, accounts_at_retirement, assumptions, roth_conversion, spending_overrides))
+
+
 def _init_state():
     if "profile" not in st.session_state:
         # Auto-load the last explicitly used scenario on first run / page refresh
@@ -124,6 +134,7 @@ def _init_state():
                 st.session_state.accounts = copy.deepcopy(data["accounts"])
                 st.session_state.roth_conversion = data.get("roth_conversion", DEFAULT_ROTH_CONVERSION.copy())
                 st.session_state.spending_overrides = {}
+                st.session_state["mc_summary"] = data.get("mc_summary")
                 st.session_state["sc_name"] = data.get("scenario_name", recent)
                 return
             except Exception:
@@ -152,6 +163,9 @@ def _apply_pending_load():
         rc["source_account_ids"] = [old_id] if old_id else []
     st.session_state.roth_conversion = rc
     st.session_state.spending_overrides = {}
+    st.session_state["mc_summary"] = data.get("mc_summary")
+    st.session_state.pop("mc_result", None)
+    st.session_state.pop("mc_result_v2", None)
     st.session_state.pop("cmp_result", None)
     _loaded_name = data.get("scenario_name", "My Scenario")
     st.session_state["sc_name"] = _loaded_name
@@ -170,6 +184,7 @@ def _apply_pending_new_scenario():
     st.session_state.pop("cmp_result", None)
     st.session_state.pop("mc_result", None)
     st.session_state.pop("mc_result_v2", None)
+    st.session_state["mc_summary"] = None
     st.session_state["sc_name"] = new_name
     save_scenario(
         new_name,
@@ -220,8 +235,7 @@ def _count_warnings(accounts, profile, summary) -> int:
     count = len(summary.get("warnings", []))
     cur_age = profile["current_age"]
     # 401k elective deferral: traditional_401k only (pre-tax designated contributions).
-    # Roth 401k accounts are excluded here because they also serve as mega backdoor Roth
-    # vehicles (after-tax, not elective deferrals); those are caught by the 415(c) check.
+    # Roth 401k accounts are excluded here (their after-tax deferrals are caught by 415(c)).
     _trad_401k = sum(a.get("annual_contribution", 0) for a in accounts if a.get("type") == "traditional_401k")
     if _trad_401k > 0:
         _401k_limit = CONTRIBUTION_LIMITS["401k"]
@@ -231,16 +245,13 @@ def _count_warnings(accounts, profile, summary) -> int:
             _401k_limit += CONTRIBUTION_LIMITS["401k_catchup_60"]
         if _trad_401k > _401k_limit:
             count += 1
-    # 401k total additions (415c): all plan money — elective (trad+Roth) + mega backdoor + match.
-    # Always checked (not just when mega backdoor is present) because a Roth 401k account may
-    # represent after-tax mega backdoor contributions and must respect the total-additions cap.
+    # 401k total additions (415c): all plan money — elective (trad+Roth) + employer match.
     _roth_401k = sum(a.get("annual_contribution", 0) for a in accounts if a.get("type") == "roth_401k")
-    _mbr_total = sum(a.get("mega_backdoor_roth", 0) for a in accounts if a.get("type") == "traditional_401k")
     _match_total = sum(
         min(a.get("annual_contribution", 0) * a.get("employer_match_percent", 0), a.get("employer_match_limit", 0))
         for a in accounts if a.get("type") in {"traditional_401k", "roth_401k"}
     )
-    _415c_total = _trad_401k + _roth_401k + _mbr_total + _match_total
+    _415c_total = _trad_401k + _roth_401k + _match_total
     if _415c_total > 0:
         _415c = CONTRIBUTION_LIMITS["401k_total_limit"]
         if 50 <= cur_age <= 59 or cur_age >= 64:
@@ -343,6 +354,22 @@ def sidebar_profile():
             ))
         else:
             p["healthcare_inflation"] = None
+        p["model_aca_subsidy"] = st.checkbox(
+            "Model ACA premium subsidy (pre-65)",
+            value=bool(p.get("model_aca_subsidy", False)),
+            help=(
+                "For pre-Medicare years, treat 'Pre-Medicare Annual Cost' as the FULL unsubsidized "
+                "premium and reduce it by the ACA Premium Tax Credit computed from each year's MAGI. "
+                "The subsidy disappears above the 400%-FPL cliff (2026 law), so higher-income "
+                "Roth-conversion years lose it — the optimizer and simulation now price this in."
+            ),
+        )
+        if p["model_aca_subsidy"]:
+            _default_hh = 2 if p.get("filing_status") == "married_filing_jointly" else 1
+            p["aca_household_size"] = st.number_input(
+                "ACA household size (for FPL)", 1, 10, int(p.get("aca_household_size") or _default_hh), 1,
+                help="Household size used to set the Federal Poverty Level, which anchors the 400% cliff and the subsidy sliding scale.",
+            )
         st.markdown(
             "<div style='font-size:0.8rem;color:#888;overflow-wrap:break-word;word-break:break-word;'>"
             "Post-Medicare: include <b>Part B</b> (~$2,435/yr/person), Part D, supplemental (Medigap), "
@@ -495,15 +522,6 @@ def sidebar_accounts():
                             f"2026 elective deferral limit: **\\${_base:,}**. "
                             f"At age 50, a \\$9,000 Roth catch-up becomes available (add a separate Roth 401(k) account for it)."
                         )
-
-                if a["type"] == "traditional_401k":
-                    a["mega_backdoor_roth"] = float(st.number_input(
-                        "Mega Backdoor Roth — After-Tax Contribution ($/yr)", 0, 100000,
-                        int(a.get("mega_backdoor_roth", 0)), 500, key=f"a_mbr_{a['id']}",
-                        help="After-tax (non-elective) 401k contributions converted to Roth in-plan. "
-                             "Separate from and in addition to your pre-tax elective deferral. "
-                             "Total plan additions (pre-tax + mega backdoor + employer match) cannot exceed \\$70,000/yr (\\$79,000 with catch-up for ages 50+).",
-                    ))
 
                 if a["type"] in {"taxable", "reit"}:
                     a["basis"] = float(st.number_input("Cost Basis ($)", 0, 10000000, int(a.get("basis", a["balance"] * 0.5)), 1000, key=f"a_basis_{a['id']}"))
@@ -844,94 +862,148 @@ def main():
     else:
         tax_adj_at_le = portfolio_at_le
 
+    today_portfolio = sum(a["balance"] for a in accounts)
+    _infl_pct = assumptions.get("inflation_rate", 0.03) * 100
+
+    # Last-run Monte Carlo headline (Success Rate + Median at Life Expectancy).
+    # Prefer a fresh in-session result; otherwise fall back to the summary that was
+    # persisted onto the scenario file the last time Monte Carlo was run. `mc_stale`
+    # flags when the recorded run predates a change to the current plan inputs.
+    _cur_plan_sig = _plan_signature(profile, accounts_at_retirement, assumptions, roth_conversion, spending_overrides)
+    _mc_sess = st.session_state.get("mc_result_v2") or st.session_state.get("mc_result")
+    mc_display = None
+    mc_stale = False
+    if _mc_sess:
+        mc_display = {
+            "success_rate": _mc_sess["success_rate"],
+            "median_at_le": _mc_sess["percentiles"][50][-1],
+            "n_runs": _mc_sess["n_runs"],
+        }
+        mc_stale = _mc_sess.get("plan_sig") not in (None, _cur_plan_sig)
+    else:
+        _mc_saved = st.session_state.get("mc_summary")
+        if _mc_saved:
+            mc_display = {
+                "success_rate": _mc_saved.get("success_rate", 0.0),
+                "median_at_le": _mc_saved.get("median_at_le", 0.0),
+                "n_runs": _mc_saved.get("n_runs", 0),
+            }
+            mc_stale = _mc_saved.get("plan_sig") not in (None, _cur_plan_sig)
+
+    _eol_help = (f"This headline figure is the **full portfolio value**, before the ordinary income "
+                 f"tax still owed on pre-tax (Traditional) accounts. After that tax, the **tax-adjusted "
+                 f"legacy is ${tax_adj_at_le:,.0f}**. In that adjusted figure: Roth counts at full value "
+                 "(tax-free); pre-tax is discounted for the income tax owed; taxable/real-estate count "
+                 "at full value because they receive a stepped-up basis at death (embedded capital gains "
+                 "escape tax for heirs).")
+
+    def _render_eol_metric(container):
+        """Portfolio-at-life-expectancy metric, with the depleted red-box treatment."""
+        if portfolio_at_le <= 0:
+            container.markdown(
+                f"""<div style="border:2px solid #cc0000;border-radius:8px;padding:10px 14px;background:#fff0f0;">
+                <div style="font-size:0.85rem;color:#888;margin-bottom:4px;">Portfolio at Age {le_age}</div>
+                <div style="font-size:1.6rem;font-weight:700;color:#cc0000;">$0</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        else:
+            container.metric(f"Portfolio at Age {le_age}", f"${portfolio_at_le:,.0f}", help=_eol_help)
+
+    def _render_tax_adj_metric(container):
+        """After-tax legacy at life expectancy — the companion to Portfolio at Age {le_age}."""
+        container.metric(
+            f"Tax-Adjusted at Age {le_age}", f"${tax_adj_at_le:,.0f}",
+            help=(f"The headline Portfolio at Age {le_age} net of the deferred income tax heirs will "
+                  "owe: pre-tax (Traditional) balances are discounted for that tax; Roth counts at "
+                  "full value (tax-free); taxable/real estate at full value (stepped-up basis at death)."),
+        )
+
+    def _render_mc_metrics(rate_col, median_col):
+        """Fill two columns with the last-run Monte Carlo Success Rate & median legacy."""
+        if mc_display is None:
+            rate_col.metric("MC Success Rate", "—",
+                            help="Run the **Monte Carlo** tab to populate this headline.")
+            median_col.metric("MC Median at Life Exp.", "—")
+            return
+        _stale_note = ("\n\n⚠ From a previous plan — re-run the Monte Carlo tab to refresh." if mc_stale else "")
+        rate_col.metric(
+            "MC Success Rate", f"{mc_display['success_rate']:.0%}",
+            help=(f"Share of {mc_display['n_runs']:,} simulated market sequences where the portfolio "
+                  f"lasted to life expectancy (last Monte Carlo run).{_stale_note}"),
+        )
+        median_col.metric(
+            "MC Median at Life Exp.", f"${mc_display['median_at_le']:,.0f}",
+            help=(f"Median (50th-percentile) portfolio at life expectancy across the last "
+                  f"Monte Carlo run.{_stale_note}"),
+        )
+
     hdr_col, tog_col = st.columns([5, 1])
     hdr_col.subheader("Summary")
-    compact_view = tog_col.toggle("Snapshot", key="summary_compact", value=False)
+    more_details = tog_col.toggle("More Details", key="summary_more_details", value=False)
 
-    if compact_view:
-        # ── Compact snapshot view ──────────────────────────────────────────────
-        today_portfolio = sum(a["balance"] for a in accounts)
-        # Mode-aware: in fixed mode show the after-tax target (today's $); in SWR mode
-        # annual_spending_target is unused/stale, so show the SWR-implied year-1 withdrawal.
-        if fixed_net_mode:
-            spending_label = "Spending Goal"
-            spending_goal = assumptions.get("annual_spending_target", 0.0)
-            spending_help = "Your after-tax discretionary spending target in retirement (today's dollars, healthcare separate)."
-        else:
-            _swr = assumptions.get("safe_withdrawal_rate", 0.04)
-            spending_label = "Withdrawal (yr 1)"
-            spending_goal = total_at_retirement * _swr
-            spending_help = f"SWR mode: {_swr:.1%} × portfolio at retirement (gross, retirement-year dollars; taxes and healthcare come out of this)."
+    if not more_details:
+        # ── Headline summary — clean 4×2 grid ──────────────────────────────────
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Current Portfolio", f"${today_portfolio:,.0f}",
+                  help=f"Total across all accounts today (age {profile['current_age']}).")
+        c2.metric("Portfolio at Retirement", f"${total_at_retirement:,.0f}")
+        c3.metric("Portfolio Longevity", longevity_str)
+        c4.metric(
+            annual_withdrawal_label,
+            f"${annual_withdrawal:,.0f}",
+            help=f"Your spending target ({_infl_pct:.1f}% inflation applied from today's dollars to retirement year 1)." if fixed_net_mode else None,
+        )
 
-        c_now, c_ret, c_eol = st.columns(3)
-        with c_now:
-            st.markdown(f"**Today  (Age {profile['current_age']})**")
-            st.metric("Portfolio", f"${today_portfolio:,.0f}")
-            st.metric(spending_label, f"${spending_goal:,.0f}", help=spending_help)
-        with c_ret:
-            st.markdown(f"**Retirement Day 1  (Age {profile['retirement_age']})**")
-            st.metric("Portfolio", f"${total_at_retirement:,.0f}")
-        with c_eol:
-            st.markdown(f"**End of Life  (Age {le_age})**")
-            if portfolio_at_le <= 0:
-                st.markdown(
-                    """<div style="border:2px solid #cc0000;border-radius:8px;padding:10px 14px;background:#fff0f0;margin-bottom:1rem;">
-                    <div style="font-size:0.85rem;color:#888;margin-bottom:4px;">Portfolio</div>
-                    <div style="font-size:1.6rem;font-weight:700;color:#cc0000;">$0 — Depleted</div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.metric("Portfolio", f"${portfolio_at_le:,.0f}",
-                          help=f"This headline figure is the **full portfolio value**, before the ordinary income "
-                               f"tax still owed on pre-tax (Traditional) accounts. After that tax, the **tax-adjusted "
-                               f"legacy is ${tax_adj_at_le:,.0f}**. In that adjusted figure: Roth counts at full value "
-                               "(tax-free); pre-tax is discounted for the income tax owed; taxable/real-estate count "
-                               "at full value because they receive a stepped-up basis at death (embedded capital gains "
-                               "escape tax for heirs).")
+        c5, c6, c7, c8 = st.columns(4)
+        _render_eol_metric(c5)
+        _render_tax_adj_metric(c6)
+        _render_mc_metrics(c7, c8)
     else:
-        # ── Full summary view ──────────────────────────────────────────────────
-        c1, c2, c3, c4, c5 = st.columns(5)
+        # ── More Details — every metric across the summary ─────────────────────
         _comp_note = ("This is the composition on **day 1 of retirement** — it does not change with Roth "
                       "conversions, which happen later during retirement and gradually move money from "
                       "**Pre-Tax → Roth**. See the year-by-year chart below (or the optimizer's End-of-Plan "
                       "by Tax Treatment table) for the post-conversion mix.")
-        c1.metric("Portfolio at Retirement", f"${total_at_retirement:,.0f}")
-        c2.metric("Pre-Tax", f"${pre_tax_total:,.0f}", help=_comp_note)
-        c3.metric("Roth / Tax-Free", f"${roth_total:,.0f}", help=_comp_note)
-        c4.metric("Taxable / Real Estate", f"${taxable_total:,.0f}", help=_comp_note)
-        c5.metric("Portfolio Longevity", longevity_str)
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Current Portfolio", f"${today_portfolio:,.0f}",
+                  help=f"Total across all accounts today (age {profile['current_age']}).")
+        c2.metric("Portfolio at Retirement", f"${total_at_retirement:,.0f}")
+        c3.metric("Pre-Tax", f"${pre_tax_total:,.0f}", help=_comp_note)
+        c4.metric("Roth / Tax-Free", f"${roth_total:,.0f}", help=_comp_note)
+        c5.metric("Taxable / Real Estate", f"${taxable_total:,.0f}", help=_comp_note)
 
         c6, c7, c8, c9, c10 = st.columns(5)
-        _infl_pct = assumptions.get("inflation_rate", 0.03) * 100
-        c6.metric(
+        c6.metric("Portfolio Longevity", longevity_str)
+        c7.metric(
             annual_withdrawal_label,
             f"${annual_withdrawal:,.0f}",
             help=f"Your spending target ({_infl_pct:.1f}% inflation applied from today's dollars to retirement year 1)." if fixed_net_mode else None,
         )
         _lt_state = float(ret_df["state_tax"].sum()) if not ret_df.empty and "state_tax" in ret_df.columns else 0.0
         _lt_fed = summary['lifetime_taxes'] - _lt_state
-        c7.metric("Lifetime Taxes", f"${summary['lifetime_taxes']:,.0f}",
-                  help=f"Federal: ${_lt_fed:,.0f}  ·  State: ${_lt_state:,.0f}")
-        c8.metric("Lifetime Healthcare", f"${summary['lifetime_healthcare']:,.0f}")
-        c9.metric("Lifetime Passive Income", f"${summary['lifetime_passive_income']:,.0f}")
-        with c10:
-            if portfolio_at_le <= 0:
-                st.markdown(
-                    f"""<div style="border:2px solid #cc0000;border-radius:8px;padding:10px 14px;background:#fff0f0;">
-                    <div style="font-size:0.85rem;color:#888;margin-bottom:4px;">Portfolio at Age {le_age}</div>
-                    <div style="font-size:1.6rem;font-weight:700;color:#cc0000;">$0</div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.metric(f"Portfolio at Age {le_age}", f"${portfolio_at_le:,.0f}",
-                          help=f"This headline figure is the **full portfolio value**, before the ordinary income "
-                               f"tax still owed on pre-tax (Traditional) accounts. After that tax, the **tax-adjusted "
-                               f"legacy is ${tax_adj_at_le:,.0f}**. In that adjusted figure: Roth counts at full value "
-                               "(tax-free); pre-tax is discounted for the income tax owed; taxable/real-estate count "
-                               "at full value because they receive a stepped-up basis at death (embedded capital gains "
-                               "escape tax for heirs).")
+        _lt_irmaa = float(ret_df["federal_irmaa"].sum()) if not ret_df.empty and "federal_irmaa" in ret_df.columns else 0.0
+        c8.metric("Lifetime Taxes", f"${summary['lifetime_taxes']:,.0f}",
+                  help=(f"Federal: ${_lt_fed:,.0f}  ·  State: ${_lt_state:,.0f}\n\n"
+                        f"Includes ${_lt_irmaa:,.0f} of Medicare IRMAA surcharges."))
+        _lt_aca = summary.get("lifetime_aca_subsidy", 0.0)
+        c9.metric(
+            "Lifetime Healthcare", f"${summary['lifetime_healthcare']:,.0f}",
+            delta=(f"−${_lt_aca:,.0f} ACA subsidy" if _lt_aca > 0 else None),
+            delta_color="inverse",
+            help=("Net of ACA premium tax credits. Gross pre-Medicare premiums totaled "
+                  f"${summary['lifetime_healthcare'] + _lt_aca:,.0f}; ACA subsidies covered "
+                  f"${_lt_aca:,.0f}." if _lt_aca > 0 else None),
+        )
+        c10.metric("Lifetime Passive Income", f"${summary['lifetime_passive_income']:,.0f}")
+
+        c11, c12, c13, c14, _ = st.columns(5)
+        _render_eol_metric(c11)
+        _render_tax_adj_metric(c12)
+        _render_mc_metrics(c13, c14)
+
+    if mc_stale:
+        st.caption("⚠ Monte Carlo results shown above are from a previous plan — re-run the **Monte Carlo** tab to refresh.")
 
     if portfolio_at_le <= 0:
         st.error(
@@ -1219,18 +1291,15 @@ def main():
             st.dataframe(acc_pivot.style.format("${:,.0f}", subset=acc_pivot.columns[1:]), width='stretch')
 
         st.subheader("Retirement Account Balances")
-        bal_cols = ["age"] + [c for c in ret_df.columns if c.startswith("bal_")] + ["total_portfolio"]
-        bal_cols = [c for c in bal_cols if c in ret_df.columns]
-        bal_df = ret_df[bal_cols].copy()
-        col_rename = {"age": "Age", "total_portfolio": "Total Portfolio"}
-        for a in accounts_at_retirement:
-            col_key = f"bal_{a['name'].replace(' ', '_')}"
-            if col_key in bal_df.columns:
-                col_rename[col_key] = a["name"]
-        bal_df = bal_df.rename(columns=col_rename)
-        bal_df["Age"] = bal_df["Age"].astype(int)
+        st.caption(
+            "Balances are shown at year-end (after that year's growth and withdrawals). "
+            "The first row is the opening balance at retirement."
+        )
+        # Shared helper prepends an "at retirement" opening row and labels each simulated
+        # row "(year-end)", so the table no longer appears to grow a phantom extra year.
+        bal_df = _opt.build_balances_table(ret_df, accounts_at_retirement)
         dollar_cols = [c for c in bal_df.columns if c != "Age"]
-        st.dataframe(bal_df.style.format("${:,.0f}", subset=dollar_cols), width='stretch')
+        st.dataframe(bal_df.style.format("${:,.0f}", subset=dollar_cols), hide_index=True, width='stretch')
 
         st.subheader("Retirement Year-by-Year")
         # Withdrawal % = gross spending need / start-of-year portfolio.
@@ -1258,18 +1327,24 @@ def main():
             # ── Tax calculation inputs ────────────────────────────
             "ordinary_income", "ltcg_income", "magi",
             # ── Tax bill (federal vs state, then total) ──────────
-            "federal_tax", "state_tax", "total_tax", "effective_tax_rate", "federal_irmaa", "healthcare_cost",
+            "federal_tax", "state_tax", "total_tax", "effective_tax_rate", "federal_irmaa",
+            # ── Healthcare (+ ACA subsidy, when modeled) ─────────
+            "aca_gross_premium", "aca_subsidy", "aca_cliff_active", "healthcare_cost",
             # ── Result ────────────────────────────────────────────
             "after_tax_spending", "actual_after_tax_net", "net_spending_delta", "surplus_reinvested",
             # ── End state ─────────────────────────────────────────
             "total_portfolio",
         ]
+        # ACA subsidy columns only add value when the feature is enabled
+        if not profile.get("model_aca_subsidy"):
+            display_cols = [c for c in display_cols
+                            if c not in ("aca_gross_premium", "aca_subsidy", "aca_cliff_active")]
         display_cols = [c for c in display_cols if c in _display_df.columns]
         # Hide fixed-net-mode-only columns when in SWR mode (they're all None)
         if not fixed_net_mode:
             display_cols = [c for c in display_cols if c not in ("net_spending_target", "actual_after_tax_net", "net_spending_delta")]
         fmt = {c: "${:,.0f}" for c in display_cols
-               if c not in ("age", "effective_tax_rate", "spending_override_active", "withdrawal_pct")}
+               if c not in ("age", "effective_tax_rate", "spending_override_active", "withdrawal_pct", "aca_cliff_active")}
         fmt["effective_tax_rate"] = "{:.1%}"
         fmt["withdrawal_pct"] = "{:.2%}"
 
@@ -1532,8 +1607,7 @@ def main():
         contrib_warnings = []
         _cur_age = profile["current_age"]
         # 401k elective deferral: traditional_401k only (pre-tax designated contributions).
-        # Roth 401k accounts are excluded here because they also serve as mega backdoor Roth
-        # vehicles (after-tax, not elective deferrals); those are caught by the 415(c) check.
+        # Roth 401k accounts are excluded here (their after-tax deferrals are caught by 415(c)).
         _trad_401k = sum(a.get("annual_contribution", 0) for a in accounts if a.get("type") == "traditional_401k")
         if _trad_401k > 0:
             _401k_limit = CONTRIBUTION_LIMITS["401k"]
@@ -1546,16 +1620,13 @@ def main():
                     f"**401(k) elective deferral**: traditional 401k contributions of \\${_trad_401k:,.0f}/yr exceed the "
                     f"2026 limit of \\${_401k_limit:,.0f} for age {_cur_age}."
                 )
-        # 401k Section 415(c): all plan money — elective (trad+Roth) + mega backdoor + match.
-        # Always checked because a Roth 401k account may represent after-tax mega backdoor
-        # contributions that must respect the total-additions cap regardless of elective deferrals.
+        # 401k Section 415(c): all plan money — elective (trad+Roth) + employer match.
         _roth_401k = sum(a.get("annual_contribution", 0) for a in accounts if a.get("type") == "roth_401k")
-        _mbr_total = sum(a.get("mega_backdoor_roth", 0) for a in accounts if a.get("type") == "traditional_401k")
         _match_total = sum(
             min(a.get("annual_contribution", 0) * a.get("employer_match_percent", 0), a.get("employer_match_limit", 0))
             for a in accounts if a.get("type") in {"traditional_401k", "roth_401k"}
         )
-        _grand_total = _trad_401k + _roth_401k + _mbr_total + _match_total
+        _grand_total = _trad_401k + _roth_401k + _match_total
         if _grand_total > 0:
             _415c = CONTRIBUTION_LIMITS["401k_total_limit"]
             if 50 <= _cur_age <= 59 or _cur_age >= 64:
@@ -1565,7 +1636,7 @@ def main():
             if _grand_total > _415c:
                 contrib_warnings.append(
                     f"**401(k) Section 415(c)**: total plan additions of \\${_grand_total:,.0f}/yr "
-                    f"(traditional \\${_trad_401k:,.0f} + Roth/mega-backdoor \\${_roth_401k + _mbr_total:,.0f} + employer match \\${_match_total:,.0f}) "
+                    f"(traditional \\${_trad_401k:,.0f} + Roth \\${_roth_401k:,.0f} + employer match \\${_match_total:,.0f}) "
                     f"exceed the 2026 annual additions limit of \\${_415c:,.0f}."
                 )
         for _acct in accounts:
@@ -1626,7 +1697,7 @@ def main():
 : Moving money from a pre-tax account (Traditional) to a post-tax account (Roth). You pay ordinary income tax now, but future growth and qualified withdrawals are tax-free. Most effective in low-income years before Social Security starts or before RMDs kick in at 73.
 
 **Contribution limits**
-: 401(k) elective deferral: $23,500 in 2026, +$9,000 Roth catch-up (age 50–59/64+), +$11,250 Roth catch-up (age 60–63). Limit is per-person across all 401k accounts. For high earners, the catch-up must be designated Roth — model the $23,500 base in a Traditional 401(k) and the catch-up in a separate Roth 401(k). Section 415(c) total additions limit (elective + employer match + after-tax): $70,000/yr ($79,000 with catch-up). Mega backdoor Roth uses after-tax contributions up to the 415(c) headroom; enter the amount on the Traditional 401(k) account. IRA: $7,000 (+$1,000 catch-up age 50+). HSA: $4,300 individual / $8,550 family.
+: 401(k) elective deferral: $23,500 in 2026, +$9,000 Roth catch-up (age 50–59/64+), +$11,250 Roth catch-up (age 60–63). Limit is per-person across all 401k accounts. For high earners, the catch-up must be designated Roth — model the $23,500 base in a Traditional 401(k) and the catch-up in a separate Roth 401(k). Section 415(c) total additions limit (elective + employer match + after-tax): $70,000/yr ($79,000 with catch-up). To model a mega backdoor Roth (after-tax contributions converted to Roth in-plan), add a separate Roth 401(k) account for those dollars. IRA: $7,000 (+$1,000 catch-up age 50+). HSA: $4,300 individual / $8,550 family.
 """)
 
 
@@ -1634,49 +1705,38 @@ def main():
         _kpi_bar()
         st.subheader("Monte Carlo Simulation")
 
-        mc_model = st.radio(
-            "Return model",
-            ["CMA Log-Normal (Recommended)", "Standard (Normal) ⚠ Experimental"],
-            horizontal=True,
-            key="mc_model",
-            help=(
-                "CMA Log-Normal: log-normal returns with correlated equity/bond factors, "
-                "stochastic inflation, and CMA-calibrated default volatilities. "
-                "Standard: independent normal draws per account, single volatility parameter. "
-                "stochastic inflation, and CMA-calibrated default volatilities."
-            ),
+        # The Standard (Normal) engine (montecarlo.py) is retained for tests and
+        # comparison but retired from the UI; CMA log-normal is the only user-facing
+        # model. `use_v2` stays as a guard so the v2-only code paths read explicitly.
+        use_v2 = True
+        st.caption(
+            "Log-normal returns with correlated equity/bond factors and stochastic inflation, "
+            "calibrated to major-asset-manager 10–15yr capital market assumptions. "
+            "**Success** = the portfolio never hits $0 before your life expectancy."
         )
-        use_v2 = "CMA" in mc_model
-
-        if use_v2:
-            st.caption(
-                "**CMA Log-Normal model** draws returns from log-normal distributions "
-                "(corrects the arithmetic/geometric mean gap, bounds the left tail at −100%). "
-                "Equity and bond factors are correlated via Cholesky decomposition — "
-                "bad equity years hit all accounts simultaneously. "
-                "Inflation is stochastic (~1.5% std dev around your assumed rate) so real spending "
-                "power varies across trials. "
-                "Default volatilities are calibrated to JPMorgan/Vanguard/BlackRock 10–15yr CMA consensus."
-            )
-        else:
-            st.caption(
-                "**Standard model** draws returns independently from a normal distribution "
-                "per account per year. Simple and fast; underestimates left-tail risk slightly "
-                "because it ignores cross-account correlation and uses fixed inflation. "
-                "**Success** = portfolio never hits $0 before your life expectancy."
-            )
-            st.warning(
-                "**Experimental — not recommended.** The Standard model will be deprecated in a future release. "
-                "Use CMA Log-Normal for more realistic results.",
-                icon="⚠️",
-            )
 
         # --- Parameters ---
         _ret = assumptions.get("retirement_return_rate", 0.065)
-        if use_v2:
-            # CMA preset selector — when not "User-defined", overrides equity/bond
-            # vol+mean for global-rate accounts using a published 2026 CMA set.
-            from montecarlo_v2 import CMA_PRESETS as _CMA_PRESETS
+        from montecarlo_v2 import CMA_PRESETS as _CMA_PRESETS
+
+        alloc_col, n_col = st.columns([3, 1])
+        with alloc_col:
+            mc_stock_pct = st.slider(
+                "Stock Allocation (%)", min_value=0, max_value=100, value=60, step=5,
+                help=(
+                    "Fraction of each investment account modeled as equities; remainder as bonds. "
+                    "Controls path volatility only — expected return stays equal to the Retirement Return Rate."
+                ),
+                key="mc_stock_pct",
+            ) / 100.0
+        with n_col:
+            mc_n = int(st.number_input(
+                "Trials", min_value=100, max_value=10000, value=1000, step=100, key="mc_n",
+            ))
+
+        with st.expander("⚙️ Advanced — capital market assumptions", expanded=False):
+            # Preset overrides equity/bond vol+mean for global-rate accounts using a
+            # published 2026 CMA set; "User-defined" uses the vol sliders below.
             _cma_options = ["User-defined"] + [v["label"] for v in _CMA_PRESETS.values()]
             _cma_keys = [None] + list(_CMA_PRESETS.keys())
             _cma_label = st.selectbox(
@@ -1695,12 +1755,10 @@ def main():
             if mc_cma_preset is not None:
                 _p = _CMA_PRESETS[mc_cma_preset]
                 st.caption(
-                    f"**{_p['label']}** — equity mean **{_p['equity_mean']:.1%}** "
-                    f"({_p['equity_vol']:.1%} vol), bond mean **{_p['bond_mean']:.1%}** "
-                    f"({_p['bond_vol']:.1%} vol). {_p['description']} "
-                    f"_Overrides the vol sliders below._"
+                    f"**{_p['label']}** — equity {_p['equity_mean']:.1%} ({_p['equity_vol']:.1%} vol), "
+                    f"bond {_p['bond_mean']:.1%} ({_p['bond_vol']:.1%} vol). Overrides the vol sliders below."
                 )
-            vol_col1, vol_col2, vol_col3, n_col = st.columns([2, 2, 2, 1])
+            vol_col1, vol_col2, vol_col3 = st.columns(3)
             with vol_col1:
                 mc_equity_vol = st.slider(
                     "Equity Volatility (%)", min_value=5, max_value=30, value=16, step=1,
@@ -1719,47 +1777,14 @@ def main():
                     help="Long-run equity/bond correlation. CMA consensus: ~0–15%.",
                     key="mc_eq_bond_corr",
                 ) / 100.0
-            with n_col:
-                mc_n = int(st.number_input(
-                    "Trials", min_value=100, max_value=10000, value=1000, step=100, key="mc_n",
-                ))
-        else:
-            vol_col, n_col = st.columns([3, 1])
-            with vol_col:
-                mc_vol = st.slider(
-                    "Equity Volatility (%)", min_value=1, max_value=30, value=12, step=1,
-                    help=(
-                        "Std dev of annual equity returns. US equities: ~15–17%. "
-                        "Balanced 60/40: ~10–12%. Bond volatility = 30% of this value."
-                    ),
-                    key="mc_vol",
-                ) / 100.0
-            with n_col:
-                mc_n = int(st.number_input(
-                    "Trials", min_value=100, max_value=10000, value=1000, step=100, key="mc_n",
-                ))
-
-        mc_stock_pct = st.slider(
-            "Stock Allocation (%)", min_value=0, max_value=100, value=60, step=5,
-            help=(
-                "Fraction of each investment account modeled as equities; remainder as bonds. "
-                "Controls path volatility only — expected return stays equal to Retirement Return Rate."
-            ),
-            key="mc_stock_pct",
-        ) / 100.0
 
         if use_v2:
-            from montecarlo_v2 import EQUITY_RISK_PREMIUM
-            _eq_mean = _ret + (1 - mc_stock_pct) * EQUITY_RISK_PREMIUM
-            _bd_mean = _ret - mc_stock_pct * EQUITY_RISK_PREMIUM
             _eff_vol_v2 = mc_stock_pct * mc_equity_vol + (1 - mc_stock_pct) * mc_bond_vol
             st.caption(
-                f"Expected portfolio return: **{_ret:.1%}** (matches Retirement Return Rate). "
-                f"Component means: equity **{_eq_mean:.1%}**, bond **{_bd_mean:.1%}** "
-                f"(3pp equity risk premium preserved). "
-                f"Effective portfolio volatility: **{_eff_vol_v2:.1%}**. "
-                f"Inflation draws: {assumptions.get('inflation_rate', 0.03):.1%} ± 1.5% per year. "
-                f"Geometric mean ≈ {_ret - _eff_vol_v2**2/2:.1%}."
+                f"Expected return **{_ret:.1%}** (matches your Retirement Return Rate) · "
+                f"effective volatility **{_eff_vol_v2:.1%}** · "
+                f"inflation {assumptions.get('inflation_rate', 0.03):.1%} ± 1.5%/yr · "
+                f"geometric mean ≈ {_ret - _eff_vol_v2**2/2:.1%}."
             )
             mc_withdrawal_mode = st.radio(
                 "Withdrawal rule",
@@ -1794,16 +1819,6 @@ def main():
                 )
             else:
                 mc_spending_floor = 0.0
-        else:
-            mc_spending_floor = 0.0
-            _eff_vol = mc_stock_pct * mc_vol + (1 - mc_stock_pct) * (mc_vol * 0.30)
-            st.caption(
-                f"Expected portfolio return: **{_ret:.1%}** (matches Retirement Return Rate). "
-                f"Effective portfolio volatility: **{_eff_vol:.1%}** "
-                f"({mc_stock_pct:.0%} stocks × {mc_vol:.0%} + "
-                f"{1 - mc_stock_pct:.0%} bonds × {mc_vol * 0.30:.0%}). "
-                f"Geometric mean ≈ {_ret - _eff_vol**2/2:.1%}."
-            )
 
         mc_crashes = st.checkbox(
             "Include a market crash in the first year of retirement (−20% equity shock)",
@@ -1838,21 +1853,17 @@ def main():
                         "statistics that depend monotonically on returns. Cheap, composes with Sobol."
                     ),
                 )
-        else:
-            mc_quasi = True
-            mc_antithetic = True
-
         det_portfolio = ret_df["total_portfolio"].tolist() if not ret_df.empty else []
 
         # --- Run button ---
-        run_key = "mc_result_v2" if use_v2 else "mc_result"
+        run_key = "mc_result_v2"
         # Signature of the underlying plan inputs (not the MC knobs). If any of these change
         # after a run — spending, balances, ages, conversions, overrides — the cached MC fan
         # and metrics are stale relative to the freshly-recomputed deterministic baseline,
         # which is exactly what makes the chart and the numbers disagree. Captured at run time
         # and compared on display so such changes also trip the staleness guard below.
-        _mc_plan_sig = repr((profile, accounts_at_retirement, assumptions,
-                             roth_conversion, spending_overrides))
+        _mc_plan_sig = _plan_signature(profile, accounts_at_retirement, assumptions,
+                                       roth_conversion, spending_overrides)
         if st.button("▶ Run Monte Carlo", type="primary", key="mc_run"):
             with st.spinner(f"Running {mc_n:,} simulations…"):
                 if use_v2:
@@ -1874,20 +1885,26 @@ def main():
                         quasi_random=mc_quasi,
                         antithetic=mc_antithetic,
                     )
-                else:
-                    result = _mc.run_monte_carlo(
-                        accounts_at_retirement=accounts_at_retirement,
-                        profile=profile,
-                        assumptions=assumptions,
-                        n_runs=mc_n,
-                        volatility=mc_vol,
-                        enable_crashes=mc_crashes,
-                        stock_pct=mc_stock_pct,
-                        roth_conversion=roth_conversion,
-                        spending_overrides=spending_overrides,
-                    )
             result["plan_sig"] = _mc_plan_sig
             st.session_state[run_key] = result
+            # Record the last-run MC headline onto the scenario file so the Summary
+            # header can show Success Rate + Median at Life Expectancy without forcing
+            # a re-run on every page load.
+            _mc_summary_rec = {
+                "success_rate": result["success_rate"],
+                "median_at_le": result["percentiles"][50][-1],
+                "n_runs": result["n_runs"],
+                "model": "CMA Log-Normal" if use_v2 else "Standard",
+                "captured_date": date.today().isoformat(),
+                "plan_sig": _mc_plan_sig,
+            }
+            st.session_state["mc_summary"] = _mc_summary_rec
+            _mc_sc_name = st.session_state.get("sc_name", "")
+            if _mc_sc_name:
+                try:
+                    save_mc_summary(_mc_sc_name, _mc_summary_rec)
+                except Exception:
+                    pass
 
         # --- Results for selected model ---
         mc_result = st.session_state.get(run_key)
@@ -1910,14 +1927,6 @@ def main():
                 or mc_result.get("cma_preset") != mc_cma_preset
                 or mc_result.get("quasi_random", True) != mc_quasi
                 or mc_result.get("antithetic", True) != mc_antithetic
-                or mc_result.get("plan_sig") != _mc_plan_sig
-            )
-        elif mc_result:
-            stale = (
-                mc_result.get("volatility") != mc_vol
-                or mc_result.get("n_runs") != mc_n
-                or mc_result.get("enable_crashes") != mc_crashes
-                or mc_result.get("stock_pct") != mc_stock_pct
                 or mc_result.get("plan_sig") != _mc_plan_sig
             )
         else:
@@ -2618,7 +2627,7 @@ def main():
                     annual_rebalance_gain=best.get("annual_rebalance_gain", 0.0),
                 )
             else:
-                desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement, best.get("annual_rebalance_gain", 0.0), best.get("cash_reserve", 0.0))
+                desc = _opt._describe_strategy(best_ws, best_rc, accounts_at_retirement, best.get("annual_rebalance_gain", 0.0))
             desc_df = pd.DataFrame(
                 [{"Setting": k, "Recommended Value": v} for k, v in desc.items()]
             )
@@ -2650,14 +2659,18 @@ def main():
                 "rmd_amount", "taxable_withdrawal", "traditional_withdrawal", "roth_withdrawal", "bank_withdrawal",
                 "roth_conversion", "qual_dividends", "harvest_ltcg", "withdrawal_ltcg",
                 "ordinary_income", "ltcg_income", "magi",
-                "total_tax", "effective_tax_rate", "federal_irmaa", "healthcare_cost",
+                "total_tax", "effective_tax_rate", "federal_irmaa",
+                "aca_gross_premium", "aca_subsidy", "aca_cliff_active", "healthcare_cost",
                 "after_tax_spending", "total_portfolio",
             ]
+            if not profile.get("model_aca_subsidy"):
+                opt_detail_cols = [c for c in opt_detail_cols
+                                   if c not in ("aca_gross_premium", "aca_subsidy", "aca_cliff_active")]
             opt_detail_cols = [c for c in opt_detail_cols if c in _opt_display.columns]
             if not fixed_net_mode:
                 opt_detail_cols = [c for c in opt_detail_cols if c not in ("net_spending_target", "actual_after_tax_net")]
             opt_fmt = {c: "${:,.0f}" for c in opt_detail_cols
-                       if c not in ("age", "effective_tax_rate", "withdrawal_pct")}
+                       if c not in ("age", "effective_tax_rate", "withdrawal_pct", "aca_cliff_active")}
             opt_fmt["effective_tax_rate"] = "{:.1%}"
             opt_fmt["withdrawal_pct"] = "{:.2%}"
             st.dataframe(

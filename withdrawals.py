@@ -1,9 +1,14 @@
 import copy
 import pandas as pd
-from constants import RMD_TABLE, RMD_START_AGE, STANDARD_DEDUCTION, BRACKET_CEILINGS, IRMAA_TIERS
+from constants import (
+    RMD_TABLE, RMD_START_AGE, STANDARD_DEDUCTION, BRACKET_CEILINGS, IRMAA_TIERS,
+    ACA_FPL_CLIFF_RATIO,
+)
 from taxes import (
     calculate_year_taxes,
     calculate_ss_taxable_amount,
+    calculate_aca_ptc,
+    aca_fpl,
     bracket_ceiling_for_rate,
 )
 
@@ -80,8 +85,14 @@ def _discretionary_after_tax_net(
     state_rate: float,
     bracket_factor: float,
     ss_taxable: float,
+    aca_enabled: bool = False,
+    aca_household: int = 1,
 ) -> float:
-    """Dry-run: compute after_tax_net for a given gross discretionary withdrawal."""
+    """Dry-run: compute after_tax_net for a given gross discretionary withdrawal.
+
+    When aca_enabled and the year is pre-65, healthcare cost is netted by the ACA premium
+    tax credit computed from this trial's MAGI, so the binary search feels the ACA cliff
+    (larger withdrawals raise MAGI and shrink the subsidy)."""
     # Shallow per-dict copy is sufficient and ~10x faster than deepcopy here: account
     # dicts hold only scalar values, and _withdraw_from only reassigns balance/basis
     # (never mutates a nested object), so the originals are not affected. This dry run
@@ -182,7 +193,11 @@ def _discretionary_after_tax_net(
         ss_taxable_amount=ss_taxable,
         bracket_factor=bracket_factor,
     )
-    return total_cash - taxes["total"] - hc_cost
+    net_hc = hc_cost
+    if aca_enabled and age < 65:
+        net_hc = max(0.0, hc_cost - calculate_aca_ptc(
+            taxes["magi"], hc_cost, aca_household, bracket_factor))
+    return total_cash - taxes["total"] - net_hc
 
 
 def _solve_discretionary_need(
@@ -205,6 +220,8 @@ def _solve_discretionary_need(
     state_rate: float,
     bracket_factor: float,
     ss_taxable: float,
+    aca_enabled: bool = False,
+    aca_household: int = 1,
 ) -> float:
     """Bisect to find gross discretionary withdrawal yielding net_target after-tax net."""
     kw = dict(
@@ -226,6 +243,8 @@ def _solve_discretionary_need(
         state_rate=state_rate,
         bracket_factor=bracket_factor,
         ss_taxable=ss_taxable,
+        aca_enabled=aca_enabled,
+        aca_household=aca_household,
     )
     if _discretionary_after_tax_net(0.0, **kw) >= net_target:
         return 0.0
@@ -316,6 +335,14 @@ def simulate_retirement(
     # Separate healthcare inflation rate; None / unset falls back to general inflation.
     hc_inflation = profile.get("healthcare_inflation") or inflation
 
+    # ACA premium tax credit (opt-in). When enabled, the pre-Medicare healthcare cost is
+    # treated as the full unsubsidized premium and reduced by the year's PTC (which vanishes
+    # above the 400%-FPL cliff). Household size defaults to 2 for MFJ, else 1.
+    aca_enabled = bool(profile.get("model_aca_subsidy", False))
+    aca_household = int(profile.get("aca_household_size")
+                        or (2 if filing_status == "married_filing_jointly" else 1))
+    lifetime_aca_subsidy = 0.0
+
     # Roth conversion vintages for 5-year rule
     conversion_vintages: dict[int, float] = {}
 
@@ -392,7 +419,7 @@ def simulate_retirement(
             hc_cost = pre_medicare_hc * inflation_factor
         else:
             hc_cost = post_medicare_hc * inflation_factor
-        lifetime_healthcare += hc_cost
+        # gross hc_cost is accumulated into lifetime_healthcare (net of ACA subsidy) in Step 6
 
         # --- Guyton-Klinger guardrails (dynamic-spending MC mode; no-op otherwise) ---
         # Adjust the discretionary spending_target based on the realized portfolio before
@@ -664,6 +691,8 @@ def simulate_retirement(
                 state_rate=state_rate,
                 bracket_factor=bracket_factor,
                 ss_taxable=ss_taxable,
+                aca_enabled=aca_enabled,
+                aca_household=aca_household,
             )
         else:
             # total_spending_need already includes conv_tax_estimate (added after Step 3).
@@ -834,6 +863,46 @@ def simulate_retirement(
         )
         lifetime_taxes += taxes["total"]
 
+        # --- ACA premium tax credit (pre-65 marketplace coverage) ---
+        # hc_cost is the gross premium; the subsidy reduces the retiree's net cost. Whether
+        # the ACA cliff constraint is "active" is reported for every pre-65 year so the user
+        # can see when income has pushed them over the 400%-FPL cliff (subsidy → $0).
+        aca_gross_premium = hc_cost if (aca_enabled and age < 65) else 0.0
+        aca_subsidy = 0.0
+        aca_cliff_active = False
+        if aca_enabled and age < 65:
+            aca_subsidy = calculate_aca_ptc(
+                taxes["magi"], hc_cost, aca_household, bracket_factor)
+            _aca_cliff_magi = aca_fpl(aca_household, bracket_factor) * ACA_FPL_CLIFF_RATIO
+            aca_cliff_active = taxes["magi"] > _aca_cliff_magi
+            if aca_cliff_active and hc_cost > 0:
+                warnings.append({
+                    "age": age,
+                    "type": "aca_cliff",
+                    "message": (
+                        f"Age {age}: MAGI ${taxes['magi']:,.0f} exceeds the ACA 400%-FPL cliff "
+                        f"(${_aca_cliff_magi:,.0f}) — no premium subsidy, paying the full "
+                        f"${hc_cost:,.0f} premium."
+                    ),
+                })
+            elif aca_subsidy > 0:
+                # Proactive alert when MAGI is within $10k of the cliff and losing the subsidy hurts.
+                _gap = _aca_cliff_magi - taxes["magi"]
+                if 0 < _gap <= 10_000:
+                    warnings.append({
+                        "age": age,
+                        "type": "aca_approaching",
+                        "message": (
+                            f"Age {age}: MAGI ${taxes['magi']:,.0f} is ${_gap:,.0f} below the ACA "
+                            f"400%-FPL cliff (${_aca_cliff_magi:,.0f}). Staying below preserves "
+                            f"~${aca_subsidy:,.0f}/yr in premium subsidy."
+                        ),
+                    })
+        # Net healthcare cost the retiree actually bears this year.
+        hc_cost_net = max(0.0, hc_cost - aca_subsidy)
+        lifetime_healthcare += hc_cost_net
+        lifetime_aca_subsidy += aca_subsidy
+
         if taxes["irmaa_tier_crossed"]:
             warnings.append({
                 "age": age,
@@ -868,7 +937,7 @@ def simulate_retirement(
         # is typically ~$0. In RMD-heavy years where passive income alone exceeds
         # the target, surplus captures and reinvests the excess.
         if fixed_net_mode:
-            surplus_reinvested = max(0.0, total_cash_received - taxes["total"] - hc_cost - net_target_this_year)
+            surplus_reinvested = max(0.0, total_cash_received - taxes["total"] - hc_cost_net - net_target_this_year)
             if surplus_reinvested > 0:
                 for a in accts:
                     if a["type"] in {"taxable", "bank"}:
@@ -882,7 +951,7 @@ def simulate_retirement(
                         "type": "rmd_excess",
                         "message": f"Age {age}: Income (${total_cash_received:,.0f}) exceeded spending target by ${surplus_reinvested:,.0f} — excess reinvested.",
                     })
-            total_spending_need = net_target_this_year + taxes["total"] + hc_cost
+            total_spending_need = net_target_this_year + taxes["total"] + hc_cost_net
 
         # --- Step 7: Apply returns, inflate, advance ---
         for a in accts:
@@ -910,7 +979,7 @@ def simulate_retirement(
         # RMD excess and passive income windfalls don't inflate this figure.
         spendable_cash = total_cash_received - surplus_reinvested
         after_tax_spending = spendable_cash - taxes["total"]
-        actual_after_tax_net = after_tax_spending - hc_cost
+        actual_after_tax_net = after_tax_spending - hc_cost_net
 
         # --- Plan-failure detection ---
         # "Depleted" means the portfolio could no longer fund the planned spending — not
@@ -984,7 +1053,10 @@ def simulate_retirement(
             "total_tax": taxes["total"],
             "effective_tax_rate": taxes["effective_rate"],
             "surplus_reinvested": surplus_reinvested,
-            "healthcare_cost": hc_cost,
+            "healthcare_cost": hc_cost_net,
+            "aca_gross_premium": aca_gross_premium,
+            "aca_subsidy": aca_subsidy,
+            "aca_cliff_active": aca_cliff_active,
             "after_tax_spending": after_tax_spending,
             "start_portfolio": start_portfolio,
             "total_portfolio": total_balance,
@@ -1002,6 +1074,7 @@ def simulate_retirement(
     summary = {
         "lifetime_taxes": lifetime_taxes,
         "lifetime_healthcare": lifetime_healthcare,
+        "lifetime_aca_subsidy": lifetime_aca_subsidy,
         "lifetime_passive_income": lifetime_passive_income,
         "portfolio_depleted_age": portfolio_depleted_age,
         "warnings": warnings,
